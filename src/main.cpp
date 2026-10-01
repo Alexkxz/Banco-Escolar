@@ -1,4 +1,4 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -36,12 +36,25 @@ constexpr lv_coord_t MONITOR_SAFE_Y = 410;
 constexpr lv_coord_t WAIT_MONITOR_SAFE_X = 676;
 constexpr lv_coord_t WAIT_MONITOR_SAFE_Y = 326;
 constexpr lv_coord_t CONFIG_GEAR_SIZE = 32;
-constexpr uint32_t CONFIG_GEAR_ROTATION_DEG10 = 900;
-constexpr uint32_t CONFIG_GEAR_ROTATION_MS = 220;
-constexpr uint32_t CONFIG_GEAR_IDLE_ROTATION_MS = 10000;
+constexpr bool FRAME_TIMING_TEST_ENABLED = false;
+constexpr uint32_t FRAME_TIMING_PHASE_HOLD_MS = 3000;
+constexpr uint32_t BUTTON_PRESS_FEEDBACK_MS = 75;
 // Temporary diagnostic suite. Enable only for an explicitly requested on-device run.
 constexpr bool PERFORMANCE_TEST_ENABLED = false;
 constexpr uint32_t PERFORMANCE_SCREEN_HOLD_MS = 3000;
+constexpr bool HOME_EFFECT_ISOLATION_TEST_ENABLED = false;
+constexpr uint32_t HOME_EFFECT_ISOLATION_HOLD_MS = 5000;
+constexpr uint32_t HOME_EFFECT_ISOLATION_POST_FADE_MS = 500;
+constexpr uint32_t HOME_EFFECT_ISOLATION_PRE_CAPTURE_MS =
+    HOME_EFFECT_ISOLATION_POST_FADE_MS;
+constexpr bool HOME_POST_OPT_TEST_ENABLED = false;
+constexpr uint32_t HOME_POST_OPT_TEST_HOLD_MS = 10000;
+constexpr uint8_t HOME_EFFECT_CARD = 1U << 0;
+constexpr uint8_t HOME_EFFECT_RINGS = 1U << 1;
+constexpr uint8_t HOME_EFFECT_PARTICLES = 1U << 2;
+constexpr uint8_t HOME_EFFECT_PULSES = 1U << 3;
+constexpr uint8_t HOME_EFFECT_ALL = HOME_EFFECT_CARD | HOME_EFFECT_RINGS |
+                                    HOME_EFFECT_PARTICLES | HOME_EFFECT_PULSES;
 constexpr uint32_t INK = 0x183B56;
 constexpr uint32_t MUTED = 0x61758A;
 constexpr uint32_t SKY = 0xDDF3FF;
@@ -124,6 +137,10 @@ struct BootProgressState {
     char message[72] = "";
 };
 BootProgressState boot_progress_state;
+constexpr uint32_t BOOT_MIN_SPLASH_MS = 6000;
+constexpr uint32_t BOOT_FINAL_HOLD_MS = 1000;
+constexpr uint32_t BOOT_PROGRESS_ANIMATION_MS = 350;
+constexpr uint32_t BOOT_NTP_WAIT_MS = 10000;
 lv_obj_t *boot_splash_screen = nullptr;
 lv_obj_t *boot_progress_bar = nullptr;
 lv_obj_t *boot_percent_label = nullptr;
@@ -135,13 +152,17 @@ lv_timer_t *boot_progress_timer = nullptr;
 lv_timer_t *session_timeout_lv_timer = nullptr;
 uint8_t boot_bar_current_value = 0;
 uint32_t boot_wifi_started_ms = 0;
+uint32_t boot_splash_started_ms = 0;
+uint32_t boot_wifi_connected_ms = 0;
 uint32_t boot_ready_since_ms = 0;
 uint32_t boot_last_detail_update_ms = 0;
 char boot_detail_text[112] = "";
 bool boot_adapter_started = false;
 bool boot_setup_complete = false;
 bool boot_wifi_resolved = false;
+bool boot_wifi_connection_seen = false;
 bool boot_ui_prepared = false;
+bool boot_final_hold_started = false;
 bool boot_splash_active = false;
 bool boot_defer_screen_load = false;
 lv_obj_t *waiting_indicator = nullptr;
@@ -150,19 +171,23 @@ lv_obj_t *balance_unit_label = nullptr;
 lv_obj_t *performance_overlay = nullptr;
 lv_obj_t *performance_label = nullptr;
 lv_timer_t *performance_timer = nullptr;
-lv_obj_t *config_gear_canvas = nullptr;
-bool config_gear_animating = false;
-int32_t config_gear_angle = 0;
-lv_color_t config_gear_canvas_buffer[CONFIG_GEAR_SIZE * CONFIG_GEAR_SIZE];
-lv_timer_t *transition_release_timer = nullptr;
+bool boot_ntp_fallback_elapsed = false;
 bool transition_in_progress = false;
 bool performance_monitor_enabled = false;
 bool visual_effects_enabled = true;
+uint8_t home_effect_isolation_mask = HOME_EFFECT_ALL;
+bool home_effect_isolation_running = false;
+bool home_effect_isolation_waiting_for_fade = false;
+uint8_t home_effect_isolation_scenario = 0;
+lv_timer_t *home_effect_isolation_timer = nullptr;
+lv_timer_t *home_post_opt_test_timer = nullptr;
+bool home_post_opt_test_running = false;
 uint32_t performance_last_frame_count = 0;
 uint32_t performance_last_sample_ms = 0;
 uint32_t performance_transition_started_ms = 0;
 uint32_t performance_screen_create_ms = 0;
 uint32_t performance_transition_ms = 0;
+bool ui_time_synchronized = false;
 lv_timer_t *performance_test_timer = nullptr;
 uint8_t performance_test_scenario = 0;
 uint8_t performance_test_step = 0;
@@ -177,6 +202,42 @@ struct PerformanceScreenStats {
     uint32_t transition_ms = 0;
 };
 PerformanceScreenStats performance_stats[24];
+struct FrameTimingStats {
+    char label[48] = "";
+    bool transition = false;
+    uint32_t configured_ms = 0;
+    uint32_t started_ms = 0;
+    uint32_t sequence_cursor = 0;
+    uint16_t animations_at_start = 0;
+    uint16_t timers_at_start = 0;
+    uint16_t animations_at_end = 0;
+    uint16_t timers_at_end = 0;
+    uint32_t samples = 0;
+    uint64_t interval_sum_us = 0;
+    uint32_t interval_min_us = UINT32_MAX;
+    uint32_t interval_max_us = 0;
+    uint32_t over_33ms = 0;
+    uint32_t over_50ms = 0;
+    uint32_t over_100ms = 0;
+    uint32_t dropped_samples = 0;
+    uint32_t histogram[6] = {};
+};
+struct FrameTimingAggregate {
+    uint32_t samples = 0;
+    uint64_t interval_sum_us = 0;
+    uint32_t interval_max_us = 0;
+    uint32_t over_33ms = 0;
+    uint32_t over_50ms = 0;
+    uint32_t over_100ms = 0;
+};
+FrameTimingStats frame_timing_current;
+FrameTimingStats home_effect_isolation_stats[9];
+FrameTimingAggregate frame_timing_scenario_stats[2];
+bool frame_timing_capture_active = false;
+bool frame_timing_test_running = false;
+uint8_t frame_timing_test_scenario = 0;
+uint8_t frame_timing_test_route_index = 0;
+lv_timer_t *frame_timing_test_timer = nullptr;
 uint8_t motivation_index = 0;
 
 // MODO DEMOSTRACION TEMPORAL: tocar la tarjeta simula un alumno identificado.
@@ -368,6 +429,7 @@ void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t heigh
                             lv_coord_t right_offset, lv_coord_t top_offset);
 void update_performance_overlay(lv_timer_t *timer);
 void performance_test_step_cb(lv_timer_t *timer);
+void frame_timing_test_step_cb(lv_timer_t *timer);
 const char *performance_screen_name(Pantalla screen);
 void update_wifi_ui();
 void update_wifi_setup_ui();
@@ -394,11 +456,11 @@ void formatear_fecha_hora(const struct tm &local_time, char *date_buffer, size_t
                           char *time_buffer, size_t time_size)
 {
     static const char *const weekdays[] = {
-        "domingo", "lunes", "martes", "miércoles", "jueves", "viernes", "sábado"
+        "Dom", "Lun", "Mar", "Mié", "Jue", "Vie", "Sáb"
     };
     static const char *const months[] = {
-        "enero", "febrero", "marzo", "abril", "mayo", "junio",
-        "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre"
+        "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+        "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"
     };
     const char *weekday = local_time.tm_wday >= 0 && local_time.tm_wday < 7
                               ? weekdays[local_time.tm_wday]
@@ -406,13 +468,10 @@ void formatear_fecha_hora(const struct tm &local_time, char *date_buffer, size_t
     const char *month = local_time.tm_mon >= 0 && local_time.tm_mon < 12
                             ? months[local_time.tm_mon]
                             : "";
-    snprintf(date_buffer, date_size, "%s %d de %s de %d", weekday, local_time.tm_mday,
+    snprintf(date_buffer, date_size, "%s %02d %s %04d", weekday, local_time.tm_mday,
              month, local_time.tm_year + 1900);
-    int hour_12 = local_time.tm_hour % 12;
-    if (hour_12 == 0) hour_12 = 12;
-    const char *period = local_time.tm_hour < 12 ? "a.m." : "p.m.";
-    snprintf(time_buffer, time_size, "%d:%02d:%02d %s", hour_12, local_time.tm_min,
-             local_time.tm_sec, period);
+    snprintf(time_buffer, time_size, "%02d:%02d:%02d", local_time.tm_hour,
+             local_time.tm_min, local_time.tm_sec);
 }
 
 void obtener_texto_fecha_hora(char *date_buffer, size_t date_size,
@@ -420,7 +479,7 @@ void obtener_texto_fecha_hora(char *date_buffer, size_t date_size,
 {
     struct tm local_time = {};
     if (!time_manager.getLocalTime(local_time)) {
-        snprintf(date_buffer, date_size, "--/--/----");
+        snprintf(date_buffer, date_size, "--- -- --- ----");
         snprintf(time_buffer, time_size, "--:--:--");
         return;
     }
@@ -428,16 +487,16 @@ void obtener_texto_fecha_hora(char *date_buffer, size_t date_size,
 }
 void halt_on_error() { while (true) vTaskDelay(pdMS_TO_TICKS(1000)); }
 
-void boot_bar_animation_exec(void *object, int32_t value)
+void boot_progress_animation_exec(void *object, int32_t value)
 {
-    lv_obj_t *bar = static_cast<lv_obj_t *>(object);
-    lv_bar_set_value(bar, value, LV_ANIM_OFF);
+    lv_bar_set_value(static_cast<lv_obj_t *>(object), value, LV_ANIM_OFF);
+    if (boot_logo_arc) lv_arc_set_value(boot_logo_arc, value);
     boot_bar_current_value = static_cast<uint8_t>(value);
-}
-
-void boot_logo_animation_exec(void *object, int32_t value)
-{
-    lv_arc_set_value(static_cast<lv_obj_t *>(object), value);
+    if (boot_percent_label) {
+        char percent_text[8];
+        snprintf(percent_text, sizeof(percent_text), "%u%%", static_cast<unsigned>(value));
+        lv_label_set_text(boot_percent_label, percent_text);
+    }
 }
 
 void set_boot_progress(uint8_t percent, const char *message)
@@ -458,20 +517,22 @@ void set_boot_progress(uint8_t percent, const char *message)
     if (esp_lv_adapter_lock(1000) != ESP_OK) return;
 
     if (percent_changed) {
-        lv_anim_del(boot_progress_bar, boot_bar_animation_exec);
+        lv_anim_del(boot_progress_bar, boot_progress_animation_exec);
         lv_anim_t bar_anim;
         lv_anim_init(&bar_anim);
         lv_anim_set_var(&bar_anim, boot_progress_bar);
         lv_anim_set_values(&bar_anim, boot_bar_current_value, percent);
-        lv_anim_set_time(&bar_anim, 220);
+        lv_anim_set_time(&bar_anim, BOOT_PROGRESS_ANIMATION_MS);
         lv_anim_set_path_cb(&bar_anim, lv_anim_path_ease_out);
-        lv_anim_set_exec_cb(&bar_anim, boot_bar_animation_exec);
+        lv_anim_set_exec_cb(&bar_anim, boot_progress_animation_exec);
         lv_anim_start(&bar_anim);
     }
 
-    char percent_text[8];
-    snprintf(percent_text, sizeof(percent_text), "%u%%", static_cast<unsigned>(percent));
-    lv_label_set_text(boot_percent_label, percent_text);
+    if (!percent_changed && boot_percent_label) {
+        char percent_text[8];
+        snprintf(percent_text, sizeof(percent_text), "%u%%", static_cast<unsigned>(percent));
+        lv_label_set_text(boot_percent_label, percent_text);
+    }
     lv_label_set_text(boot_state_label, boot_progress_state.message);
     esp_lv_adapter_unlock();
 }
@@ -498,40 +559,29 @@ void create_boot_splash()
     lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 61);
 
     boot_logo_arc = lv_arc_create(boot_splash_screen);
-    lv_obj_set_size(boot_logo_arc, 148, 148);
+    lv_obj_set_size(boot_logo_arc, 164, 164);
     lv_arc_set_range(boot_logo_arc, 0, 100);
     lv_arc_set_bg_angles(boot_logo_arc, 0, 360);
     lv_arc_set_rotation(boot_logo_arc, 270);
-    lv_arc_set_value(boot_logo_arc, 64);
+    lv_arc_set_value(boot_logo_arc, boot_progress_state.percent);
     lv_obj_set_style_bg_opa(boot_logo_arc, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(boot_logo_arc, lv_color_hex(0xC5DCEB), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(boot_logo_arc, 7, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(boot_logo_arc, lv_color_hex(0x9DBFD6), LV_PART_MAIN);
+    lv_obj_set_style_arc_width(boot_logo_arc, 10, LV_PART_MAIN);
     lv_obj_set_style_arc_color(boot_logo_arc, lv_color_hex(BLUE), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(boot_logo_arc, 7, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_width(boot_logo_arc, 10, LV_PART_INDICATOR);
     lv_obj_set_style_bg_opa(boot_logo_arc, LV_OPA_TRANSP, LV_PART_KNOB);
     lv_obj_set_style_border_width(boot_logo_arc, 0, LV_PART_KNOB);
-    lv_obj_align(boot_logo_arc, LV_ALIGN_TOP_MID, 0, 102);
-
-    lv_anim_t logo_anim;
-    lv_anim_init(&logo_anim);
-    lv_anim_set_var(&logo_anim, boot_logo_arc);
-    lv_anim_set_values(&logo_anim, 18, 82);
-    lv_anim_set_time(&logo_anim, 1500);
-    lv_anim_set_playback_time(&logo_anim, 1500);
-    lv_anim_set_repeat_count(&logo_anim, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_path_cb(&logo_anim, lv_anim_path_ease_in_out);
-    lv_anim_set_exec_cb(&logo_anim, boot_logo_animation_exec);
-    lv_anim_start(&logo_anim);
+    lv_obj_align(boot_logo_arc, LV_ALIGN_TOP_MID, 0, 94);
 
     lv_obj_t *logo = lv_obj_create(boot_splash_screen);
     lv_obj_remove_style_all(logo);
-    lv_obj_set_size(logo, 82, 82);
+    lv_obj_set_size(logo, 90, 90);
     lv_obj_set_style_bg_color(logo, lv_color_hex(0xFFF4D8), 0);
     lv_obj_set_style_bg_opa(logo, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(logo, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_border_width(logo, 2, 0);
     lv_obj_set_style_border_color(logo, lv_color_hex(ORANGE), 0);
-    lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 135);
+    lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 131);
 
     // A compact school/bank building made from basic LVGL shapes.
     lv_obj_t *roof = lv_obj_create(logo);
@@ -592,29 +642,34 @@ void create_boot_splash()
     lv_obj_set_style_text_font(boot_detail_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(boot_detail_label, lv_color_hex(theme_palette().secondary_text), 0);
     lv_obj_set_width(boot_detail_label, 760);
+    lv_obj_set_height(boot_detail_label, 44);
     lv_label_set_long_mode(boot_detail_label, LV_LABEL_LONG_DOT);
     lv_obj_set_style_text_align(boot_detail_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_align(boot_detail_label, LV_ALIGN_TOP_MID, 0, 431);
+    lv_obj_align(boot_detail_label, LV_ALIGN_TOP_MID, 0, 420);
 
     boot_splash_active = true;
     lv_scr_load(boot_splash_screen);
+    boot_splash_started_ms = millis();
 }
 
 void update_boot_detail()
 {
-    const char *wifi_text = "WiFi: sin conexion";
+    const char *wifi_text = "Wi-Fi: sin conexión";
     switch (wifi_manager.state()) {
-        case WiFiState::CONNECTING: wifi_text = "WiFi: conectando"; break;
-        case WiFiState::CONNECTED: wifi_text = "WiFi: conectado"; break;
-        case WiFiState::ERROR: wifi_text = "WiFi: no disponible"; break;
+        case WiFiState::CONNECTING: wifi_text = "Wi-Fi: conectando"; break;
+        case WiFiState::CONNECTED: wifi_text = "Wi-Fi: conectado"; break;
+        case WiFiState::ERROR: wifi_text = "Wi-Fi: no disponible"; break;
         case WiFiState::DISCONNECTED: break;
     }
-    const char *time_text = time_manager.isSynchronized() ? "Hora sincronizada" : "Hora pendiente";
+    const bool wifi_connected = wifi_manager.state() == WiFiState::CONNECTED;
+    const char *time_text = time_manager.isSynchronized() ? "Hora: sincronizada" :
+                            (wifi_connected && !boot_ntp_fallback_elapsed ?
+                                 "Hora: sincronizando" : "Hora: pendiente");
     const char *sd_text = sd_manager.state() == SdState::SD_NOT_PRESENT ?
-                          "microSD: No instalada" : "microSD: no disponible";
+                          "MicroSD: no instalada" : "MicroSD: no disponible";
     const char *nfc_text = PN532_ENABLED ? "NFC: iniciando" : "NFC: deshabilitado";
     char next_text[sizeof(boot_detail_text)];
-    snprintf(next_text, sizeof(next_text), "%s | %s | %s | %s",
+    snprintf(next_text, sizeof(next_text), "%s       %s\n%s       %s",
              wifi_text, time_text, sd_text, nfc_text);
     if (strcmp(next_text, boot_detail_text) == 0) return;
     strncpy(boot_detail_text, next_text, sizeof(boot_detail_text) - 1);
@@ -779,16 +834,35 @@ void apply_arcade_badge_style(lv_obj_t *badge, uint32_t background, uint32_t acc
     lv_obj_set_style_shadow_width(badge, 0, 0);
 }
 
+void button_press_zoom_exec(void *object, int32_t value)
+{
+    lv_obj_set_style_transform_zoom(static_cast<lv_obj_t *>(object),
+                                    static_cast<lv_coord_t>(value), 0);
+}
+
+void start_button_press_feedback(lv_obj_t *button)
+{
+    lv_anim_del(button, button_press_zoom_exec);
+    lv_anim_t feedback;
+    lv_anim_init(&feedback);
+    lv_anim_set_var(&feedback, button);
+    lv_anim_set_values(&feedback, 256, 250);
+    lv_anim_set_time(&feedback, BUTTON_PRESS_FEEDBACK_MS / 2U);
+    lv_anim_set_playback_time(&feedback, BUTTON_PRESS_FEEDBACK_MS - BUTTON_PRESS_FEEDBACK_MS / 2U);
+    lv_anim_set_path_cb(&feedback, lv_anim_path_ease_out);
+    lv_anim_set_exec_cb(&feedback, button_press_zoom_exec);
+    lv_anim_start(&feedback);
+}
+
 void arcade_button_feedback_event(lv_event_t *event)
 {
     const lv_event_code_t code = lv_event_get_code(event);
     lv_obj_t *target = lv_event_get_target(event);
     if (code == LV_EVENT_PRESSED) {
-        lv_obj_set_style_transform_zoom(target, 250, 0);
-        lv_obj_set_style_opa(target, LV_OPA_90, 0);
-    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        start_button_press_feedback(target);
+    } else if (code == LV_EVENT_PRESS_LOST) {
+        lv_anim_del(target, button_press_zoom_exec);
         lv_obj_set_style_transform_zoom(target, 256, 0);
-        lv_obj_set_style_opa(target, LV_OPA_COVER, 0);
     }
 }
 
@@ -850,24 +924,6 @@ void ring_opacity_anim_exec(void *object, int32_t value)
 
 void card_float_anim_exec(void *object, int32_t value) { lv_obj_align(static_cast<lv_obj_t *>(object), LV_ALIGN_CENTER, 0, value); }
 
-void waiting_indicator_anim_exec(void *object, int32_t value)
-{
-    lv_obj_set_style_opa(static_cast<lv_obj_t *>(object), static_cast<lv_opa_t>(value), 0);
-}
-
-void start_waiting_indicator_animation()
-{
-    if (!visual_effects_enabled || waiting_indicator == nullptr) return;
-    lv_anim_t pulse; lv_anim_init(&pulse); lv_anim_set_var(&pulse, waiting_indicator); lv_anim_set_values(&pulse, 70, LV_OPA_COVER);
-    lv_anim_set_time(&pulse, 1200); lv_anim_set_playback_time(&pulse, 1200); lv_anim_set_repeat_count(&pulse, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&pulse, waiting_indicator_anim_exec); lv_anim_start(&pulse);
-}
-
-void nfc_panel_pulse_exec(void *object, int32_t value)
-{
-    lv_obj_set_style_border_opa(static_cast<lv_obj_t *>(object), static_cast<lv_opa_t>(value), 0);
-}
-
 void nfc_confirm_exec(void *object, int32_t value)
 {
     lv_obj_set_style_border_width(static_cast<lv_obj_t *>(object), value, 0);
@@ -886,22 +942,24 @@ void start_nfc_animations()
 {
     if (!visual_effects_enabled) return;
 
-    lv_anim_t outer; lv_anim_init(&outer); lv_anim_set_var(&outer, nfc_ring_outer); lv_anim_set_values(&outer, 28, 120);
-    lv_anim_set_time(&outer, 2100); lv_anim_set_playback_time(&outer, 2100); lv_anim_set_delay(&outer, 520);
-    lv_anim_set_repeat_count(&outer, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&outer, ring_opacity_anim_exec); lv_anim_start(&outer);
-    lv_anim_t middle; lv_anim_init(&middle); lv_anim_set_var(&middle, nfc_ring_middle); lv_anim_set_values(&middle, 38, 145);
-    lv_anim_set_time(&middle, 1900); lv_anim_set_playback_time(&middle, 1900); lv_anim_set_delay(&middle, 260);
-    lv_anim_set_repeat_count(&middle, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&middle, ring_opacity_anim_exec); lv_anim_start(&middle);
-    lv_anim_t inner; lv_anim_init(&inner); lv_anim_set_var(&inner, nfc_ring_inner); lv_anim_set_values(&inner, 52, 175);
-    lv_anim_set_time(&inner, 1700); lv_anim_set_playback_time(&inner, 1700);
-    lv_anim_set_repeat_count(&inner, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&inner, ring_opacity_anim_exec); lv_anim_start(&inner);
-    lv_anim_t card; lv_anim_init(&card); lv_anim_set_var(&card, nfc_card_visual); lv_anim_set_values(&card, 0, -6);
-    lv_anim_set_time(&card, 1800); lv_anim_set_playback_time(&card, 1800); lv_anim_set_repeat_count(&card, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&card, card_float_anim_exec); lv_anim_start(&card);
-
-    lv_anim_t panel; lv_anim_init(&panel); lv_anim_set_var(&panel, nfc_panel); lv_anim_set_values(&panel, 100, 220);
-    lv_anim_set_time(&panel, 2600); lv_anim_set_playback_time(&panel, 2600); lv_anim_set_repeat_count(&panel, LV_ANIM_REPEAT_INFINITE);
-    lv_anim_set_exec_cb(&panel, nfc_panel_pulse_exec); lv_anim_start(&panel);
+    const bool isolation = home_effect_isolation_running && pantalla_actual == PANTALLA_ESPERA;
+    const uint8_t mask = isolation ? home_effect_isolation_mask : HOME_EFFECT_ALL;
+    if (mask & HOME_EFFECT_RINGS) {
+        lv_anim_t outer; lv_anim_init(&outer); lv_anim_set_var(&outer, nfc_ring_outer); lv_anim_set_values(&outer, 28, 120);
+        lv_anim_set_time(&outer, 2100); lv_anim_set_playback_time(&outer, 2100); lv_anim_set_delay(&outer, 520);
+        lv_anim_set_repeat_count(&outer, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&outer, ring_opacity_anim_exec); lv_anim_start(&outer);
+        lv_anim_t middle; lv_anim_init(&middle); lv_anim_set_var(&middle, nfc_ring_middle); lv_anim_set_values(&middle, 38, 145);
+        lv_anim_set_time(&middle, 1900); lv_anim_set_playback_time(&middle, 1900); lv_anim_set_delay(&middle, 260);
+        lv_anim_set_repeat_count(&middle, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&middle, ring_opacity_anim_exec); lv_anim_start(&middle);
+        lv_anim_t inner; lv_anim_init(&inner); lv_anim_set_var(&inner, nfc_ring_inner); lv_anim_set_values(&inner, 52, 175);
+        lv_anim_set_time(&inner, 1700); lv_anim_set_playback_time(&inner, 1700);
+        lv_anim_set_repeat_count(&inner, LV_ANIM_REPEAT_INFINITE); lv_anim_set_exec_cb(&inner, ring_opacity_anim_exec); lv_anim_start(&inner);
+    }
+    if (mask & HOME_EFFECT_CARD) {
+        lv_anim_t card; lv_anim_init(&card); lv_anim_set_var(&card, nfc_card_visual); lv_anim_set_values(&card, 0, -6);
+        lv_anim_set_time(&card, 1800); lv_anim_set_playback_time(&card, 1800); lv_anim_set_repeat_count(&card, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_exec_cb(&card, card_float_anim_exec); lv_anim_start(&card);
+    }
 }
 
 void nfc_area_event_cb(lv_event_t *event)
@@ -985,14 +1043,19 @@ void update_nfc_ui_timer(lv_timer_t *timer)
     }
 }
 
-void update_clock_timer(lv_timer_t *timer)
+void refresh_clock_labels()
 {
-    (void)timer;
     char date_text[48];
     char time_text[16];
     obtener_texto_fecha_hora(date_text, sizeof(date_text), time_text, sizeof(time_text));
     if (clock_label) lv_label_set_text(clock_label, time_text);
     if (date_label) lv_label_set_text(date_label, date_text);
+}
+
+void update_clock_timer(lv_timer_t *timer)
+{
+    (void)timer;
+    refresh_clock_labels();
 }
 
 const char *wifi_state_text(WiFiState state)
@@ -1090,6 +1153,8 @@ void particle_y_exec(void *object, int32_t value)
 void create_particle_background(lv_obj_t *screen, uint8_t intensity)
 {
     if (!visual_effects_enabled || intensity == 0) return;
+    if (home_effect_isolation_running && pantalla_actual == PANTALLA_ESPERA &&
+        !(home_effect_isolation_mask & HOME_EFFECT_PARTICLES)) return;
 
     static const lv_coord_t x_positions[] = {34, 96, 168, 244, 326, 404, 486, 566, 644, 714, 758, 282};
     static const lv_coord_t y_positions[] = {438, 392, 348, 420, 300, 454, 368, 418, 334, 452, 386, 270};
@@ -1242,6 +1307,337 @@ const char *performance_screen_name(Pantalla screen)
     return "Unknown";
 }
 
+uint16_t frame_timing_timer_count()
+{
+    uint16_t count = 0;
+    for (lv_timer_t *timer = lv_timer_get_next(nullptr); timer != nullptr;
+         timer = lv_timer_get_next(timer)) ++count;
+    return count;
+}
+
+void frame_timing_record_interval(uint32_t interval_us)
+{
+    ++frame_timing_current.samples;
+    frame_timing_current.interval_sum_us += interval_us;
+    if (interval_us < frame_timing_current.interval_min_us) {
+        frame_timing_current.interval_min_us = interval_us;
+    }
+    if (interval_us > frame_timing_current.interval_max_us) {
+        frame_timing_current.interval_max_us = interval_us;
+    }
+    if (interval_us > 33300) ++frame_timing_current.over_33ms;
+    if (interval_us > 50000) ++frame_timing_current.over_50ms;
+    if (interval_us > 100000) ++frame_timing_current.over_100ms;
+
+    const uint8_t bucket = interval_us <= 16700 ? 0 : interval_us <= 33300 ? 1 :
+                           interval_us <= 50000 ? 2 : interval_us <= 100000 ? 3 :
+                           interval_us <= 250000 ? 4 : 5;
+    ++frame_timing_current.histogram[bucket];
+
+    if (FRAME_TIMING_TEST_ENABLED && frame_timing_test_running &&
+        !home_effect_isolation_running && frame_timing_test_scenario < 2) {
+        FrameTimingAggregate &aggregate = frame_timing_scenario_stats[frame_timing_test_scenario];
+        ++aggregate.samples;
+        aggregate.interval_sum_us += interval_us;
+        if (interval_us > aggregate.interval_max_us) aggregate.interval_max_us = interval_us;
+        if (interval_us > 33300) ++aggregate.over_33ms;
+        if (interval_us > 50000) ++aggregate.over_50ms;
+        if (interval_us > 100000) ++aggregate.over_100ms;
+    }
+}
+
+void frame_timing_collect_intervals()
+{
+    uint32_t intervals_us[256];
+    uint32_t dropped = 0;
+    const uint32_t read = esp_lv_adapter_read_frame_intervals(
+        &frame_timing_current.sequence_cursor, intervals_us,
+        sizeof(intervals_us) / sizeof(intervals_us[0]), &dropped);
+    frame_timing_current.dropped_samples += dropped;
+    for (uint32_t i = 0; i < read; ++i) frame_timing_record_interval(intervals_us[i]);
+}
+
+void frame_timing_begin(const char *label, bool transition, uint32_t configured_ms = 0)
+{
+    frame_timing_current = FrameTimingStats{};
+    strncpy(frame_timing_current.label, label, sizeof(frame_timing_current.label) - 1);
+    frame_timing_current.transition = transition;
+    frame_timing_current.configured_ms = configured_ms;
+    frame_timing_current.started_ms = millis();
+    frame_timing_current.sequence_cursor = esp_lv_adapter_get_frame_interval_sequence();
+    frame_timing_current.animations_at_start = static_cast<uint16_t>(lv_anim_count_running());
+    frame_timing_current.timers_at_start = frame_timing_timer_count();
+    frame_timing_capture_active = true;
+    Serial.printf("[FrameTiming] BEGIN %s effects=%s anim=%u timers=%u\n",
+                  frame_timing_current.label,
+                  visual_effects_enabled ? "ON" : "OFF",
+                  static_cast<unsigned>(frame_timing_current.animations_at_start),
+                  static_cast<unsigned>(frame_timing_current.timers_at_start));
+
+    if (!transition && pantalla_actual == PANTALLA_ESPERA && visual_effects_enabled) {
+        Serial.println("[FrameTiming] Home configured: static waiting dot and NFC panel border; NFC waves 2100/1900/1700ms; card float 1800ms; particles 5600-7600ms staggered by 230ms; clock 1000ms; bottom bar static; fade 220ms");
+    }
+}
+
+const char *frame_timing_p95_label()
+{
+    if (frame_timing_current.samples == 0) return "n/a";
+    const uint32_t target = (frame_timing_current.samples * 95U + 99U) / 100U;
+    static const char *const upper_bounds[] = {"16.7", "33.3", "50", "100", "250", ">250"};
+    uint32_t accumulated = 0;
+    for (uint8_t i = 0; i < 6; ++i) {
+        accumulated += frame_timing_current.histogram[i];
+        if (accumulated >= target) return upper_bounds[i];
+    }
+    return ">250";
+}
+
+void frame_timing_finish()
+{
+    if (!frame_timing_capture_active) return;
+    frame_timing_collect_intervals();
+    const uint32_t elapsed_ms = millis() - frame_timing_current.started_ms;
+    const uint16_t animations_now = static_cast<uint16_t>(lv_anim_count_running());
+    const uint16_t timers_now = frame_timing_timer_count();
+    frame_timing_current.animations_at_end = animations_now;
+    frame_timing_current.timers_at_end = timers_now;
+    const uint32_t avg_tenth_ms = frame_timing_current.samples == 0 ? 0 :
+        static_cast<uint32_t>((frame_timing_current.interval_sum_us * 10ULL) /
+                              frame_timing_current.samples / 1000ULL);
+    const uint32_t min_tenth_ms = frame_timing_current.samples == 0 ? 0 :
+                                  frame_timing_current.interval_min_us / 100U;
+    const uint32_t max_tenth_ms = frame_timing_current.interval_max_us / 100U;
+    const char *p95_label = frame_timing_p95_label();
+    if (frame_timing_current.transition) {
+        Serial.printf("[FrameTiming] END %s configured=%lums actual=%lums frames=%lu interval_ms min/avg/max=%lu.%lu/%lu.%lu/%lu.%lu p95~%sms over33/50/100=%lu/%lu/%lu anim=%u->%u timers=%u->%u dropped=%lu\n",
+                      frame_timing_current.label,
+                      static_cast<unsigned long>(frame_timing_current.configured_ms),
+                      static_cast<unsigned long>(elapsed_ms),
+                      static_cast<unsigned long>(frame_timing_current.samples),
+                      static_cast<unsigned long>(min_tenth_ms / 10U), static_cast<unsigned long>(min_tenth_ms % 10U),
+                      static_cast<unsigned long>(avg_tenth_ms / 10U), static_cast<unsigned long>(avg_tenth_ms % 10U),
+                      static_cast<unsigned long>(max_tenth_ms / 10U), static_cast<unsigned long>(max_tenth_ms % 10U),
+                      p95_label,
+                      static_cast<unsigned long>(frame_timing_current.over_33ms),
+                      static_cast<unsigned long>(frame_timing_current.over_50ms),
+                      static_cast<unsigned long>(frame_timing_current.over_100ms),
+                      static_cast<unsigned>(frame_timing_current.animations_at_start),
+                      static_cast<unsigned>(animations_now),
+                      static_cast<unsigned>(frame_timing_current.timers_at_start),
+                      static_cast<unsigned>(timers_now),
+                      static_cast<unsigned long>(frame_timing_current.dropped_samples));
+    } else {
+        Serial.printf("[FrameTiming] END %s duration=%lums frames=%lu interval_ms min/avg/max=%lu.%lu/%lu.%lu/%lu.%lu p95~%sms over33/50/100=%lu/%lu/%lu anim=%u->%u timers=%u->%u dropped=%lu\n",
+                      frame_timing_current.label,
+                      static_cast<unsigned long>(elapsed_ms),
+                      static_cast<unsigned long>(frame_timing_current.samples),
+                      static_cast<unsigned long>(min_tenth_ms / 10U), static_cast<unsigned long>(min_tenth_ms % 10U),
+                      static_cast<unsigned long>(avg_tenth_ms / 10U), static_cast<unsigned long>(avg_tenth_ms % 10U),
+                      static_cast<unsigned long>(max_tenth_ms / 10U), static_cast<unsigned long>(max_tenth_ms % 10U),
+                      p95_label,
+                      static_cast<unsigned long>(frame_timing_current.over_33ms),
+                      static_cast<unsigned long>(frame_timing_current.over_50ms),
+                      static_cast<unsigned long>(frame_timing_current.over_100ms),
+                      static_cast<unsigned>(frame_timing_current.animations_at_start),
+                      static_cast<unsigned>(animations_now),
+                      static_cast<unsigned>(frame_timing_current.timers_at_start),
+                      static_cast<unsigned>(timers_now),
+                      static_cast<unsigned long>(frame_timing_current.dropped_samples));
+    }
+    frame_timing_capture_active = false;
+}
+
+void home_post_opt_test_step_cb(lv_timer_t *timer)
+{
+    if (!home_post_opt_test_running) {
+        if (transition_in_progress || pantalla_actual != PANTALLA_ESPERA) return;
+        home_post_opt_test_running = true;
+        esp_lv_adapter_set_frame_timing_enabled(true);
+        Serial.println("[HomePostOpt] Inicio normal; measuring 10000ms after splash/Wi-Fi/NTP resolution and entry fade");
+        frame_timing_begin("Home post-opt", false);
+        lv_timer_set_period(timer, HOME_POST_OPT_TEST_HOLD_MS);
+        lv_timer_reset(timer);
+        return;
+    }
+
+    frame_timing_finish();
+    esp_lv_adapter_set_frame_timing_enabled(false);
+    home_post_opt_test_running = false;
+    home_post_opt_test_timer = nullptr;
+    lv_timer_del(timer);
+    Serial.println("[HomePostOpt] Complete; one 10-second normal Home sample recorded");
+}
+
+void frame_timing_print_scenario_summary(uint8_t scenario)
+{
+    const FrameTimingAggregate &stats = frame_timing_scenario_stats[scenario];
+    const uint32_t average_tenth_ms = stats.samples == 0 ? 0 :
+        static_cast<uint32_t>((stats.interval_sum_us * 10ULL) / stats.samples / 1000ULL);
+    Serial.printf("[FrameTiming] SUMMARY effects=%s frames=%lu interval_avg=%lu.%lums max=%lu.%lums over33/50/100=%lu/%lu/%lu\n",
+                  scenario == 0 ? "ON" : "OFF",
+                  static_cast<unsigned long>(stats.samples),
+                  static_cast<unsigned long>(average_tenth_ms / 10U),
+                  static_cast<unsigned long>(average_tenth_ms % 10U),
+                  static_cast<unsigned long>(stats.interval_max_us / 1000U),
+                  static_cast<unsigned long>((stats.interval_max_us / 100U) % 10U),
+                  static_cast<unsigned long>(stats.over_33ms),
+                  static_cast<unsigned long>(stats.over_50ms),
+                  static_cast<unsigned long>(stats.over_100ms));
+}
+
+void frame_timing_test_step_cb(lv_timer_t *timer)
+{
+    static const Pantalla route[] = {
+        PANTALLA_ESPERA, PANTALLA_ALUMNO, PANTALLA_CUENTA, PANTALLA_ALUMNO,
+        PANTALLA_PROGRESO, PANTALLA_FLUIDEZ, PANTALLA_PROGRESO, PANTALLA_DICTADO,
+        PANTALLA_ALUMNO, PANTALLA_TRANSFERIR, PANTALLA_ESPERA,
+        PANTALLA_CONFIGURACION, PANTALLA_WIFI_REDES, PANTALLA_CONFIGURACION,
+        PANTALLA_STORAGE_LOCAL, PANTALLA_ESPERA
+    };
+    constexpr uint8_t ROUTE_LENGTH = sizeof(route) / sizeof(route[0]);
+
+    if (transition_in_progress) return;
+    if (!frame_timing_test_running) {
+        frame_timing_test_running = true;
+        frame_timing_test_scenario = 0;
+        frame_timing_test_route_index = 0;
+        frame_timing_scenario_stats[0] = FrameTimingAggregate{};
+        frame_timing_scenario_stats[1] = FrameTimingAggregate{};
+        visual_effects_enabled = true;
+        performance_monitor_enabled = false;
+        esp_lv_adapter_set_frame_timing_enabled(true);
+        Serial.println("[FrameTiming] Scenario A: effects ON; interval sampling from completed LVGL refresh callbacks");
+        lv_timer_set_period(timer, FRAME_TIMING_PHASE_HOLD_MS);
+        mostrar_pantalla(route[0]);
+        return;
+    }
+
+    frame_timing_finish();
+    ++frame_timing_test_route_index;
+    if (frame_timing_test_route_index >= ROUTE_LENGTH) {
+        frame_timing_print_scenario_summary(frame_timing_test_scenario);
+        if (frame_timing_test_scenario == 0) {
+            frame_timing_test_scenario = 1;
+            frame_timing_test_route_index = 0;
+            visual_effects_enabled = false;
+            Serial.println("[FrameTiming] Scenario B: effects OFF; same transitions and screen holds");
+        } else {
+            const FrameTimingAggregate &on = frame_timing_scenario_stats[0];
+            const FrameTimingAggregate &off = frame_timing_scenario_stats[1];
+            const uint32_t on_avg = on.samples == 0 ? 0 : static_cast<uint32_t>(on.interval_sum_us / on.samples);
+            const uint32_t off_avg = off.samples == 0 ? 0 : static_cast<uint32_t>(off.interval_sum_us / off.samples);
+            Serial.printf("[FrameTiming] EFFECTS COMPARISON avg_interval_us ON/OFF=%lu/%lu max_us=%lu/%lu over50=%lu/%lu\n",
+                          static_cast<unsigned long>(on_avg), static_cast<unsigned long>(off_avg),
+                          static_cast<unsigned long>(on.interval_max_us),
+                          static_cast<unsigned long>(off.interval_max_us),
+                          static_cast<unsigned long>(on.over_50ms),
+                          static_cast<unsigned long>(off.over_50ms));
+            Serial.println("[FrameTiming] Test complete; effects restored ON, monitor OFF");
+            visual_effects_enabled = true;
+            performance_monitor_enabled = false;
+            frame_timing_test_running = false;
+            frame_timing_test_timer = nullptr;
+            esp_lv_adapter_set_frame_timing_enabled(false);
+            lv_timer_del(timer);
+            return;
+        }
+    }
+
+    lv_timer_set_period(timer, FRAME_TIMING_PHASE_HOLD_MS);
+    mostrar_pantalla(route[frame_timing_test_route_index]);
+}
+
+void home_effect_isolation_step_cb(lv_timer_t *timer)
+{
+    static const char *const names[] = {
+        "BASE", "SOLO TARJETA", "SOLO ONDAS NFC", "SOLO PARTICULAS",
+        "SOLO PULSOS", "TARJETA + ONDAS", "TARJETA + PARTICULAS",
+        "ONDAS + PARTICULAS", "TODOS"
+    };
+    static const uint8_t masks[] = {
+        0, HOME_EFFECT_CARD, HOME_EFFECT_RINGS, HOME_EFFECT_PARTICLES,
+        HOME_EFFECT_PULSES, HOME_EFFECT_CARD | HOME_EFFECT_RINGS,
+        HOME_EFFECT_CARD | HOME_EFFECT_PARTICLES,
+        HOME_EFFECT_RINGS | HOME_EFFECT_PARTICLES, HOME_EFFECT_ALL
+    };
+    constexpr uint8_t SCENARIO_COUNT = sizeof(masks) / sizeof(masks[0]);
+
+    if (transition_in_progress) return;
+    if (!home_effect_isolation_running) {
+        home_effect_isolation_running = true;
+        home_effect_isolation_scenario = 0;
+        visual_effects_enabled = true;
+        home_effect_isolation_mask = masks[0];
+        for (uint8_t i = 0; i < SCENARIO_COUNT; ++i) {
+            home_effect_isolation_stats[i] = FrameTimingStats{};
+        }
+        esp_lv_adapter_set_frame_timing_enabled(true);
+        Serial.println("[HomeIsolation] Waiting for startup splash/Wi-Fi/NTP resolution: complete");
+        Serial.println("[HomeIsolation] 9 scenarios, each measured for 5000ms after transition fade + 500ms settle");
+        Serial.println("[HomeIsolation] HOME particle count=8; 8 moving simultaneously after stagger; durations=5600-7600ms, delay=230ms each, opacity=40 dark/60 light; y movement only, no transform/zoom/rotation; object invalidation ~3-6px");
+        Serial.println("[HomeIsolation] NFC rings=3 (212/198/184px); opacity loop 2100/1900/1700ms with playback, no scale/transform; invalidation bounds up to 212x212px");
+        Serial.println("[HomeIsolation] Card=190x122px, align offset 0..-6px, 1800ms playback loop; no shadow on card, no opacity/transform/zoom/rotation; invalidation about card bounds");
+        Serial.println("[HomeIsolation] Pulses removed: waiting dot and NFC panel border remain static; fade excluded from sample; clock timer updates text each 1000ms, not an LVGL animation");
+        home_effect_isolation_waiting_for_fade = true;
+        mostrar_pantalla(PANTALLA_ESPERA);
+        lv_timer_set_period(timer, HOME_EFFECT_ISOLATION_PRE_CAPTURE_MS);
+        lv_timer_reset(timer);
+        return;
+    }
+
+    if (home_effect_isolation_waiting_for_fade) {
+        home_effect_isolation_waiting_for_fade = false;
+        Serial.printf("[HomeIsolation] BEGIN %s; decorative mask=0x%02X\n",
+                      names[home_effect_isolation_scenario],
+                      static_cast<unsigned>(home_effect_isolation_mask));
+        frame_timing_begin(names[home_effect_isolation_scenario], false);
+        lv_timer_set_period(timer, HOME_EFFECT_ISOLATION_HOLD_MS);
+        lv_timer_reset(timer);
+        return;
+    }
+
+    frame_timing_finish();
+    home_effect_isolation_stats[home_effect_isolation_scenario] = frame_timing_current;
+    ++home_effect_isolation_scenario;
+    if (home_effect_isolation_scenario >= SCENARIO_COUNT) {
+        Serial.println("[HomeIsolation] SUMMARY label | samples | avg ms | P95 upper ms | max ms | >33/>50/>100 | anim start->end | timers start->end");
+        for (uint8_t i = 0; i < SCENARIO_COUNT; ++i) {
+            const FrameTimingStats &stats = home_effect_isolation_stats[i];
+            const uint32_t avg_tenth_ms = stats.samples == 0 ? 0 :
+                static_cast<uint32_t>((stats.interval_sum_us * 10ULL) / stats.samples / 1000ULL);
+            const uint32_t max_tenth_ms = stats.interval_max_us / 100U;
+            frame_timing_current = stats;
+            Serial.printf("[HomeIsolation] %s | %lu | %lu.%lu | %s | %lu.%lu | %lu/%lu/%lu | %u->%u | %u->%u\n",
+                          names[i], static_cast<unsigned long>(stats.samples),
+                          static_cast<unsigned long>(avg_tenth_ms / 10U),
+                          static_cast<unsigned long>(avg_tenth_ms % 10U), frame_timing_p95_label(),
+                          static_cast<unsigned long>(max_tenth_ms / 10U),
+                          static_cast<unsigned long>(max_tenth_ms % 10U),
+                          static_cast<unsigned long>(stats.over_33ms),
+                          static_cast<unsigned long>(stats.over_50ms),
+                          static_cast<unsigned long>(stats.over_100ms),
+                          static_cast<unsigned>(stats.animations_at_start),
+                          static_cast<unsigned>(stats.animations_at_end),
+                          static_cast<unsigned>(stats.timers_at_start),
+                          static_cast<unsigned>(stats.timers_at_end));
+        }
+        home_effect_isolation_mask = HOME_EFFECT_ALL;
+        home_effect_isolation_running = false;
+        home_effect_isolation_waiting_for_fade = false;
+        esp_lv_adapter_set_frame_timing_enabled(false);
+        home_effect_isolation_timer = nullptr;
+        lv_timer_del(timer);
+        Serial.println("[HomeIsolation] Complete; normal Home effects restored; no code optimization was applied");
+        return;
+    }
+
+    home_effect_isolation_mask = masks[home_effect_isolation_scenario];
+    home_effect_isolation_waiting_for_fade = true;
+    mostrar_pantalla(PANTALLA_ESPERA);
+    lv_timer_set_period(timer, HOME_EFFECT_ISOLATION_PRE_CAPTURE_MS);
+    lv_timer_reset(timer);
+}
+
 void performance_test_step_cb(lv_timer_t *timer)
 {
     (void)timer;
@@ -1325,10 +1721,7 @@ void create_nfc_area(lv_obj_t *screen)
     apply_arcade_button_style(demo_button, 0xE8F0FF, BLUE);
     lv_obj_add_flag(demo_button, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(demo_button, arcade_button_feedback_event, LV_EVENT_ALL, nullptr); lv_obj_add_event_cb(demo_button, demo_entry_event, LV_EVENT_CLICKED, nullptr);
     lv_obj_t *demo_label = lv_label_create(demo_button); lv_label_set_text(demo_label, "ENTRAR A DEMO"); lv_obj_set_style_text_font(demo_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(demo_label, lv_color_hex(INK), 0); lv_obj_center(demo_label);
-    if (visual_effects_enabled) {
-        start_waiting_indicator_animation();
-        start_nfc_animations();
-    }
+    if (visual_effects_enabled) start_nfc_animations();
 }
 
 void create_status_chip(lv_obj_t *parent, lv_coord_t x, lv_coord_t width, uint32_t bg, uint32_t dot_color, const char *text, lv_obj_t **label_out = nullptr)
@@ -1339,39 +1732,21 @@ void create_status_chip(lv_obj_t *parent, lv_coord_t x, lv_coord_t width, uint32
     if (label_out) *label_out = label;
 }
 
-void draw_config_gear(lv_obj_t *canvas)
+lv_obj_t *create_config_gear_part(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                  lv_coord_t width, lv_coord_t height,
+                                  uint32_t color, lv_coord_t radius)
 {
-    lv_canvas_set_buffer(canvas, config_gear_canvas_buffer, CONFIG_GEAR_SIZE,
-                         CONFIG_GEAR_SIZE, LV_IMG_CF_TRUE_COLOR_CHROMA_KEYED);
-    lv_canvas_fill_bg(canvas, lv_color_hex(0x00FF00), LV_OPA_COVER);
-
-    lv_draw_rect_dsc_t gear_part;
-    lv_draw_rect_dsc_init(&gear_part);
-    gear_part.bg_color = lv_color_hex(BLUE);
-    gear_part.bg_opa = LV_OPA_COVER;
-    gear_part.border_width = 0;
-    gear_part.radius = 2;
-    lv_canvas_draw_rect(canvas, 12, 1, 8, 8, &gear_part);
-    lv_canvas_draw_rect(canvas, 12, 23, 8, 8, &gear_part);
-    lv_canvas_draw_rect(canvas, 1, 12, 8, 8, &gear_part);
-    lv_canvas_draw_rect(canvas, 23, 12, 8, 8, &gear_part);
-    lv_canvas_draw_rect(canvas, 4, 4, 7, 7, &gear_part);
-    lv_canvas_draw_rect(canvas, 21, 4, 7, 7, &gear_part);
-    lv_canvas_draw_rect(canvas, 4, 21, 7, 7, &gear_part);
-    lv_canvas_draw_rect(canvas, 21, 21, 7, 7, &gear_part);
-
-    gear_part.radius = LV_RADIUS_CIRCLE;
-    lv_canvas_draw_rect(canvas, 6, 6, 20, 20, &gear_part);
-
-    gear_part.bg_color = lv_color_hex(0xFBEAF2);
-    lv_canvas_draw_rect(canvas, 12, 12, 8, 8, &gear_part);
-}
-
-void config_gear_rotation_exec(void *object, int32_t angle)
-{
-    config_gear_angle = angle % 3600;
-    if (config_gear_angle < 0) config_gear_angle += 3600;
-    lv_obj_set_style_transform_angle(static_cast<lv_obj_t *>(object), config_gear_angle, 0);
+    lv_obj_t *part = lv_obj_create(parent);
+    lv_obj_remove_style_all(part);
+    lv_obj_set_size(part, width, height);
+    lv_obj_set_pos(part, x, y);
+    lv_obj_set_style_bg_color(part, lv_color_hex(color), 0);
+    lv_obj_set_style_bg_opa(part, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(part, 0, 0);
+    lv_obj_set_style_radius(part, radius, 0);
+    lv_obj_set_style_opa(part, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(part, LV_OBJ_FLAG_HIDDEN | LV_OBJ_FLAG_CLICKABLE);
+    return part;
 }
 
 void create_status_bar(lv_obj_t *screen)
@@ -1381,27 +1756,23 @@ void create_status_bar(lv_obj_t *screen)
     create_status_chip(bar, 204, 190, 0xFFF4D8, YELLOW, "NFC pendiente", &nfc_status_label);
     create_status_chip(bar, 414, 226, 0xE8F0FF, BLUE, "Wi-Fi sin conexi\xC3\xB3n", &wifi_status_label);
     lv_obj_t *settings = lv_obj_create(bar); lv_obj_remove_style_all(settings); lv_obj_set_size(settings, 72, 44); lv_obj_set_pos(settings, 668, 6); apply_arcade_button_style(settings, 0xFBEAF2, PINK); lv_obj_add_flag(settings, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(settings, arcade_button_feedback_event, LV_EVENT_ALL, nullptr); lv_obj_add_event_cb(settings, config_event, LV_EVENT_CLICKED, nullptr);
-    config_gear_animating = false;
-    config_gear_canvas = lv_canvas_create(settings);
-    lv_obj_set_size(config_gear_canvas, CONFIG_GEAR_SIZE, CONFIG_GEAR_SIZE);
-    lv_obj_set_style_transform_pivot_x(config_gear_canvas, CONFIG_GEAR_SIZE / 2, 0);
-    lv_obj_set_style_transform_pivot_y(config_gear_canvas, CONFIG_GEAR_SIZE / 2, 0);
-    lv_obj_set_style_transform_angle(config_gear_canvas, 0, 0);
-    config_gear_angle = 0;
-    draw_config_gear(config_gear_canvas);
-    lv_obj_align(config_gear_canvas, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_clear_flag(config_gear_canvas, LV_OBJ_FLAG_CLICKABLE);
-    if (visual_effects_enabled) {
-        lv_anim_t idle_rotation;
-        lv_anim_init(&idle_rotation);
-        lv_anim_set_var(&idle_rotation, config_gear_canvas);
-        lv_anim_set_values(&idle_rotation, 0, 3600);
-        lv_anim_set_time(&idle_rotation, CONFIG_GEAR_IDLE_ROTATION_MS);
-        lv_anim_set_repeat_count(&idle_rotation, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&idle_rotation, lv_anim_path_linear);
-        lv_anim_set_exec_cb(&idle_rotation, config_gear_rotation_exec);
-        lv_anim_start(&idle_rotation);
-    }
+    const uint32_t gear_color = theme_palette().primary_text;
+    const lv_coord_t gear_x = (72 - CONFIG_GEAR_SIZE) / 2;
+    const lv_coord_t gear_y = (44 - CONFIG_GEAR_SIZE) / 2;
+    // Draw each opaque part directly on the existing button. This avoids the
+    // canvas and transformed-container render paths that appeared blank on-device.
+    create_config_gear_part(settings, gear_x + 13, gear_y + 2, 6, 8, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 13, gear_y + 22, 6, 8, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 2, gear_y + 13, 8, 6, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 22, gear_y + 13, 8, 6, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 6, gear_y + 6, 7, 7, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 19, gear_y + 6, 7, 7, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 6, gear_y + 19, 7, 7, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 19, gear_y + 19, 7, 7, gear_color, 2);
+    create_config_gear_part(settings, gear_x + 6, gear_y + 6, 20, 20,
+                            gear_color, LV_RADIUS_CIRCLE);
+    create_config_gear_part(settings, gear_x + 12, gear_y + 12, 8, 8,
+                            0xFBEAF2, LV_RADIUS_CIRCLE);
 }
 
 void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t height,
@@ -1415,12 +1786,12 @@ void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t heigh
     obtener_texto_fecha_hora(date_text, sizeof(date_text), time_text, sizeof(time_text));
     date_label = lv_label_create(date_card); lv_label_set_text(date_label, date_text);
     lv_obj_set_style_text_font(date_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(date_label, lv_color_hex(INK), 0);
-    lv_obj_set_style_text_align(date_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(date_label, width - 20); lv_obj_set_height(date_label, 38); lv_label_set_long_mode(date_label, LV_LABEL_LONG_WRAP); lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_set_style_text_align(date_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(date_label, width - 20); lv_obj_set_height(date_label, 22); lv_label_set_long_mode(date_label, LV_LABEL_LONG_CLIP); lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 5);
     clock_label = lv_label_create(date_card); lv_obj_set_style_text_font(clock_label, &lv_font_montserrat_26, 0);
     lv_label_set_text(clock_label, time_text);
-    lv_obj_set_width(clock_label, width - 12); lv_label_set_long_mode(clock_label, LV_LABEL_LONG_CLIP);
+    lv_obj_set_width(clock_label, width - 12); lv_obj_set_height(clock_label, 36); lv_label_set_long_mode(clock_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(clock_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(clock_label, lv_color_hex(PURPLE), 0); lv_obj_align(clock_label, LV_ALIGN_BOTTOM_MID, 0, -6);
+    lv_obj_set_style_text_color(clock_label, lv_color_hex(PURPLE), 0); lv_obj_align(clock_label, LV_ALIGN_BOTTOM_MID, 0, -3);
 }
 
 void create_student_topbar(lv_obj_t *screen, const char *title, bool show_exit, bool show_profile)
@@ -1478,8 +1849,9 @@ void demo_menu_event(lv_event_t *event)
     lv_obj_t *button = lv_event_get_target(event);
     const lv_event_code_t code = lv_event_get_code(event);
     if (code == LV_EVENT_PRESSED) {
-        lv_obj_set_style_transform_zoom(button, 246, 0);
-    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        start_button_press_feedback(button);
+    } else if (code == LV_EVENT_PRESS_LOST) {
+        lv_anim_del(button, button_press_zoom_exec);
         lv_obj_set_style_transform_zoom(button, 256, 0);
     } else if (code == LV_EVENT_CLICKED) {
         register_student_activity();
@@ -1583,29 +1955,7 @@ void demo_exit_event(lv_event_t *event)
 void config_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
-    if (!visual_effects_enabled || config_gear_canvas == nullptr) {
-        mostrar_pantalla(PANTALLA_CONFIGURACION);
-        return;
-    }
-    if (config_gear_animating) return;
-
-    config_gear_animating = true;
-    lv_anim_t gear_anim;
-    lv_anim_init(&gear_anim);
-    lv_anim_set_var(&gear_anim, config_gear_canvas);
-    lv_anim_set_values(&gear_anim, config_gear_angle,
-                       config_gear_angle + CONFIG_GEAR_ROTATION_DEG10);
-    lv_anim_set_time(&gear_anim, CONFIG_GEAR_ROTATION_MS);
-    lv_anim_set_path_cb(&gear_anim, lv_anim_path_ease_out);
-    lv_anim_set_exec_cb(&gear_anim, config_gear_rotation_exec);
-    lv_anim_set_ready_cb(&gear_anim, [](lv_anim_t *) {
-        config_gear_animating = false;
-        if (pantalla_actual != PANTALLA_ESPERA) return;
-        if (config_gear_canvas) lv_anim_del(config_gear_canvas, config_gear_rotation_exec);
-        config_gear_canvas = nullptr;
-        mostrar_pantalla(PANTALLA_CONFIGURACION);
-    });
-    lv_anim_start(&gear_anim);
+    mostrar_pantalla(PANTALLA_CONFIGURACION);
 }
 
 void config_theme_event(lv_event_t *event)
@@ -1783,7 +2133,8 @@ void create_theme_option(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, const cha
 }
 
 void create_config_toggle(lv_obj_t *parent, lv_coord_t y, const char *title, const char *description,
-                          bool enabled, lv_event_cb_t callback)
+                          bool enabled, lv_event_cb_t callback,
+                          const lv_font_t *description_font = &lv_font_montserrat_14)
 {
     lv_obj_t *row = lv_obj_create(parent); lv_obj_remove_style_all(row);
     lv_obj_set_size(row, 336, 68); lv_obj_align(row, LV_ALIGN_TOP_LEFT, 12, y);
@@ -1795,7 +2146,7 @@ void create_config_toggle(lv_obj_t *parent, lv_coord_t y, const char *title, con
     lv_obj_set_width(label, 310); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(INK), 0);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 12, 4);
     label = lv_label_create(row); lv_label_set_text(label, description);
-    lv_obj_set_width(label, 310); lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0); lv_obj_set_style_text_color(label, lv_color_hex(MUTED), 0);
+    lv_obj_set_width(label, 310); lv_obj_set_style_text_font(label, description_font, 0); lv_obj_set_style_text_color(label, lv_color_hex(MUTED), 0);
     lv_obj_align(label, LV_ALIGN_TOP_LEFT, 12, 25);
 
     label = lv_label_create(row); lv_label_set_text(label, enabled ? "ACTIVADO" : "DESACTIVADO");
@@ -1847,7 +2198,8 @@ void create_config_screen(lv_obj_t *screen)
     lv_obj_set_style_text_font(theme_state, &lv_font_montserrat_14, 0); lv_obj_set_style_text_color(theme_state, lv_color_hex(BLUE), 0); lv_obj_align(theme_state, LV_ALIGN_TOP_LEFT, 14, 96);
 
     create_config_toggle(left, 120, "MONITOR DE RENDIMIENTO", "FPS, RAM y PSRAM", performance_monitor_enabled, config_performance_event);
-    create_config_toggle(left, 202, "EFECTOS VISUALES", "Partículas y animaciones suaves", visual_effects_enabled, config_effects_event);
+    create_config_toggle(left, 202, "EFECTOS VISUALES", "Part\xC3\xAD" "culas y animaciones suaves",
+                         visual_effects_enabled, config_effects_event, &banco_escolar_font_16);
 
     lv_obj_t *network = lv_obj_create(panel); lv_obj_remove_style_all(network); lv_obj_set_size(network, 350, 280); lv_obj_set_pos(network, 390, 10); set_panel_style(network, lv_color_hex(theme_palette().surface), 14); lv_obj_clear_flag(network, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_style_border_width(network, 1, 0); lv_obj_set_style_border_color(network, lv_color_hex(theme_palette().border), 0);
@@ -2979,33 +3331,11 @@ bool is_back_navigation(Pantalla from, Pantalla to)
     return false;
 }
 
-lv_scr_load_anim_t transition_animation_for(Pantalla from, Pantalla to)
-{
-    (void)from;
-    (void)to;
-    return LV_SCR_LOAD_ANIM_FADE_ON;
-}
-
-void transition_release_cb(lv_timer_t *timer)
-{
-    performance_transition_ms = millis() - performance_transition_started_ms;
-    if (PERFORMANCE_TEST_ENABLED) {
-        PerformanceScreenStats &stats = performance_stats[static_cast<uint8_t>(performance_transition_to)];
-        stats.transition_ms = performance_transition_ms;
-        Serial.printf("[Perf] Transition %s->%s %lums\n",
-                      performance_screen_name(performance_transition_from),
-                      performance_screen_name(performance_transition_to),
-                      static_cast<unsigned long>(performance_transition_ms));
-    }
-    transition_in_progress = false;
-    if (transition_release_timer == timer) transition_release_timer = nullptr;
-    lv_timer_del(timer);
-}
-
 void mostrar_pantalla(Pantalla pantalla)
 {
     if (transition_in_progress) return;
     const Pantalla previous_screen = pantalla_actual;
+    lv_obj_t *const previous_screen_obj = lv_scr_act();
     transition_in_progress = true;
     const uint32_t screen_create_started_ms = millis();
     if (demo_detection_timer && pantalla != PANTALLA_DETECCION) { lv_timer_del(demo_detection_timer); demo_detection_timer = nullptr; }
@@ -3066,8 +3396,40 @@ void mostrar_pantalla(Pantalla pantalla)
     performance_transition_from = previous_screen;
     performance_transition_to = pantalla;
     performance_transition_started_ms = millis();
-    lv_scr_load_anim(next_screen, transition_animation_for(previous_screen, pantalla), 220, 0, true);
-    transition_release_timer = lv_timer_create(transition_release_cb, 260, nullptr);
+    if (FRAME_TIMING_TEST_ENABLED && frame_timing_test_running) {
+        char transition_label[48];
+        snprintf(transition_label, sizeof(transition_label), "%s->%s",
+                 performance_screen_name(previous_screen), performance_screen_name(pantalla));
+        frame_timing_begin(transition_label, true, 0);
+    }
+    lv_obj_set_style_opa(next_screen, LV_OPA_COVER, 0);
+    lv_obj_set_pos(next_screen, 0, 0);
+    lv_scr_load(next_screen);
+    if (previous_screen_obj != nullptr && previous_screen_obj != next_screen) {
+        lv_obj_del_async(previous_screen_obj);
+    }
+    performance_transition_ms = millis() - performance_transition_started_ms;
+    if (PERFORMANCE_TEST_ENABLED) {
+        PerformanceScreenStats &stats = performance_stats[static_cast<uint8_t>(performance_transition_to)];
+        stats.transition_ms = performance_transition_ms;
+        Serial.printf("[Perf] Instant screen change %s->%s %lums\n",
+                      performance_screen_name(performance_transition_from),
+                      performance_screen_name(performance_transition_to),
+                      static_cast<unsigned long>(performance_transition_ms));
+    }
+    transition_in_progress = false;
+    if (FRAME_TIMING_TEST_ENABLED && frame_timing_test_running &&
+        frame_timing_capture_active && frame_timing_current.transition) {
+        frame_timing_finish();
+        char screen_label[48];
+        snprintf(screen_label, sizeof(screen_label), "%s active",
+                 performance_screen_name(pantalla_actual));
+        frame_timing_begin(screen_label, false);
+        if (frame_timing_test_timer) {
+            lv_timer_set_period(frame_timing_test_timer, FRAME_TIMING_PHASE_HOLD_MS);
+            lv_timer_reset(frame_timing_test_timer);
+        }
+    }
 }
 
 void create_ui()
@@ -3102,13 +3464,30 @@ void startup_progress_timer_cb(lv_timer_t *timer)
         const bool disconnected_without_attempt =
             wifi_state == WiFiState::DISCONNECTED && elapsed >= 800;
         const bool connection_timeout = elapsed >= 13000;
-        if (wifi_state == WiFiState::CONNECTED || wifi_state == WiFiState::ERROR ||
-            disconnected_without_attempt || connection_timeout) {
-            const bool connected = wifi_state == WiFiState::CONNECTED;
-            set_boot_progress(76, connected ? "Wi-Fi conectado" :
-                                               "Wi-Fi no disponible; continuando");
-            set_boot_progress(82, time_manager.isSynchronized() ?
-                                  "Hora sincronizada" : "Hora: pendiente; continuando");
+        if (wifi_state == WiFiState::CONNECTED) {
+            if (!boot_wifi_connection_seen) {
+                boot_wifi_connection_seen = true;
+                boot_wifi_connected_ms = now;
+            }
+            set_boot_progress(76, "Wi-Fi conectado");
+            if (time_manager.isSynchronized()) {
+                set_boot_progress(82, "Hora sincronizada");
+                set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
+                                      "MicroSD: No instalada" : "MicroSD no disponible");
+                boot_wifi_resolved = true;
+            } else if (now - boot_wifi_connected_ms >= BOOT_NTP_WAIT_MS) {
+                boot_ntp_fallback_elapsed = true;
+                set_boot_progress(82, "Hora: pendiente; continuando");
+                set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
+                                      "MicroSD: No instalada" : "MicroSD no disponible");
+                boot_wifi_resolved = true;
+            } else {
+                set_boot_progress(82, "Sincronizando hora...");
+            }
+        } else if (wifi_state == WiFiState::ERROR || disconnected_without_attempt ||
+                   connection_timeout) {
+            set_boot_progress(76, "Wi-Fi no disponible; continuando");
+            set_boot_progress(82, "Hora: pendiente; continuando");
             set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
                                   "MicroSD: No instalada" : "MicroSD no disponible");
             boot_wifi_resolved = true;
@@ -3123,12 +3502,24 @@ void startup_progress_timer_cb(lv_timer_t *timer)
         create_ui();
         boot_defer_screen_load = false;
         boot_ui_prepared = true;
-        set_boot_progress(100, "Sistema listo");
-        boot_ready_since_ms = millis();
         return;
     }
 
-    if (millis() - boot_ready_since_ms < 350 || boot_deferred_screen == nullptr) return;
+    if (!boot_final_hold_started) {
+        if (now - boot_splash_started_ms < BOOT_MIN_SPLASH_MS) return;
+        if (time_manager.isSynchronized()) {
+            refresh_clock_labels();
+            ui_time_synchronized = true;
+        }
+        update_boot_detail();
+        set_boot_progress(100, "Sistema listo");
+        boot_ready_since_ms = now;
+        boot_final_hold_started = true;
+        return;
+    }
+
+    const uint32_t final_visible_ms = BOOT_FINAL_HOLD_MS + BOOT_PROGRESS_ANIMATION_MS;
+    if (now - boot_ready_since_ms < final_visible_ms || boot_deferred_screen == nullptr) return;
 
     boot_splash_active = false;
     boot_splash_screen = nullptr;
@@ -3147,6 +3538,15 @@ void startup_progress_timer_cb(lv_timer_t *timer)
     if (PERFORMANCE_TEST_ENABLED && performance_test_timer == nullptr) {
         performance_test_timer = lv_timer_create(performance_test_step_cb,
                                                  PERFORMANCE_SCREEN_HOLD_MS, nullptr);
+    }
+    if (FRAME_TIMING_TEST_ENABLED && frame_timing_test_timer == nullptr) {
+        frame_timing_test_timer = lv_timer_create(frame_timing_test_step_cb, 500, nullptr);
+    }
+    if (HOME_EFFECT_ISOLATION_TEST_ENABLED && home_effect_isolation_timer == nullptr) {
+        home_effect_isolation_timer = lv_timer_create(home_effect_isolation_step_cb, 500, nullptr);
+    }
+    if (HOME_POST_OPT_TEST_ENABLED && home_post_opt_test_timer == nullptr) {
+        home_post_opt_test_timer = lv_timer_create(home_post_opt_test_step_cb, 500, nullptr);
     }
     if (boot_progress_timer == timer) boot_progress_timer = nullptr;
     lv_timer_del(timer);
@@ -3225,6 +3625,15 @@ void loop()
 {
     wifi_manager.update();
     time_manager.update(wifi_manager.isConnected());
+    const bool synchronized = time_manager.isSynchronized();
+    if (synchronized && !ui_time_synchronized) {
+        ui_time_synchronized = true;
+        if (esp_lv_adapter_lock(100) == ESP_OK) {
+            refresh_clock_labels();
+            esp_lv_adapter_unlock();
+        }
+    }
     storage_manager.updateSelfTest();
     vTaskDelay(pdMS_TO_TICKS(50));
 }
+

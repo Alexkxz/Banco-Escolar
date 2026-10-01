@@ -73,6 +73,12 @@ void esp_lv_adapter_unlock(void);
 lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_config_t *config);
 lv_indev_t *esp_lv_adapter_register_touch(const esp_lv_adapter_touch_config_t *config);
 uint32_t esp_lv_adapter_get_frame_count(void);
+void esp_lv_adapter_set_frame_timing_enabled(bool enabled);
+uint32_t esp_lv_adapter_get_frame_interval_sequence(void);
+uint32_t esp_lv_adapter_read_frame_intervals(uint32_t *sequence_cursor,
+                                             uint32_t *intervals_us,
+                                             uint32_t capacity,
+                                             uint32_t *dropped_count);
 
 #ifdef __cplusplus
 }

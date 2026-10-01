@@ -33,12 +33,27 @@ typedef struct {
 
 static esp_lv_adapter_arduino_context_t s_ctx = {};
 static volatile uint32_t s_frame_count = 0;
+static constexpr uint32_t FRAME_INTERVAL_HISTORY_SIZE = 256;
+static volatile uint32_t s_frame_interval_sequence = 0;
+static volatile uint32_t s_frame_intervals_us[FRAME_INTERVAL_HISTORY_SIZE] = {};
+static bool s_frame_timing_enabled = false;
+static int64_t s_previous_frame_timestamp_us = 0;
 
 static void display_monitor_cb(lv_disp_drv_t *disp_drv, uint32_t render_time, uint32_t refreshed_pixels)
 {
     LV_UNUSED(disp_drv);
     LV_UNUSED(render_time);
     LV_UNUSED(refreshed_pixels);
+    if (s_frame_timing_enabled) {
+        const int64_t now_us = esp_timer_get_time();
+        if (s_previous_frame_timestamp_us != 0) {
+            const uint32_t interval_us = static_cast<uint32_t>(now_us - s_previous_frame_timestamp_us);
+            const uint32_t sequence = s_frame_interval_sequence + 1;
+            s_frame_intervals_us[sequence % FRAME_INTERVAL_HISTORY_SIZE] = interval_us;
+            s_frame_interval_sequence = sequence;
+        }
+        s_previous_frame_timestamp_us = now_us;
+    }
     ++s_frame_count;
 }
 
@@ -236,6 +251,49 @@ lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_confi
 uint32_t esp_lv_adapter_get_frame_count(void)
 {
     return s_frame_count;
+}
+
+void esp_lv_adapter_set_frame_timing_enabled(bool enabled)
+{
+    s_frame_timing_enabled = enabled;
+    s_previous_frame_timestamp_us = 0;
+    if (enabled) s_frame_interval_sequence = 0;
+}
+
+uint32_t esp_lv_adapter_get_frame_interval_sequence(void)
+{
+    return s_frame_interval_sequence;
+}
+
+uint32_t esp_lv_adapter_read_frame_intervals(uint32_t *sequence_cursor,
+                                             uint32_t *intervals_us,
+                                             uint32_t capacity,
+                                             uint32_t *dropped_count)
+{
+    if (sequence_cursor == nullptr || intervals_us == nullptr || capacity == 0) return 0;
+
+    const uint32_t latest_sequence = s_frame_interval_sequence;
+    uint32_t available = latest_sequence - *sequence_cursor;
+    uint32_t dropped = 0;
+    if (available > FRAME_INTERVAL_HISTORY_SIZE) {
+        dropped = available - FRAME_INTERVAL_HISTORY_SIZE;
+        *sequence_cursor += dropped;
+        available = FRAME_INTERVAL_HISTORY_SIZE;
+    }
+    if (available > capacity) {
+        const uint32_t skip = available - capacity;
+        dropped += skip;
+        *sequence_cursor += skip;
+        available = capacity;
+    }
+
+    for (uint32_t i = 0; i < available; ++i) {
+        const uint32_t sequence = *sequence_cursor + i + 1;
+        intervals_us[i] = s_frame_intervals_us[sequence % FRAME_INTERVAL_HISTORY_SIZE];
+    }
+    *sequence_cursor += available;
+    if (dropped_count) *dropped_count = dropped;
+    return available;
 }
 
 lv_indev_t *esp_lv_adapter_register_touch(const esp_lv_adapter_touch_config_t *config)

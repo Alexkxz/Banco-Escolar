@@ -110,4 +110,4 @@ constexpr bool STORAGE_SELF_TEST = false;
 
 // Keep disabled in normal firmware. Enabling it permits one guarded format of
 // the expected LittleFS partition after a failed mount.
-constexpr bool STORAGE_ALLOW_ONE_TIME_FORMAT = true;
+constexpr bool STORAGE_ALLOW_ONE_TIME_FORMAT = false;
