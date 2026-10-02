@@ -21,17 +21,17 @@ física se indica por separado y no se deduce de compilar.
   `CST6`; el arranque espera sincronización con fallback no bloqueante.
 - **PREPARADO / DESHABILITADO:** lógica de lectura PN532 desarrollada, pero
   `PN532_ENABLED=false` y el lector está desconectado. No se considera operativo.
-- **IMPLEMENTADO / DEMO:** modelo de 13 alumnos provisionales y vistas de
-  alumno, cuenta, progreso, lectura, dictado, transferencia y logros demo.
-- **PREPARADO:** modelo `Student`, tipos de cuenta y movimientos; las
-  transferencias de UI no escriben movimientos persistentes.
+- **IMPLEMENTADO / DEMO:** modelo de 13 alumnos provisionales y vistas académicas,
+  cuenta y logros demo; `Registrar salida` usa persistencia local validada.
+- **IMPLEMENTADO / VALIDADO:** `Registrar salida` escribe un movimiento individual
+  en LittleFS y lo relee por ID; el nombre se resuelve desde el `student_id` persistido.
 - **PREPARADO:** nombre de moneda configurable en `src/app_config.h` mediante
   `CURRENCY_NAME`.
 - **IMPLEMENTADO:** umbrales de Fluidez lectora por grado en
   `src/academic_config.h`; otros niveles, logros y reglas de asistencia quedan
   pendientes.
-- **IMPLEMENTADO / VALIDADO:** LittleFS y la base de `StorageManager` están
-  disponibles; la integración de movimientos reales de la UI sigue pendiente.
+- **IMPLEMENTADO / VALIDADO:** LittleFS y `StorageManager` guardan movimientos
+  reales de salida individual; la validación física confirmó persistencia y continuidad de IDs.
 - **FUTURO:** servidor/API, Panel del Maestro, sincronización y OTA.
 
 ## Modelo de dominio
@@ -47,9 +47,9 @@ El saldo se modifica mediante `setStudentBalance()` y la UI se refresca desde
 `StudentMovement` contempla alumno, cantidad, tipo entrada/salida, motivo,
 fecha/hora y origen (`Banco Escolar` o `Panel del Maestro`). `StorageManager`
 implementa `MovementRecord` y las operaciones `appendMovement()`,
-`readMovements()`, conteo y pendientes en LittleFS. La UI real todavía no está
-conectada a estas operaciones; la persistencia de movimientos de Áureos
-corresponde a la Fase 5A.4.
+`readMovements()`, conteo y pendientes en LittleFS. La salida individual de Áureos
+ya usa `appendMovement()` y relee el registro guardado para presentar el alumno
+vinculado por `student_id`; el historial visible completo corresponde a 5B.
 
 El nombre actual de la moneda es **Áureos**, pero la interfaz lo obtiene de
 `CURRENCY_NAME`; para renombrarlo en el futuro se cambia un solo lugar.
@@ -196,16 +196,17 @@ Los detalles y límites operativos se mantienen en la referencia
   `/data/movements.ndjson` y ofrece `MovementRecord`, `appendMovement()`,
   `readMovements()`, `getMovementCount()`, `getPendingMovementCount()` y
   `clearLocalData()`.
-- **PENDIENTE — FASE 5A.4:** conectar movimientos reales de la UI a
-  `appendMovement()` y presentar el historial persistido. Las acciones actuales
-  de transferencia siguen siendo demo.
+- **IMPLEMENTADO / VALIDADO — FASES 5A.4–5A.7:** la UI registra salidas
+  individuales reales; se comprobaron físicamente los movimientos ID 1, 2 y 3,
+  su conteo tras reinicio y la resolución de `student_id=7` como Darío. El
+  historial visible completo sigue pendiente para 5B.
 - **FUTURO:** caché/cola de sincronización con el servidor y sincronización al
   recuperar la red. Los registros persistentes actuales no equivalen a una
   sincronización implementada.
 
 El diseño requiere que terminal y Panel sigan temporalmente con operaciones
-válidas sin Internet. En el ESP32 los movimientos reales aún requieren 5A.4.
-La escritura actual exige hora válida; el caso de arranque sin hora NTP queda
+válidas sin Internet. En el ESP32 las salidas individuales se guardan localmente;
+la escritura actual exige hora válida. El caso de arranque sin hora NTP queda
 por resolver y no autoriza omitir esa validación.
 
 ## Exportaciones y respaldos — FUTURO
@@ -239,8 +240,9 @@ Nunca escribir saldo o historial en la tarjeta.
   DARIO`) en el modelo `Student`, con nombre amigable para la interfaz.
 - **IMPLEMENTADO:** menú del alumno con `Mi cuenta`, `Mi progreso`, `Mis metas`
   y `Logros`. `Tienda` no forma parte de esta fase.
-- **IMPLEMENTADO / DEMO:** `Mi cuenta` muestra saldo, `CURRENCY_NAME` y tres
-  movimientos temporales del día. No hay historial persistente.
+- **IMPLEMENTADO / DEMO:** `Mi cuenta` muestra saldo demo, `CURRENCY_NAME` y tres
+  movimientos temporales del día. Los movimientos reales guardados aún no tienen
+  una pantalla de historial; esa vista corresponde a 5B.
 - **IMPLEMENTADO / DEMO:** `Mi progreso` enlaza a Fluidez lectora y Dictado de
   oraciones. Las pantallas consumen estructuras `ReadingRecord` y
   `WritingRecord`.
@@ -413,8 +415,12 @@ y reserva `next_mv_id` en NVS antes de escribir; gaps son aceptables y los IDs
 no se reutilizan. `clearLocalData()` borra solo el archivo conocido y conserva
 NVS y el contador. La infraestructura incluye `getPendingMovementCount()` y
 lectura de movimientos pendientes; la sincronización y el marcado durable como
-sincronizado siguen pendientes. Estas funciones aún no están conectadas a la
-UI de Áureos.
+sincronizado siguen pendientes. La UI de salida individual agrega y relee el
+movimiento por ID; las pruebas físicas confirmaron los IDs secuenciales 1–3,
+el conteo persistente tras reinicio y el vínculo `student_id=7` → Darío. Los
+registros siguen con `synced=false`; el saldo de UI permanece demo/RAM y no se
+reconstruye desde movimientos. `MovementRecord` mantiene `schema_version=1` y
+no almacena el nombre del alumno.
 
 ## microSD
 
@@ -451,9 +457,12 @@ de rendimiento; Skill `banco-escolar`.
 | 0S.1 | Skill creada | COMPLETADA |
 | 0S.2 | Documentación base | COMPLETADA |
 | 0S.2B | Arquitectura PWA/offline-first | COMPLETADA |
-| 0S.3 | Git estable y commit local | FASE ACTUAL |
-| 5A.4 | Persistencia real de Áureos | FUTURO |
-| 5A.5 | Validación de persistencia y reinicios | FUTURO |
+| 0S.3 | Git estable y commit local | COMPLETADA |
+| 5A.4 | Persistencia real de Áureos | COMPLETADA |
+| 5A.5 | Validación de persistencia y reinicios | COMPLETADA |
+| 5A.6 | Continuidad secuencial de IDs | COMPLETADA |
+| 5A.7 | Vínculo del movimiento con alumno mediante `student_id` | COMPLETADA |
+| 5B | Historial real de movimientos | FUTURO |
 | 5B | Historial real de movimientos | FUTURO |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
@@ -472,9 +481,10 @@ de rendimiento; Skill `banco-escolar`.
 | 18 | BLE solo si existe caso de uso | FUTURO |
 | 19 | OTA | FUTURO |
 
-La fase en curso es 0S.3: vincular Git, crear un commit local y revisar ese
-commit antes de autorizar un push. La implementación de persistencia real
-corresponde a 5A.4 y exige una solicitud separada. Todos los componentes de
+El bloque 5A.4–5A.7 quedó completado y validado físicamente. La siguiente fase
+es 5B, que implementará el historial real visible. El saldo persistente completo,
+la sincronización y la atomicidad de transferencias entre alumnos siguen pendientes.
+Todos los componentes de
 Panel/API/base central y sincronización aquí descritos son futuros: no se crean
 backend, endpoints, esquema de base de datos, manifest, Service Worker,
 IndexedDB ni pantallas en esta fase documental.

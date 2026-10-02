@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <memory>
 
 #include <Adafruit_PN532.h>
@@ -285,6 +286,12 @@ bool transfer_balance_warning = false;
 char transfer_keypad_buffer[8] = {};
 lv_obj_t *transfer_feedback_label = nullptr;
 lv_obj_t *transfer_keypad_input_label = nullptr;
+char movement_feedback_text[96] = {};
+uint64_t saved_movement_id = 0;
+uint16_t saved_movement_student_id = 0;
+bool saved_movement_reload_failed = false;
+size_t saved_movement_count = 0;
+int32_t saved_movement_balance = 0;
 
 const char *student_short_name(const Student *student)
 {
@@ -292,6 +299,45 @@ const char *student_short_name(const Student *student)
     if (student->preferred_name != nullptr) return student->preferred_name;
     const char *last_space = strrchr(student->name ? student->name : "", ' ');
     return last_space ? last_space + 1 : (student->name ? student->name : "Alumno");
+}
+
+bool read_stored_movement_by_id(uint64_t movement_id, MovementRecord &found_record)
+{
+    constexpr size_t PAGE_SIZE = 4;
+    const size_t movement_count = storage_manager.getMovementCount();
+    for (size_t offset = 0; offset < movement_count; offset += PAGE_SIZE) {
+        MovementRecord page[PAGE_SIZE] = {};
+        size_t read_count = 0;
+        if (storage_manager.readMovements(offset, page, PAGE_SIZE, read_count) != StorageResult::STORAGE_OK) {
+            return false;
+        }
+        for (size_t i = 0; i < read_count; ++i) {
+            if (page[i].id == movement_id) {
+                found_record = page[i];
+                return true;
+            }
+        }
+        if (read_count < PAGE_SIZE) break;
+    }
+    return false;
+}
+
+const char *movement_student_display_name(uint16_t student_id, char *fallback, size_t fallback_size)
+{
+    const Student *student = getStudentById(student_id);
+    if (student != nullptr) {
+        const char *display_name = student_short_name(student);
+        Serial.printf("[Movement] student_id=%u -> %s\n",
+                      static_cast<unsigned>(student_id), display_name);
+        return display_name;
+    }
+
+    Serial.printf("[Movement] Alumno no encontrado para student_id=%u\n",
+                  static_cast<unsigned>(student_id));
+    if (fallback == nullptr || fallback_size == 0) return "Alumno desconocido";
+    snprintf(fallback, fallback_size, "Alumno desconocido (ID %u)",
+             static_cast<unsigned>(student_id));
+    return fallback;
 }
 
 void mostrar_pantalla(Pantalla pantalla);
@@ -1859,6 +1905,7 @@ void demo_menu_event(lv_event_t *event)
         if (static_cast<Pantalla>(target) == PANTALLA_TRANSFERIR) {
             transfer_sender_id = selected_student ? selected_student->student_id : 0;
             transfer_receiver_id = 0; transfer_amount = 0; transfer_receiver_detected = false; transfer_balance_warning = false; transfer_keypad_buffer[0] = '\0';
+            movement_feedback_text[0] = '\0'; saved_movement_id = 0; saved_movement_count = 0; saved_movement_balance = 0;
         }
         mostrar_pantalla(static_cast<Pantalla>(target));
     }
@@ -1906,7 +1953,7 @@ void create_arcade_student_home(lv_obj_t *screen)
     animate_balance_card(balance);
     create_student_menu_button_sized(screen, 18, 226, 230, 96, 0xDDF3FF, BLUE, "Mi cuenta", "Consulta tus movimientos", PANTALLA_CUENTA);
     create_student_menu_button_sized(screen, 285, 226, 230, 96, 0xFFF4D8, ORANGE, "Mi progreso", "Mira tu avance escolar", PANTALLA_PROGRESO);
-    create_student_menu_button_sized(screen, 552, 226, 230, 96, 0xE8F0FF, BLUE, "Transferir", "Env\xC3\xAD" "a saldo", PANTALLA_TRANSFERIR);
+    create_student_menu_button_sized(screen, 552, 226, 230, 96, 0xE8F0FF, BLUE, "Registrar salida", "Restar Aureos", PANTALLA_TRANSFERIR);
     create_student_menu_button_sized(screen, 148, 338, 230, 96, 0xFBEAF2, PURPLE, "Mis metas", "Mira cu\xC3\xA1nto has avanzado", PANTALLA_METAS);
     create_student_menu_button_sized(screen, 408, 338, 230, 96, 0xE4F7EC, GREEN, "Logros", "Descubre lo que has conseguido", PANTALLA_LOGROS);
 }
@@ -1928,7 +1975,7 @@ void create_student_home(lv_obj_t *screen)
     animate_balance_card(balance);
     create_student_menu_button_sized(screen, 32, 208, 230, 96, 0xDDF3FF, BLUE, "Mi cuenta", "Consulta tus movimientos", PANTALLA_CUENTA);
     create_student_menu_button_sized(screen, 285, 208, 230, 96, 0xFFF4D8, ORANGE, "Mi progreso", "Mira tu avance escolar", PANTALLA_PROGRESO);
-    create_student_menu_button_sized(screen, 538, 208, 230, 96, 0xE8F0FF, BLUE, "Transferir", "Envía saldo", PANTALLA_TRANSFERIR);
+    create_student_menu_button_sized(screen, 538, 208, 230, 96, 0xE8F0FF, BLUE, "Registrar salida", "Restar Aureos", PANTALLA_TRANSFERIR);
     create_student_menu_button_sized(screen, 155, 328, 230, 96, 0xFBEAF2, PURPLE, "Mis metas", "Mira cuánto has avanzado", PANTALLA_METAS);
     create_student_menu_button_sized(screen, 415, 328, 230, 96, 0xE4F7EC, GREEN, "Logros", "Descubre lo que has conseguido", PANTALLA_LOGROS);
 }
@@ -3131,13 +3178,85 @@ void transfer_keypad_event(lv_event_t *event)
 void transfer_continue_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
-    if (transfer_receiver_detected && transfer_amount > 0) { register_student_activity(); mostrar_pantalla(PANTALLA_TRANSFER_CONFIRMAR); }
+    if (transfer_sender_id != 0 && transfer_amount > 0) {
+        movement_feedback_text[0] = '\0';
+        register_student_activity();
+        mostrar_pantalla(PANTALLA_TRANSFER_CONFIRMAR);
+    }
 }
 
 void transfer_confirm_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
-    register_student_activity(); mostrar_pantalla(PANTALLA_TRANSFER_RESULTADO);
+    register_student_activity();
+
+    const Student *student = getStudentById(transfer_sender_id);
+    const AccountRecord *account = getAccountByStudentId(transfer_sender_id);
+    struct tm local_time = {};
+    if (student == nullptr || account == nullptr || transfer_amount == 0 ||
+        transfer_amount > static_cast<uint32_t>(std::numeric_limits<int32_t>::max()) ||
+        static_cast<int64_t>(transfer_amount) > account->aureos) {
+        snprintf(movement_feedback_text, sizeof(movement_feedback_text),
+                 "No se pudo guardar el movimiento.");
+        Serial.println("[Movement] Error: operacion o saldo invalidos");
+        mostrar_pantalla(PANTALLA_TRANSFER_CONFIRMAR);
+        return;
+    }
+    if (!time_manager.isSynchronized() || !time_manager.getLocalTime(local_time)) {
+        snprintf(movement_feedback_text, sizeof(movement_feedback_text),
+                 "No se pudo guardar.\nHora no sincronizada.");
+        Serial.println("[Movement] Error: hora no sincronizada");
+        mostrar_pantalla(PANTALLA_TRANSFER_CONFIRMAR);
+        return;
+    }
+
+    const size_t movement_count_before = storage_manager.getMovementCount();
+    const int32_t signed_amount = -static_cast<int32_t>(transfer_amount);
+    uint64_t created_id = 0;
+    Serial.println("[Movement] Guardando salida individual...");
+    const StorageResult result = storage_manager.appendMovement(
+        transfer_sender_id, signed_amount, StoredMovementType::EXIT,
+        "Salida manual", StoredRecordOrigin::TERMINAL, &created_id);
+    if (result != StorageResult::STORAGE_OK) {
+        const char *message = result == StorageResult::STORAGE_TIME_UNSYNCED
+                                  ? "No se pudo guardar.\nHora no sincronizada."
+                                  : (result == StorageResult::STORAGE_NOT_READY
+                                         ? "Almacenamiento no disponible."
+                                         : "No se pudo guardar. Intenta de nuevo.");
+        snprintf(movement_feedback_text, sizeof(movement_feedback_text), "%s", message);
+        Serial.printf("[Movement] Error de Storage: %u\n", static_cast<unsigned>(result));
+        mostrar_pantalla(PANTALLA_TRANSFER_CONFIRMAR);
+        return;
+    }
+
+    saved_movement_id = created_id;
+    saved_movement_student_id = 0;
+    saved_movement_reload_failed = false;
+    MovementRecord persisted_movement = {};
+    if (read_stored_movement_by_id(saved_movement_id, persisted_movement)) {
+        saved_movement_student_id = persisted_movement.student_id;
+        Serial.printf("[Movement] Releído ID=%llu student_id=%u\n",
+                      static_cast<unsigned long long>(saved_movement_id),
+                      static_cast<unsigned>(saved_movement_student_id));
+    } else {
+        saved_movement_student_id = transfer_sender_id;
+        saved_movement_reload_failed = true;
+        Serial.printf("[Movement] No se pudo releer el movimiento ID=%llu\n",
+                      static_cast<unsigned long long>(saved_movement_id));
+    }
+    const int32_t new_balance = account->aureos + signed_amount;
+    setAccountBalance(transfer_sender_id, new_balance);
+    saved_movement_count = storage_manager.getMovementCount();
+    saved_movement_balance = new_balance;
+    movement_feedback_text[0] = '\0';
+    Serial.printf("[Movement] ID=%llu student_id=%u amount=%ld count=%u (antes=%u)\n",
+                  static_cast<unsigned long long>(created_id),
+                  static_cast<unsigned>(transfer_sender_id),
+                  static_cast<long>(signed_amount),
+                  static_cast<unsigned>(saved_movement_count),
+                  static_cast<unsigned>(movement_count_before));
+    Serial.println("[Movement] Guardado correctamente; synced=false");
+    mostrar_pantalla(PANTALLA_TRANSFER_RESULTADO);
 }
 
 void transfer_cancel_event(lv_event_t *event)
@@ -3151,33 +3270,25 @@ void transfer_cancel_event(lv_event_t *event)
 
 void create_arcade_transfer_screen(lv_obj_t *screen)
 {
-    char transfer_title[48]; snprintf(transfer_title, sizeof(transfer_title), "Transferir %s", CURRENCY_NAME);
-    create_student_topbar(screen, transfer_title, false, false);
+    char movement_title[48]; snprintf(movement_title, sizeof(movement_title), "Registrar salida de %s", CURRENCY_NAME);
+    create_student_topbar(screen, movement_title, false, false);
     const Student *sender = getStudentById(transfer_sender_id ? transfer_sender_id : (selected_student ? selected_student->student_id : 0));
-    const Student *receiver = getStudentById(transfer_receiver_id);
     lv_obj_t *panel = make_content_panel(screen, GRID_MARGIN, 112, SCREEN_WIDTH - (GRID_MARGIN * 2), 282, 0xF7FBFF);
-    if (!transfer_receiver_detected || receiver == nullptr) {
-        lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, "TU SALDO"); lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(title, lv_color_hex(MUTED), 0); lv_obj_align(title, LV_ALIGN_TOP_LEFT, 28, 20);
-        char balance_text[40]; snprintf(balance_text, sizeof(balance_text), "%ld %s", static_cast<long>(getStudentBalance()), CURRENCY_NAME);
-        lv_obj_t *balance = lv_label_create(panel); lv_label_set_text(balance, balance_text); lv_obj_set_style_text_font(balance, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance, lv_color_hex(ORANGE), 0); lv_obj_align(balance, LV_ALIGN_TOP_LEFT, 28, 50);
-        lv_obj_t *icon = create_card_icon(panel); lv_obj_align(icon, LV_ALIGN_LEFT_MID, 48, 20);
-        lv_obj_t *hint = lv_label_create(panel); lv_label_set_text(hint, "ACERCA LA TARJETA DEL COMPAÑERO"); lv_obj_set_style_text_font(hint, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(hint, lv_color_hex(INK), 0); lv_obj_set_width(hint, 420); lv_obj_align(hint, LV_ALIGN_TOP_LEFT, 300, 106);
-        create_transfer_button(panel, 300, 164, 420, 48, "SIMULAR TARJETA RECEPTOR", transfer_receiver_event);
-    } else {
-        create_transfer_profile(panel, 46, "DE", sender, 0xDDF3FF);
-        create_transfer_profile(panel, 418, "PARA", receiver, 0xE4F7EC);
-        lv_obj_t *amount_title = lv_label_create(panel); lv_label_set_text(amount_title, "CANTIDAD A TRANSFERIR"); lv_obj_set_style_text_font(amount_title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(amount_title, lv_color_hex(MUTED), 0); lv_obj_align(amount_title, LV_ALIGN_TOP_LEFT, 46, 108);
-        char amount_text[40]; snprintf(amount_text, sizeof(amount_text), "%lu %s", static_cast<unsigned long>(transfer_amount), CURRENCY_NAME);
-        lv_obj_t *amount = lv_label_create(panel); lv_label_set_text(amount, amount_text); lv_obj_set_style_text_font(amount, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(amount, lv_color_hex(PURPLE), 0); lv_obj_set_width(amount, 300); lv_obj_align(amount, LV_ALIGN_TOP_LEFT, 46, 132);
-        create_transfer_button(panel, 46, 184, 100, 40, "+5", transfer_amount_event, 5);
-        create_transfer_button(panel, 158, 184, 100, 40, "+10", transfer_amount_event, 10);
-        create_transfer_button(panel, 270, 184, 100, 40, "-5", transfer_amount_event, -5);
-        create_transfer_button(panel, 382, 184, 100, 40, "-10", transfer_amount_event, -10);
-        create_transfer_button(panel, 46, 234, 210, 40, "OTRA CANTIDAD", transfer_keypad_event, -4);
-        const bool can_continue = transfer_amount > 0;
-        create_transfer_button(panel, 482, 234, 180, 40, "CONTINUAR", transfer_continue_event, 0, can_continue);
-        transfer_feedback_label = lv_label_create(panel); lv_label_set_text(transfer_feedback_label, transfer_balance_warning ? "No puedes transferir más de tu saldo." : ""); lv_obj_set_style_text_font(transfer_feedback_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(transfer_feedback_label, lv_color_hex(ORANGE), 0); lv_obj_set_width(transfer_feedback_label, 420); lv_obj_align(transfer_feedback_label, LV_ALIGN_TOP_LEFT, 46, 162);
-    }
+    create_transfer_profile(panel, 46, "ALUMNO", sender, 0xDDF3FF);
+    lv_obj_t *balance_title = lv_label_create(panel); lv_label_set_text(balance_title, "SALDO ACTUAL"); lv_obj_set_style_text_font(balance_title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance_title, lv_color_hex(MUTED), 0); lv_obj_align(balance_title, LV_ALIGN_TOP_LEFT, 418, 22);
+    char balance_text[40]; snprintf(balance_text, sizeof(balance_text), "%ld %s", static_cast<long>(getStudentBalance()), CURRENCY_NAME);
+    lv_obj_t *balance = lv_label_create(panel); lv_label_set_text(balance, balance_text); lv_obj_set_style_text_font(balance, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance, lv_color_hex(ORANGE), 0); lv_obj_align(balance, LV_ALIGN_TOP_LEFT, 418, 50);
+    lv_obj_t *amount_title = lv_label_create(panel); lv_label_set_text(amount_title, "SALIDA A REGISTRAR"); lv_obj_set_style_text_font(amount_title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(amount_title, lv_color_hex(MUTED), 0); lv_obj_align(amount_title, LV_ALIGN_TOP_LEFT, 46, 108);
+    char amount_text[40]; snprintf(amount_text, sizeof(amount_text), "%lu %s", static_cast<unsigned long>(transfer_amount), CURRENCY_NAME);
+    lv_obj_t *amount = lv_label_create(panel); lv_label_set_text(amount, amount_text); lv_obj_set_style_text_font(amount, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(amount, lv_color_hex(PURPLE), 0); lv_obj_set_width(amount, 300); lv_obj_align(amount, LV_ALIGN_TOP_LEFT, 46, 132);
+    create_transfer_button(panel, 46, 184, 100, 40, "+5", transfer_amount_event, 5);
+    create_transfer_button(panel, 158, 184, 100, 40, "+10", transfer_amount_event, 10);
+    create_transfer_button(panel, 270, 184, 100, 40, "-5", transfer_amount_event, -5);
+    create_transfer_button(panel, 382, 184, 100, 40, "-10", transfer_amount_event, -10);
+    create_transfer_button(panel, 46, 234, 210, 40, "OTRA CANTIDAD", transfer_keypad_event, -4);
+    const bool can_continue = transfer_amount > 0;
+    create_transfer_button(panel, 482, 234, 180, 40, "CONTINUAR", transfer_continue_event, 0, can_continue);
+    transfer_feedback_label = lv_label_create(panel); lv_label_set_text(transfer_feedback_label, transfer_balance_warning ? "La salida supera el saldo disponible." : ""); lv_obj_set_style_text_font(transfer_feedback_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(transfer_feedback_label, lv_color_hex(ORANGE), 0); lv_obj_set_width(transfer_feedback_label, 420); lv_obj_align(transfer_feedback_label, LV_ALIGN_TOP_LEFT, 46, 162);
     create_back_button(screen);
 }
 
@@ -3246,15 +3357,19 @@ void create_transfer_keypad_screen(lv_obj_t *screen)
 
 void create_arcade_transfer_confirm_screen(lv_obj_t *screen)
 {
-    create_student_topbar(screen, "Confirmar transferencia", false, false);
-    const Student *sender = getStudentById(transfer_sender_id); const Student *receiver = getStudentById(transfer_receiver_id);
+    create_student_topbar(screen, "Confirmar salida", false, false);
+    const Student *sender = getStudentById(transfer_sender_id);
+    const AccountRecord *account = getAccountByStudentId(transfer_sender_id);
+    const int32_t current_balance = account ? account->aureos : 0;
     lv_obj_t *panel = make_content_panel(screen, 118, 112, 564, 282, 0xFFF4D8);
-    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, "CONFIRMAR OPERACIÓN"); lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(title, lv_color_hex(ORANGE), 0); lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
-    lv_obj_t *from = lv_label_create(panel); char from_text[64]; snprintf(from_text, sizeof(from_text), "De: %s", student_short_name(sender)); lv_label_set_text(from, from_text); lv_obj_set_style_text_font(from, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(from, lv_color_hex(INK), 0); lv_obj_align(from, LV_ALIGN_TOP_LEFT, 52, 66);
-    lv_obj_t *arrow = lv_label_create(panel); lv_label_set_text(arrow, "TRANSFERIR"); lv_obj_set_style_text_font(arrow, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(arrow, lv_color_hex(PURPLE), 0); lv_obj_align(arrow, LV_ALIGN_TOP_MID, 0, 66);
-    lv_obj_t *to = lv_label_create(panel); char to_text[64]; snprintf(to_text, sizeof(to_text), "Para: %s", student_short_name(receiver)); lv_label_set_text(to, to_text); lv_obj_set_style_text_font(to, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(to, lv_color_hex(INK), 0); lv_obj_align(to, LV_ALIGN_TOP_RIGHT, -52, 66);
-    char text[160]; snprintf(text, sizeof(text), "Cantidad: %lu %s\nSaldo actual: %ld %s\nSaldo después: %ld %s", static_cast<unsigned long>(transfer_amount), CURRENCY_NAME, static_cast<long>(getStudentBalance()), CURRENCY_NAME, static_cast<long>(getStudentBalance() - transfer_amount), CURRENCY_NAME);
+    char confirmation_title[48]; snprintf(confirmation_title, sizeof(confirmation_title), "SALIDA INDIVIDUAL DE %s", CURRENCY_NAME);
+    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, confirmation_title); lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(title, lv_color_hex(ORANGE), 0); lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 20);
+    lv_obj_t *from = lv_label_create(panel); char from_text[64]; snprintf(from_text, sizeof(from_text), "Alumno: %s", student_short_name(sender)); lv_label_set_text(from, from_text); lv_obj_set_style_text_font(from, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(from, lv_color_hex(INK), 0); lv_obj_align(from, LV_ALIGN_TOP_MID, 0, 62);
+    char text[160]; snprintf(text, sizeof(text), "Salida: %lu %s\nSaldo actual: %ld %s\nSaldo después: %ld %s", static_cast<unsigned long>(transfer_amount), CURRENCY_NAME, static_cast<long>(current_balance), CURRENCY_NAME, static_cast<long>(current_balance - static_cast<int32_t>(transfer_amount)), CURRENCY_NAME);
     lv_obj_t *details = lv_label_create(panel); lv_label_set_text(details, text); lv_obj_set_style_text_font(details, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(details, lv_color_hex(INK), 0); lv_obj_set_style_text_align(details, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(details, 480); lv_obj_align(details, LV_ALIGN_TOP_MID, 0, 116);
+    if (movement_feedback_text[0] != '\0') {
+        lv_obj_t *feedback = lv_label_create(panel); lv_label_set_text(feedback, movement_feedback_text); lv_obj_set_style_text_font(feedback, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(feedback, lv_color_hex(ORANGE), 0); lv_obj_set_style_text_align(feedback, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(feedback, 480); lv_obj_align(feedback, LV_ALIGN_TOP_MID, 0, 184);
+    }
     create_transfer_button(panel, 72, 222, 190, 42, "CONFIRMAR", transfer_confirm_event, 1);
     create_transfer_button(panel, 302, 222, 190, 42, "CANCELAR", transfer_cancel_event, 0);
     create_back_button(screen);
@@ -3274,11 +3389,16 @@ void create_transfer_confirm_screen(lv_obj_t *screen)
 
 void create_arcade_transfer_result_screen(lv_obj_t *screen)
 {
-    create_student_topbar(screen, "Transferencia demo", false, false);
-    const Student *sender = getStudentById(transfer_sender_id); const Student *receiver = getStudentById(transfer_receiver_id);
+    create_student_topbar(screen, "Movimiento local", false, false);
     lv_obj_t *panel = make_content_panel(screen, 150, 126, 500, 246, 0xE4F7EC);
-    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, "TRANSFERENCIA DEMO"); lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(title, lv_color_hex(GREEN), 0); lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 22);
-    char text[160]; snprintf(text, sizeof(text), "%s  ->  %s\n%lu %s\n\nSimulación completada", student_short_name(sender), student_short_name(receiver), static_cast<unsigned long>(transfer_amount), CURRENCY_NAME);
+    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, "MOVIMIENTO GUARDADO EN LITTLEFS"); lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(title, lv_color_hex(GREEN), 0); lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    char name_fallback[40];
+    const char *student_name = movement_student_display_name(
+        saved_movement_student_id, name_fallback, sizeof(name_fallback));
+    const char *reload_status = saved_movement_reload_failed
+                                    ? "\nNo se pudo releer el registro"
+                                    : "";
+    char text[224]; snprintf(text, sizeof(text), "%s\nSalida: -%lu %s\nSaldo demo: %ld %s\nID: %llu  |  Movimientos: %u\nPendiente de sincronizacion%s", student_name, static_cast<unsigned long>(transfer_amount), CURRENCY_NAME, static_cast<long>(saved_movement_balance), CURRENCY_NAME, static_cast<unsigned long long>(saved_movement_id), static_cast<unsigned>(saved_movement_count), reload_status);
     lv_obj_t *label = lv_label_create(panel); lv_label_set_text(label, text); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(INK), 0); lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(label, 440); lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 72);
     create_transfer_button(panel, 120, 178, 260, 42, "VOLVER AL INICIO", transfer_cancel_event, 0);
 }

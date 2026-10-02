@@ -11,6 +11,10 @@ La fuente primaria es `src/student_model.h`, `src/academic_config.h` y `src/data
 - `StudentMovement`: alumno, cantidad firmada, tipo, motivo, fecha/hora y origen.
 - `AttendanceRecord`: tipo preparado; no implica registros reales.
 
+## Identidad de movimientos persistidos
+
+`MovementRecord.student_id` es la clave que vincula cada movimiento persistido con `Student.student_id`. El nombre visible se resuelve al presentar el movimiento mediante `getStudentById()` y la preferencia/nombre de `Student`; no se copia el nombre al NDJSON ni se cambia el esquema del movimiento para mostrarlo. Si el ID no existe en los datos disponibles, la interfaz debe conservar el movimiento y mostrar un fallback que identifique el ID desconocido.
+
 ## Registros demo comprobados
 
 Hay 13 alumnos provisionales: seis de 3.º y siete de 4.º; identificadores 1–13. Todos tienen `nfc_uid` sin asignar. Darío es `student_id = 7`, nombre `CAMACHO ARREOLA ALONZO DARIO`, presentación `Darío`. No inventes UID.
