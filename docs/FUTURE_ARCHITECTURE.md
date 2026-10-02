@@ -1,9 +1,11 @@
-# Banco-Escolar: arquitectura futura
+# Banco-Escolar: arquitectura y estado del proyecto
 
-Este documento registra las decisiones de diseño de la Fase 1. Se mantienen
-separadas las funciones ya operativas de las capas que se implementarán más
-adelante. En esta fase no se agregan Wi-Fi, servidor, base de datos, Excel,
-almacenamiento persistente ni OTA.
+Este documento conserva las decisiones arquitectónicas de las Fases 1 y 2 y
+las actualiza con el estado vigente del firmware. Los marcadores distinguen
+funcionalidad **IMPLEMENTADA**, vistas o datos **DEMO**, infraestructura
+**PREPARADA**, validación física **VALIDADA** y trabajo **FUTURO/PENDIENTE**.
+El código fuente es la referencia para el comportamiento actual; una prueba
+física se indica por separado y no se deduce de compilar.
 
 ## Estado de la Fase 1
 
@@ -11,29 +13,43 @@ almacenamiento persistente ni OTA.
   GT911, CH422G y LVGL 8.4.0.
 - **IMPLEMENTADO:** fuente española, fecha/hora de demo, navegación y
   animaciones actuales.
-- **IMPLEMENTADO:** PN532 por segundo bus I²C en GPIO43/GPIO44; se lee solo el
-  UID y no se escribe en la tarjeta.
-- **IMPLEMENTADO:** `DEMO_MODE` con un alumno de prueba.
-- **PREPARADO:** modelo `Student`, movimientos y actualización centralizada del
-  saldo.
+- **IMPLEMENTADO:** Wi-Fi en modo estación (`WIFI_STA`), escaneo asíncrono,
+  selección de red, conexión protegida/abierta, guardado de credenciales en
+  Preferences tras una conexión exitosa y reconexión. La conexión fue validada
+  físicamente.
+- **IMPLEMENTADO:** `TimeManager` con NTP y zona `America/Mexico_City` usando
+  `CST6`; el arranque espera sincronización con fallback no bloqueante.
+- **PREPARADO / DESHABILITADO:** lógica de lectura PN532 desarrollada, pero
+  `PN532_ENABLED=false` y el lector está desconectado. No se considera operativo.
+- **IMPLEMENTADO / DEMO:** modelo de 13 alumnos provisionales y vistas de
+  alumno, cuenta, progreso, lectura, dictado, transferencia y logros demo.
+- **PREPARADO:** modelo `Student`, tipos de cuenta y movimientos; las
+  transferencias de UI no escriben movimientos persistentes.
 - **PREPARADO:** nombre de moneda configurable en `src/app_config.h` mediante
   `CURRENCY_NAME`.
-- **PENDIENTE DE DEFINICIÓN:** reglas del nivel del alumno; actualmente
-  `Student.level` solo conserva el valor visual temporal de DEMO MODE.
+- **IMPLEMENTADO:** umbrales de Fluidez lectora por grado en
+  `src/academic_config.h`; otros niveles, logros y reglas de asistencia quedan
+  pendientes.
+- **IMPLEMENTADO / VALIDADO:** LittleFS y la base de `StorageManager` están
+  disponibles; la integración de movimientos reales de la UI sigue pendiente.
+- **FUTURO:** servidor/API, Panel del Maestro, sincronización y OTA.
 
 ## Modelo de dominio
 
-`src/student_model.h` define `Student` con identidad, UID, nombre, grado,
-grupo, número de lista, referencia opcional a avatar, Áureos y nivel temporal.
-Los campos de avatar/foto y número de lista solo preparan el modelo: no hay
-archivos, SD, servidor ni almacenamiento implementados.
+`src/student_model.h` define `Student` con identidad, UID, nombre preferido,
+grado, grupo, número de lista, referencia opcional a avatar y nivel temporal.
+`AccountRecord` conserva aparte el saldo demo; el saldo no es un campo de
+`Student`. Los campos de avatar y número de lista preparan futuras funciones.
 
 El saldo se modifica mediante `setStudentBalance()` y la UI se refresca desde
 `updateBalanceUI()`. El valor actual vive en RAM como dato demo.
 
 `StudentMovement` contempla alumno, cantidad, tipo entrada/salida, motivo,
-fecha/hora y origen (`Banco Escolar` o `Panel del Maestro`). No existe todavía
-historial persistente.
+fecha/hora y origen (`Banco Escolar` o `Panel del Maestro`). `StorageManager`
+implementa `MovementRecord` y las operaciones `appendMovement()`,
+`readMovements()`, conteo y pendientes en LittleFS. La UI real todavía no está
+conectada a estas operaciones; la persistencia de movimientos de Áureos
+corresponde a la Fase 5A.4.
 
 El nombre actual de la moneda es **Áureos**, pero la interfaz lo obtiene de
 `CURRENCY_NAME`; para renombrarlo en el futuro se cambia un solo lugar.
@@ -66,9 +82,11 @@ UI LVGL
    ↓
 Student / Account / AcademicProgress
    ↓
-Data Service (futuro)
-   ├── caché local temporal (futuro)
-   └── servidor local / API / base de datos (futuro)
+Persistencia local / cola pendiente (integración futura)
+   ↓
+API ↔ Servidor / Data Service ↔ Base de datos central (futuros)
+ ↕
+Panel Maestro PWA (futuro)
 ```
 
 ## Escuela multigrado
@@ -81,16 +99,86 @@ fase posterior el administrador podrá definir combinaciones como `3° A`, `3° 
 La primera versión contempla un solo administrador (**PREPARADO como decisión
 de alcance**). No se implementan todavía múltiples maestros, roles ni permisos.
 
-## Panel del Maestro y red
+## Panel Maestro PWA y red: decisión oficial 0S.2B
 
-- **FUTURO:** Panel del Maestro para administrar alumnos, Áureos, progreso,
-  logros y movimientos.
-- **FUTURO:** servidor local y API dentro de la red local:
-  `PC del Maestro ↔ servidor local ↔ Banco Escolar`.
-- **FUTURO:** migración posterior del servidor local a un servidor web/Internet.
+- **IMPLEMENTADO:** conectividad Wi-Fi del terminal para redes locales e
+  Internet, con estado mostrado en Configuración.
+- **DECISIÓN / FUTURO:** Panel Maestro como PWA multiplataforma + API + base de
+  datos central, con filosofía offline-first para Panel y terminal.
+- **FUTURO:** uso desde navegador en Windows, Android, iPhone/iPad, macOS,
+  Linux y tablets; instalación PWA cuando la plataforma lo permita.
+- **FUTURO:** una interfaz responsive con menú lateral en escritorio y compacto
+  en móvil; la lógica principal no dependerá de APIs exclusivas de Windows.
+- **FUTURO:** servidor/API local, con posible crecimiento posterior a nube/remoto.
 
 La UI no debe contener IPs, URLs ni detalles del servidor. La comunicación debe
 pertenecer a un servicio de datos independiente.
+
+La aplicación nativa de escritorio no es prioridad inicial: no se inicia como
+.exe, WinForms, WPF o UWP. La misma interfaz web podría empaquetarse después
+con Tauri o equivalente; Electron queda como alternativa opcional. No se ha
+elegido framework frontend/backend ni tecnología de base de datos.
+
+### Offline-first y almacenamiento de la PWA — FUTURO
+
+Guardar localmente primero cuando sea necesario y sincronizar después. La PWA
+deberá abrirse sin Internet después de una carga/instalación previa que haya
+conservado sus recursos; la primera apertura no puede presuponerse offline.
+Se prevé Service Worker para cachear interfaz, administrar recursos estáticos,
+permitir arranque offline y facilitar actualizaciones. Se prevé IndexedDB
+para caché de alumnos, movimientos recientes, operaciones pendientes,
+configuración y datos académicos necesarios. Ninguno está implementado.
+
+### API, fuente de verdad y eventos — FUTURO
+
+Hoy LittleFS es almacenamiento persistente de la terminal. Cuando exista
+servidor, la base central será la fuente de verdad global y ESP32/PWA mantendrán
+caché, cola pendiente y estado de sincronización. Ambos clientes pasarán por
+la API para acceder a la base central. El servidor no debe ser un requisito
+obligatorio para operaciones locales válidas.
+
+La API asumirá autenticación, autorización, recepción de movimientos,
+consultas, sincronización, validaciones, deduplicación y conflictos. El acceso
+del Panel será protegido, inicialmente para un administrador/docente principal,
+con crecimiento posterior a maestros, roles, permisos, grupos y escuelas.
+
+Cada cambio de Áureos desde ESP32 o Panel deberá generar un movimiento
+trazable; el saldo debe poder reconstruirse o validarse a partir del historial.
+Flujo previsto: operación local → guardar → marcar pendiente → detectar acceso
+a API → enviar → validar → confirmar → marcar sincronizado. Sin confirmación
+del servidor, el registro permanece pendiente.
+
+Los reintentos no deben duplicar movimientos (idempotencia): identificador
+único estable y reconocimiento de operaciones ya recibidas. El contador actual
+de la terminal es local; la identidad entre dispositivos y PWA queda pendiente.
+Origen, timestamps, IDs, `synced`, orden de eventos y conflictos por operación
+offline simultánea se resolverán en la fase de sincronización, sin definir
+todavía protocolo o estrategia final.
+
+### Módulos y experiencia previstos — FUTURO
+
+Inicio/Dashboard, Alumnos, Áureos, Movimientos, Asistencia, Académico, Logros,
+Dispositivos y Configuración. El perfil del alumno será el núcleo modular:
+datos generales, saldo, historial, NFC, lectura, dictado, asistencia, logros y
+gráficas. Dashboard mostrará alumnos, actividad, movimientos del día,
+pendientes, sincronización y dispositivos.
+
+Áureos incluirá sumar, descontar, transferir, ajustar y operaciones grupales,
+siempre con movimiento. El estado de cuenta permitirá filtros por alumno,
+fecha, tipo, concepto, cantidad, origen y sincronización. La UI mostrará
+“Sin conexión” y cantidad pendiente; al volver acceso a API, sincronizará
+automáticamente o mediante acción clara y mostrará “Sincronizando”,
+“Sincronizado” y “Errores pendientes”. Sin Internet aún puede haber API en LAN.
+
+Dispositivos podrá mostrar nombre, estado online/offline, última conexión,
+firmware, almacenamiento, pendientes, NFC, microSD y última sincronización.
+Lectura incluirá PPM, histórico, nivel y gráficas; dictado, palabras, errores e
+histórico; asistencia, historial real cuando exista. Esos datos permanecen
+separados del saldo. Logros permitirá futuras reglas, fecha, alumno, insignia y
+posible recompensa; los criterios siguen pendientes.
+
+Los detalles y límites operativos se mantienen en la referencia
+[panel-master.md](../.agents/skills/banco-escolar/references/panel-master.md).
 
 ## Importación académica desde Excel
 
@@ -98,28 +186,52 @@ pertenecer a un servicio de datos independiente.
   alumno, fecha, palabras por minuto, errores de escritura y otros indicadores.
 - **NO previsto en la Waveshare:** el ESP32 no leerá Excel directamente.
 
-## Operación sin conexión
+## Operación local y sin conexión
 
-- **FUTURO:** con red local disponible, la terminal sincronizará con el servidor.
-- **FUTURO:** sin red, una caché local podrá conservar temporalmente datos y
-  movimientos pendientes.
-- **FUTURO:** al regresar la red, el servicio sincronizará la cola pendiente.
+- **IMPLEMENTADO / VALIDADO:** LittleFS monta localmente; el área de datos
+  corresponde al label `spiffs`, offset `0xC90000`, tamaño `0x360000` (3,538,944
+  bytes). En la medición inicial se reportaron 16,384 bytes usados y 3,522,560
+  libres.
+- **IMPLEMENTADO / PREPARADO:** `StorageManager` usa
+  `/data/movements.ndjson` y ofrece `MovementRecord`, `appendMovement()`,
+  `readMovements()`, `getMovementCount()`, `getPendingMovementCount()` y
+  `clearLocalData()`.
+- **PENDIENTE — FASE 5A.4:** conectar movimientos reales de la UI a
+  `appendMovement()` y presentar el historial persistido. Las acciones actuales
+  de transferencia siguen siendo demo.
+- **FUTURO:** caché/cola de sincronización con el servidor y sincronización al
+  recuperar la red. Los registros persistentes actuales no equivalen a una
+  sincronización implementada.
 
-No se implementa aún persistencia ni sincronización.
+El diseño requiere que terminal y Panel sigan temporalmente con operaciones
+válidas sin Internet. En el ESP32 los movimientos reales aún requieren 5A.4.
+La escritura actual exige hora válida; el caso de arranque sin hora NTP queda
+por resolver y no autoriza omitir esa validación.
+
+## Exportaciones y respaldos — FUTURO
+
+CSV y Excel se exportarán desde Panel/servidor; PDF podrá incorporarse si se
+requiere. El ESP32 no leerá Excel. Se prevén respaldos de datos locales en
+LittleFS, de la base central mediante backups periódicos y opcionalmente en
+microSD. No hay implementación nueva de respaldos en esta fase.
 
 ## OTA y recuperación
 
 - **FUTURO:** OTA por Wi-Fi desde Configuración: mostrar versión, buscar,
   descargar, instalar y reiniciar.
 - **PREPARADO:** USB/UART seguirá siendo el método de recuperación.
-- **NO IMPLEMENTADO:** OTA, Wi-Fi y servidor.
+- **NO IMPLEMENTADO:** OTA y servidor/API.
+- **IMPLEMENTADO:** Wi-Fi (ver sección «Panel del Maestro y red»).
 
 ## Identificación NFC
 
-El UID NFC identifica al alumno y no contiene su saldo. El futuro servicio de
-datos buscará el `Student` correspondiente y devolverá la cuenta y el resto de
-la información del sistema. La configuración actual del PN532, GPIO, I²C,
-ST7262, GT911 y CH422G queda fuera de esta arquitectura y no se modifica.
+El UID NFC identifica al alumno y no contiene su saldo. La lectura UID se
+desarrolló anteriormente, pero el lector está actualmente desconectado y
+`PN532_ENABLED=false`; el código no inicia I²C1 ni crea el dispositivo mientras
+esté deshabilitado. I²C1 GPIO43/44 queda reservado para una futura conexión
+separada de I²C0. El cableado, alimentación y niveles lógicos seguros siguen
+pendientes. El futuro servicio de datos buscará el `Student` correspondiente.
+Nunca escribir saldo o historial en la tarjeta.
 
 ## Fase 2: interfaz y navegación del alumno
 
@@ -132,16 +244,14 @@ ST7262, GT911 y CH422G queda fuera de esta arquitectura y no se modifica.
 - **IMPLEMENTADO / DEMO:** `Mi progreso` enlaza a Fluidez lectora y Dictado de
   oraciones. Las pantallas consumen estructuras `ReadingRecord` y
   `WritingRecord`.
-- **IMPLEMENTADO / DEMO:** Fluidez lectora muestra 82, 83 y 107 PPM para
-  septiembre. Las fechas de esas mediciones no están presentes en los datos
-  actuales, por lo que se muestran como mediciones numeradas y no se inventan
-  fechas.
+- **IMPLEMENTADO / DEMO:** hay 39 `ReadingRecord` con fechas de septiembre de
+  2026 para los 13 alumnos. Darío muestra 82, 83 y 107 PPM con fechas
+  01/09/2026, 07/09/2026 y 11/09/2026.
 - **PREPARADO:** navegación mensual de progreso; por ahora solo existe
   septiembre de 2026 con datos demo.
-- **PENDIENTE DE DATOS:** los valores reales de Dictado de oraciones de Darío
-  no están en el código ni en la documentación disponible. La pantalla queda
-  preparada y distingue conceptualmente `0 errores` de `-` (no aplicado), sin
-  inventar registros.
+- **IMPLEMENTADO / DEMO:** hay 52 `WritingRecord` con fecha, palabras, errores
+  y estado `applied`; Dictado de Darío incluye sus registros de septiembre.
+  `applied=false` representa no aplicado, no cero errores ni asistencia.
 - **IMPLEMENTADO / DEMO:** `Mis metas` muestra el estándar actual y el reto
   Avanzado sin calcular puntos faltantes.
 - **IMPLEMENTADO / DEMO:** `Logros` contiene únicamente un elemento visual
@@ -163,10 +273,11 @@ ST7262, GT911 y CH422G queda fuera de esta arquitectura y no se modifica.
 - **IMPLEMENTADO:** al vencer el tiempo, la interfaz regresa a `Acerca tu
   tarjeta` / pantalla de espera.
 
-Las reglas definitivas de niveles, rangos de Fluidez lectora, logros y
-asistencia siguen **PENDIENTES DE DEFINICIÓN**. Los indicadores académicos
-deben continuar independientes de LVGL y ser reemplazables por datos del
-Panel del Maestro/servidor en una fase posterior.
+Los umbrales iniciales por grado para Fluidez lectora están **IMPLEMENTADOS**
+en `src/academic_config.h` (tabla en la sección anterior). La política final de
+niveles, logros y asistencia sigue **PENDIENTE DE DEFINICIÓN**. Los indicadores
+académicos deben continuar independientes de LVGL y ser reemplazables por
+datos del Panel del Maestro/servidor en una fase posterior.
 
 ## Configuración académica por grado
 
@@ -221,19 +332,19 @@ La cantidad total de palabras se conserva para una futura métrica más completa
 que también considere la extensión del dictado. Por ahora no se calculan
 porcentajes, aciertos, niveles ni metas automáticas de escritura.
 
-## Reloj provisional
+## Reloj y NTP
 
-- **IMPLEMENTADO:** todas las pantallas consumen el mismo estado interno de
-  fecha y hora.
-- **IMPLEMENTADO / DEMO:** la compilación actual inicia provisionalmente en
-  `23/09/2026 11:39:56` y muestra horas con segundos.
-- **IMPLEMENTADO:** el avance se realiza mediante el temporizador LVGL, sin
-  bloqueo ni `delay(1000)`, incluyendo los cambios de minuto, hora, día, mes y
-  año.
-- **PREPARADO:** la zona horaria futura es `America/Mexico_City` y existe una
-  interfaz reservada para sincronización NTP.
-- **FUTURO:** Wi-Fi/NTP establecerá la hora real al arrancar; la hora demo no
-  debe interpretarse como sincronización de Internet.
+- **IMPLEMENTADO:** `TimeManager` sincroniza mediante NTP con los servidores
+  configurados en código y aplica la zona `America/Mexico_City` mediante la
+  regla POSIX actual `CST6`.
+- **IMPLEMENTADO:** el splash comparte una fuente de progreso para barra, aro y
+  porcentaje, dura al menos 6 segundos y espera sincronización al disponer de
+  Wi-Fi, con fallback para no bloquear indefinidamente. Si NTP responde, la
+  fecha/hora se actualiza antes de mostrar Inicio.
+- **IMPLEMENTADO:** al alcanzar 100 % muestra “Sistema listo” y hace una pausa
+  breve antes de Inicio; el flujo usa timers, no un `delay()` bloqueante.
+- **HISTÓRICO:** el reloj interno y la hora demo se usaron antes de incorporar
+  NTP; no representan la hora actual cuando la sincronización está pendiente.
 
 ## Fase 2B: capa de datos provisional
 
@@ -272,8 +383,9 @@ válidos. Los guiones del origen no generan registros oficiales de asistencia.
 
 Las consultas disponibles son `getStudentById()`, `getReadingRecords()`,
 `getWritingRecords()`, `getStudentMovements()`, `getAccountByStudentId()` y
-`getAttendanceRecords()`. La interfaz de Darío consume las consultas por el
-ID 7, por lo que cambiar de alumno no requiere reconstruir las pantallas.
+`getAttendanceRecords()`. La interfaz demo de Darío consume las consultas por
+ID 7. Además existe `StoredAttendanceRecord` en el modelo de StorageManager,
+pero no hay historial real de asistencia ni API de almacenamiento de asistencia.
 
 ### Flujo NFC futuro
 
@@ -284,5 +396,85 @@ Leer tarjeta → obtener UID → buscar Student.nfc_uid
 ```
 
 Este flujo está documentado, pero la vinculación UID ↔ alumno todavía no está
-implementada. La capa provisional tampoco implementa Wi-Fi, servidor, API,
-SQL, sincronización, OTA ni almacenamiento persistente.
+implementada y el PN532 permanece deshabilitado. Wi-Fi, NTP y almacenamiento
+local LittleFS sí están implementados; servidor, API, SQL, sincronización y
+OTA siguen pendientes.
+
+## StorageManager y movimientos locales
+
+LittleFS monta con formato automático deshabilitado. En modo normal los flags
+son `STORAGE_ALLOW_ONE_TIME_FORMAT=false` y `STORAGE_SELF_TEST=false`; ante un
+fallo de montaje no debe formatear ni borrar datos automáticamente. La
+validación física registró dos arranques consecutivos con montaje correcto.
+
+El archivo de datos es `/data/movements.ndjson` y cada línea usa NDJSON,
+`schema_version=1`. `appendMovement()` requiere hora válida (epoch desde 2025)
+y reserva `next_mv_id` en NVS antes de escribir; gaps son aceptables y los IDs
+no se reutilizan. `clearLocalData()` borra solo el archivo conocido y conserva
+NVS y el contador. La infraestructura incluye `getPendingMovementCount()` y
+lectura de movimientos pendientes; la sincronización y el marcado durable como
+sincronizado siguen pendientes. Estas funciones aún no están conectadas a la
+UI de Áureos.
+
+## microSD
+
+La pantalla de Configuración y `SDManager` están **PREPARADOS**. El driver
+actual es un placeholder: no toca GPIO ni realiza I/O. La microSD física no
+está instalada, por lo que no hay montaje ni capacidad detectada.
+
+## Rendimiento de Inicio
+
+Inicio presentaba stutter. La medición previa informó promedio ~112.4 ms y
+máximo ~136.5 ms. Se identificaron como causa principal los pulsos continuos de
+opacidad del punto de espera y del borde NFC, que se eliminaron. La medición
+posterior informó promedio ~46.4 ms, máximo ~56.5 ms y cero intervalos >100 ms,
+una mejora promedio aproximada de 58.7 %. El P95 disponible es aproximado por
+categorías, no una medida exacta. Los cuatro tests automáticos permanecen
+desactivados en firmware normal.
+
+## Navegación actual
+
+La navegación normal es instantánea: pantalla nueva opaca en (0,0), sin fade,
+slide, zoom ni animación de opacidad a pantalla completa; la pantalla anterior
+se elimina con `lv_obj_del_async()`. El feedback local del botón dura unos
+75 ms. El fade de 220 ms del splash al entrar a Inicio es independiente de la
+navegación normal.
+
+## Roadmap estable
+
+**COMPLETADO:** interfaz base y datos provisionales; Wi-Fi; NTP y splash;
+LittleFS validado y base de StorageManager; UI de almacenamiento; optimización
+de rendimiento; Skill `banco-escolar`.
+
+| Fase | Alcance | Estado |
+|---|---|---|
+| 0S.1 | Skill creada | COMPLETADA |
+| 0S.2 | Documentación base | COMPLETADA |
+| 0S.2B | Arquitectura PWA/offline-first | COMPLETADA |
+| 0S.3 | Git estable y commit local | FASE ACTUAL |
+| 5A.4 | Persistencia real de Áureos | FUTURO |
+| 5A.5 | Validación de persistencia y reinicios | FUTURO |
+| 5B | Historial real de movimientos | FUTURO |
+| 6 | Sincronización | FUTURO |
+| 7 | Panel Maestro PWA 1.0 | FUTURO |
+| 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
+| 7.2 | Operación offline completa | FUTURO |
+| 8 | Gestión de dispositivos | FUTURO |
+| 9 | NFC | FUTURO |
+| 10 | Asistencia | FUTURO |
+| 11 | Integración académica | FUTURO |
+| 12 | Gráficas y análisis | FUTURO |
+| 13 | Logros y recompensas | FUTURO |
+| 14 | microSD | FUTURO |
+| 15 | Respaldos | FUTURO |
+| 16 | Exportaciones | FUTURO |
+| 17 | Administración avanzada | FUTURO |
+| 18 | BLE solo si existe caso de uso | FUTURO |
+| 19 | OTA | FUTURO |
+
+La fase en curso es 0S.3: vincular Git, crear un commit local y revisar ese
+commit antes de autorizar un push. La implementación de persistencia real
+corresponde a 5A.4 y exige una solicitud separada. Todos los componentes de
+Panel/API/base central y sincronización aquí descritos son futuros: no se crean
+backend, endpoints, esquema de base de datos, manifest, Service Worker,
+IndexedDB ni pantallas en esta fase documental.
