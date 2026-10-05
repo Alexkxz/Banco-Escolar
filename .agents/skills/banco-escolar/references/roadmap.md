@@ -22,7 +22,12 @@
 | 5A.5 | Validación de persistencia y reinicios | COMPLETADA |
 | 5A.6 | Continuidad secuencial de IDs | COMPLETADA |
 | 5A.7 | Vínculo de movimiento con alumno mediante `student_id` | COMPLETADA |
-| 5B | Historial real de movimientos | FUTURO |
+| 5B.1 | Vista paginada de historial real de movimientos desde LittleFS | COMPLETADA; validada físicamente |
+| 5B.1B | Pulido visual inicial del historial | PARCIAL; integrado al ajuste 5B.1C |
+| 5B.1C | Rediseño visual coordinado de Inicio, Mi cuenta e Historial | COMPLETADA; validada físicamente |
+| 5B.1D | Ajuste final del encabezado superior | COMPLETADA; validada físicamente |
+| 5B.1E | Integrar logo oficial estático al splash | COMPLETADA; validada físicamente |
+| 5B.1F | Integrar logo compacto en el encabezado común | COMPLETADA; validada físicamente |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
 | 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
@@ -40,7 +45,7 @@
 | 18 | BLE solo si existe caso de uso | FUTURO |
 | 19 | OTA | FUTURO |
 
-La fase 0S.3 quedó cerrada con el commit estable en GitHub. Las fases 5A.4–5A.7 quedaron validadas: LittleFS conserva los movimientos 1–3 y su conteo tras reinicio, y la UI resuelve el nombre del alumno desde el `student_id` persistido. El saldo continúa siendo demo/RAM y no se reconstruye desde los movimientos; `synced=false` permanece porque no existe servidor ni sincronización operativa. La siguiente fase es 5B, historial real de movimientos. La fase 6 define sincronización; el Panel PWA 1.0 es 7, su integración con ESP32 es 7.1 y la operación offline completa es 7.2. Consulta [panel-master.md](panel-master.md) antes de esos trabajos.
+La fase 0S.3 quedó cerrada con el commit estable en GitHub. Las fases 5A.4–5A.7 quedaron validadas: LittleFS conserva los movimientos 1–3 y su conteo tras reinicio, y la UI resuelve el nombre del alumno desde el `student_id` persistido. La vista 5B.1 del historial real fue validada físicamente; es de solo lectura, no altera el esquema y no reconstruye saldo. El pulido 5B.1B se integró en 5B.1C. Las fases visuales 5B.1C–5B.1F fueron validadas físicamente; el bloque visual 5B.1 queda cerrado con Inicio, Mi cuenta e Historial coordinados, encabezado común, logos del splash y del encabezado, fecha/hora y Salir. `synced=false` permanece porque no existe servidor ni sincronización operativa. La fase 6 define sincronización; el Panel PWA 1.0 es 7, su integración con ESP32 es 7.1 y la operación offline completa es 7.2. Consulta [panel-master.md](panel-master.md) antes de esos trabajos.
 
 BLE aún está pendiente; no habilitarlo sin caso de uso. No inferir asistencia de dictados no aplicados. Excel corresponde al Panel del Maestro/servidor, no al ESP32.
 

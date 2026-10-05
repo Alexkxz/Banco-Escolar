@@ -462,8 +462,11 @@ de rendimiento; Skill `banco-escolar`.
 | 5A.5 | Validación de persistencia y reinicios | COMPLETADA |
 | 5A.6 | Continuidad secuencial de IDs | COMPLETADA |
 | 5A.7 | Vínculo del movimiento con alumno mediante `student_id` | COMPLETADA |
-| 5B | Historial real de movimientos | FUTURO |
-| 5B | Historial real de movimientos | FUTURO |
+| 5B.1 | Historial real de movimientos desde LittleFS | COMPLETADA; validada físicamente |
+| 5B.1C | Rediseño coordinado de Inicio, Mi cuenta e Historial | COMPLETADA; validada físicamente |
+| 5B.1D | Encabezado común y acción Salir | COMPLETADA; validada físicamente |
+| 5B.1E | Logo estático en el splash | COMPLETADA; validada físicamente |
+| 5B.1F | Logo compacto en el encabezado | COMPLETADA; validada físicamente |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
 | 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
@@ -481,9 +484,10 @@ de rendimiento; Skill `banco-escolar`.
 | 18 | BLE solo si existe caso de uso | FUTURO |
 | 19 | OTA | FUTURO |
 
-El bloque 5A.4–5A.7 quedó completado y validado físicamente. La siguiente fase
-es 5B, que implementará el historial real visible. El saldo persistente completo,
-la sincronización y la atomicidad de transferencias entre alumnos siguen pendientes.
+El bloque 5A.4–5A.7 quedó completado y validado físicamente. El historial real
+5B.1 y el bloque visual 5B.1C–5B.1F quedaron completados y validados físicamente;
+el respaldo estable de este bloque se registra en GitHub. El saldo persistente
+completo, la sincronización y la atomicidad de transferencias entre alumnos siguen pendientes.
 Todos los componentes de
 Panel/API/base central y sincronización aquí descritos son futuros: no se crean
 backend, endpoints, esquema de base de datos, manifest, Service Worker,

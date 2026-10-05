@@ -12,6 +12,8 @@
 #include "esp_display_panel.hpp"
 #include "esp_lv_adapter_arduino.h"
 #include "lvgl.h"
+LV_IMG_DECLARE(logo_banco_escolar);
+LV_IMG_DECLARE(logo_y_nombre);
 #include "app_config.h"
 #include "academic_config.h"
 #include "data/provisional_data.h"
@@ -30,6 +32,10 @@ constexpr lv_coord_t GRID_MARGIN = 18;
 constexpr lv_coord_t GRID_GAP = 12;
 constexpr lv_coord_t HEADER_HEIGHT = 96;
 constexpr lv_coord_t NAV_HEIGHT = 50;
+constexpr lv_coord_t APP_SPACE_8 = 8;
+constexpr lv_coord_t APP_SPACE_12 = 12;
+constexpr lv_coord_t APP_SPACE_16 = 16;
+constexpr lv_coord_t APP_SPACE_24 = 24;
 constexpr lv_coord_t MONITOR_WIDTH = 112;
 constexpr lv_coord_t MONITOR_HEIGHT = 54;
 constexpr lv_coord_t MONITOR_SAFE_X = 636;
@@ -147,7 +153,6 @@ lv_obj_t *boot_progress_bar = nullptr;
 lv_obj_t *boot_percent_label = nullptr;
 lv_obj_t *boot_state_label = nullptr;
 lv_obj_t *boot_detail_label = nullptr;
-lv_obj_t *boot_logo_arc = nullptr;
 lv_obj_t *boot_deferred_screen = nullptr;
 lv_timer_t *boot_progress_timer = nullptr;
 lv_timer_t *session_timeout_lv_timer = nullptr;
@@ -250,6 +255,7 @@ enum Pantalla : uint8_t {
     PANTALLA_DETECCION,
     PANTALLA_ALUMNO,
     PANTALLA_CUENTA,
+    PANTALLA_HISTORIAL,
     PANTALLA_PROGRESO,
     PANTALLA_FLUIDEZ,
     PANTALLA_DICTADO,
@@ -292,6 +298,7 @@ uint16_t saved_movement_student_id = 0;
 bool saved_movement_reload_failed = false;
 size_t saved_movement_count = 0;
 int32_t saved_movement_balance = 0;
+size_t movement_history_page = 0;
 
 const char *student_short_name(const Student *student)
 {
@@ -344,6 +351,7 @@ void mostrar_pantalla(Pantalla pantalla);
 void demo_menu_event(lv_event_t *event);
 void demo_back_event(lv_event_t *event);
 void demo_exit_event(lv_event_t *event);
+void create_movement_history_screen(lv_obj_t *screen);
 void config_event(lv_event_t *event);
 void config_theme_event(lv_event_t *event);
 void config_performance_event(lv_event_t *event);
@@ -472,7 +480,8 @@ void transfer_cancel_event(lv_event_t *event);
 lv_obj_t *make_content_panel(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                              lv_coord_t width, lv_coord_t height, uint32_t color);
 void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t height,
-                            lv_coord_t right_offset, lv_coord_t top_offset);
+                            lv_coord_t right_offset, lv_coord_t top_offset,
+                            bool compact_header = false);
 void update_performance_overlay(lv_timer_t *timer);
 void performance_test_step_cb(lv_timer_t *timer);
 void frame_timing_test_step_cb(lv_timer_t *timer);
@@ -536,7 +545,6 @@ void halt_on_error() { while (true) vTaskDelay(pdMS_TO_TICKS(1000)); }
 void boot_progress_animation_exec(void *object, int32_t value)
 {
     lv_bar_set_value(static_cast<lv_obj_t *>(object), value, LV_ANIM_OFF);
-    if (boot_logo_arc) lv_arc_set_value(boot_logo_arc, value);
     boot_bar_current_value = static_cast<uint8_t>(value);
     if (boot_percent_label) {
         char percent_text[8];
@@ -592,68 +600,9 @@ void create_boot_splash()
     lv_obj_set_style_bg_opa(boot_splash_screen, LV_OPA_COVER, 0);
     lv_obj_clear_flag(boot_splash_screen, LV_OBJ_FLAG_SCROLLABLE);
 
-    lv_obj_t *title = lv_label_create(boot_splash_screen);
-    lv_label_set_text(title, "BANCO ESCOLAR");
-    lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(theme_palette().primary_text), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 28);
-
-    lv_obj_t *subtitle = lv_label_create(boot_splash_screen);
-    lv_label_set_text(subtitle, "Inicializando sistema...");
-    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(theme_palette().secondary_text), 0);
-    lv_obj_align(subtitle, LV_ALIGN_TOP_MID, 0, 61);
-
-    boot_logo_arc = lv_arc_create(boot_splash_screen);
-    lv_obj_set_size(boot_logo_arc, 164, 164);
-    lv_arc_set_range(boot_logo_arc, 0, 100);
-    lv_arc_set_bg_angles(boot_logo_arc, 0, 360);
-    lv_arc_set_rotation(boot_logo_arc, 270);
-    lv_arc_set_value(boot_logo_arc, boot_progress_state.percent);
-    lv_obj_set_style_bg_opa(boot_logo_arc, LV_OPA_TRANSP, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(boot_logo_arc, lv_color_hex(0x9DBFD6), LV_PART_MAIN);
-    lv_obj_set_style_arc_width(boot_logo_arc, 10, LV_PART_MAIN);
-    lv_obj_set_style_arc_color(boot_logo_arc, lv_color_hex(BLUE), LV_PART_INDICATOR);
-    lv_obj_set_style_arc_width(boot_logo_arc, 10, LV_PART_INDICATOR);
-    lv_obj_set_style_bg_opa(boot_logo_arc, LV_OPA_TRANSP, LV_PART_KNOB);
-    lv_obj_set_style_border_width(boot_logo_arc, 0, LV_PART_KNOB);
-    lv_obj_align(boot_logo_arc, LV_ALIGN_TOP_MID, 0, 94);
-
-    lv_obj_t *logo = lv_obj_create(boot_splash_screen);
-    lv_obj_remove_style_all(logo);
-    lv_obj_set_size(logo, 90, 90);
-    lv_obj_set_style_bg_color(logo, lv_color_hex(0xFFF4D8), 0);
-    lv_obj_set_style_bg_opa(logo, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(logo, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(logo, 2, 0);
-    lv_obj_set_style_border_color(logo, lv_color_hex(ORANGE), 0);
-    lv_obj_align(logo, LV_ALIGN_TOP_MID, 0, 131);
-
-    // A compact school/bank building made from basic LVGL shapes.
-    lv_obj_t *roof = lv_obj_create(logo);
-    lv_obj_remove_style_all(roof);
-    lv_obj_set_size(roof, 52, 8);
-    lv_obj_set_style_bg_color(roof, lv_color_hex(BLUE), 0);
-    lv_obj_set_style_bg_opa(roof, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(roof, 4, 0);
-    lv_obj_align(roof, LV_ALIGN_TOP_MID, 0, 17);
-    const lv_coord_t column_x[] = {18, 37, 56};
-    for (lv_coord_t x : column_x) {
-        lv_obj_t *column = lv_obj_create(logo);
-        lv_obj_remove_style_all(column);
-        lv_obj_set_size(column, 8, 26);
-        lv_obj_set_style_bg_color(column, lv_color_hex(BLUE), 0);
-        lv_obj_set_style_bg_opa(column, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(column, 3, 0);
-        lv_obj_align(column, LV_ALIGN_TOP_LEFT, x, 29);
-    }
-    lv_obj_t *base = lv_obj_create(logo);
-    lv_obj_remove_style_all(base);
-    lv_obj_set_size(base, 52, 7);
-    lv_obj_set_style_bg_color(base, lv_color_hex(ORANGE), 0);
-    lv_obj_set_style_bg_opa(base, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(base, 3, 0);
-    lv_obj_align(base, LV_ALIGN_TOP_MID, 0, 58);
+    lv_obj_t *logo_image = lv_img_create(boot_splash_screen);
+    lv_img_set_src(logo_image, &logo_y_nombre);
+    lv_obj_align(logo_image, LV_ALIGN_TOP_MID, 0, 12);
 
     boot_progress_bar = lv_bar_create(boot_splash_screen);
     lv_obj_set_size(boot_progress_bar, 600, 24);
@@ -857,6 +806,14 @@ void apply_arcade_panel_style(lv_obj_t *object, uint32_t background, lv_coord_t 
     lv_obj_set_style_border_color(object, lv_color_hex(accented ? accent : theme_palette().border), 0);
     lv_obj_set_style_shadow_width(object, accented ? 8 : 0, 0);
     lv_obj_set_style_shadow_opa(object, current_theme == AppTheme::DARK ? LV_OPA_20 : LV_OPA_10, 0);
+}
+
+void apply_student_surface_style(lv_obj_t *object, lv_coord_t radius = 16)
+{
+    set_panel_style(object, lv_color_hex(theme_palette().surface), radius);
+    lv_obj_set_style_border_width(object, 1, 0);
+    lv_obj_set_style_border_color(object, lv_color_hex(theme_palette().border), 0);
+    lv_obj_set_style_shadow_width(object, 0, 0);
 }
 
 void apply_arcade_header_style(lv_obj_t *header)
@@ -1176,6 +1133,7 @@ uint8_t particle_intensity_for_screen(Pantalla pantalla)
         case PANTALLA_ALUMNO: return 8;
         case PANTALLA_DETECCION: return 3;
         case PANTALLA_CUENTA:
+        case PANTALLA_HISTORIAL:
         case PANTALLA_PROGRESO:
         case PANTALLA_METAS:
         case PANTALLA_LOGROS: return 5;
@@ -1330,6 +1288,7 @@ const char *performance_screen_name(Pantalla screen)
         case PANTALLA_DETECCION: return "Demo";
         case PANTALLA_ALUMNO: return "StudentHome";
         case PANTALLA_CUENTA: return "Account";
+        case PANTALLA_HISTORIAL: return "MovementHistory";
         case PANTALLA_PROGRESO: return "Progress";
         case PANTALLA_FLUIDEZ: return "ReadingChart";
         case PANTALLA_DICTADO: return "Dictation";
@@ -1822,22 +1781,37 @@ void create_status_bar(lv_obj_t *screen)
 }
 
 void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t height,
-                            lv_coord_t right_offset, lv_coord_t top_offset)
+                            lv_coord_t right_offset, lv_coord_t top_offset,
+                            bool compact_header)
 {
     lv_obj_t *date_card = lv_obj_create(parent); lv_obj_remove_style_all(date_card);
-    lv_obj_set_size(date_card, width, height); apply_arcade_badge_style(date_card, 0xE8F7FF, BLUE);
+    lv_obj_set_size(date_card, width, height);
+    if (compact_header) {
+        lv_obj_set_style_bg_opa(date_card, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(date_card, 0, 0);
+        lv_obj_set_style_shadow_width(date_card, 0, 0);
+    } else {
+        apply_arcade_badge_style(date_card, 0xE8F7FF, BLUE);
+    }
     lv_obj_align(date_card, LV_ALIGN_TOP_RIGHT, right_offset, top_offset);
     char date_text[48];
     char time_text[16];
     obtener_texto_fecha_hora(date_text, sizeof(date_text), time_text, sizeof(time_text));
     date_label = lv_label_create(date_card); lv_label_set_text(date_label, date_text);
-    lv_obj_set_style_text_font(date_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(date_label, lv_color_hex(INK), 0);
-    lv_obj_set_style_text_align(date_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_set_width(date_label, width - 20); lv_obj_set_height(date_label, 22); lv_label_set_long_mode(date_label, LV_LABEL_LONG_CLIP); lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, 5);
+    lv_obj_set_style_text_font(date_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(date_label, lv_color_hex(compact_header ? theme_palette().secondary_text : INK), 0);
+    lv_obj_set_style_text_align(date_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(date_label, width - (compact_header ? APP_SPACE_8 : 20));
+    lv_obj_set_height(date_label, 22);
+    lv_label_set_long_mode(date_label, LV_LABEL_LONG_CLIP);
+    lv_obj_align(date_label, LV_ALIGN_TOP_MID, 0, compact_header ? 0 : 5);
     clock_label = lv_label_create(date_card); lv_obj_set_style_text_font(clock_label, &lv_font_montserrat_26, 0);
     lv_label_set_text(clock_label, time_text);
     lv_obj_set_width(clock_label, width - 12); lv_obj_set_height(clock_label, 36); lv_label_set_long_mode(clock_label, LV_LABEL_LONG_CLIP);
     lv_obj_set_style_text_align(clock_label, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_style_text_color(clock_label, lv_color_hex(PURPLE), 0); lv_obj_align(clock_label, LV_ALIGN_BOTTOM_MID, 0, -3);
+    lv_obj_set_style_text_color(clock_label,
+                                lv_color_hex(compact_header ? theme_palette().primary_text : PURPLE), 0);
+    lv_obj_align(clock_label, LV_ALIGN_BOTTOM_MID, 0, compact_header ? -APP_SPACE_8 : -3);
 }
 
 void create_student_topbar(lv_obj_t *screen, const char *title, bool show_exit, bool show_profile)
@@ -1845,22 +1819,30 @@ void create_student_topbar(lv_obj_t *screen, const char *title, bool show_exit, 
     (void)show_profile;
     lv_obj_t *header = lv_obj_create(screen); lv_obj_remove_style_all(header);
     lv_obj_set_size(header, SCREEN_WIDTH, HEADER_HEIGHT); apply_arcade_header_style(header);
-    create_arcade_marker(header, 24, 22, 52, ORANGE);
-    lv_obj_t *brand = lv_label_create(header); lv_label_set_text(brand, "BANCO ESCOLAR");
-    lv_obj_set_style_text_font(brand, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(brand, lv_color_hex(BLUE), 0);
-    lv_obj_align(brand, LV_ALIGN_TOP_LEFT, 92, 12);
+    lv_obj_t *logo = lv_img_create(header);
+    lv_img_set_src(logo, &logo_banco_escolar);
+    lv_obj_align(logo, LV_ALIGN_LEFT_MID, APP_SPACE_24, 0);
     lv_obj_t *label = lv_label_create(header); lv_label_set_text(label, title);
-    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(INK), 0);
-    lv_obj_set_width(label, show_exit ? 300 : 370); lv_obj_align(label, LV_ALIGN_TOP_LEFT, 92, 52);
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(label, show_exit ? 330 : 450);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, APP_SPACE_24 + 56 + APP_SPACE_16, 0);
 
     if (show_exit) {
-        lv_obj_t *exit = lv_obj_create(header); lv_obj_remove_style_all(exit); lv_obj_set_size(exit, 64, 42);
-        apply_arcade_button_style(exit, 0xFBEAF2, PINK); lv_obj_align(exit, LV_ALIGN_TOP_LEFT, 414, 27);
-        lv_obj_t *dot = make_shape(exit, 11, 11, PINK); lv_obj_align(dot, LV_ALIGN_LEFT_MID, 8, 0);
-        lv_obj_t *exit_label = lv_label_create(exit); lv_label_set_text(exit_label, "Salir"); lv_obj_set_style_text_font(exit_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(exit_label, lv_color_hex(INK), 0); lv_obj_align(exit_label, LV_ALIGN_LEFT_MID, 24, 0);
+        lv_obj_t *exit = lv_obj_create(header); lv_obj_remove_style_all(exit);
+        lv_obj_set_size(exit, 104, 44);
+        apply_student_surface_style(exit, 12);
+        lv_obj_align(exit, LV_ALIGN_TOP_LEFT, 444, 26);
+        lv_obj_t *dot = make_shape(exit, APP_SPACE_8, APP_SPACE_8, BLUE);
+        lv_obj_align(dot, LV_ALIGN_LEFT_MID, 14, 0);
+        lv_obj_t *exit_label = lv_label_create(exit); lv_label_set_text(exit_label, "Salir");
+        lv_obj_set_style_text_font(exit_label, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(exit_label, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_align(exit_label, LV_ALIGN_LEFT_MID, 34, 0);
         lv_obj_add_flag(exit, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(exit, arcade_button_feedback_event, LV_EVENT_ALL, nullptr); lv_obj_add_event_cb(exit, demo_exit_event, LV_EVENT_CLICKED, nullptr);
     }
-    create_date_clock_card(header, show_exit ? 288 : 300, 82, 18, 8);
+    create_date_clock_card(header, 212, 72, APP_SPACE_24, APP_SPACE_12, true);
 }
 
 void create_demo_avatar(lv_obj_t *parent)
@@ -1907,6 +1889,7 @@ void demo_menu_event(lv_event_t *event)
             transfer_receiver_id = 0; transfer_amount = 0; transfer_receiver_detected = false; transfer_balance_warning = false; transfer_keypad_buffer[0] = '\0';
             movement_feedback_text[0] = '\0'; saved_movement_id = 0; saved_movement_count = 0; saved_movement_balance = 0;
         }
+        if (static_cast<Pantalla>(target) == PANTALLA_HISTORIAL) movement_history_page = 0;
         mostrar_pantalla(static_cast<Pantalla>(target));
     }
 }
@@ -1914,13 +1897,28 @@ void demo_menu_event(lv_event_t *event)
 void create_student_menu_button_sized(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, lv_coord_t width, lv_coord_t height,
                                       uint32_t color, uint32_t icon_color, const char *title, const char *description, Pantalla target)
 {
+    (void)color;
     lv_obj_t *button = lv_obj_create(parent); lv_obj_remove_style_all(button); lv_obj_set_size(button, width, height);
-    apply_arcade_button_style(button, color, icon_color); lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, y);
-    lv_obj_t *icon = make_shape(button, 38, 38, icon_color); lv_obj_align(icon, LV_ALIGN_TOP_LEFT, 16, (height - 38) / 2);
-    lv_obj_t *icon_dot = make_shape(icon, 12, 12, 0xFFFFFF); lv_obj_align(icon_dot, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_t *label = lv_label_create(button); lv_label_set_text(label, title); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(INK), 0); lv_obj_align(label, LV_ALIGN_TOP_LEFT, 66, 12);
-    label = lv_label_create(button); lv_label_set_text(label, description); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(MUTED), 0); lv_obj_set_width(label, width - 78); lv_obj_set_height(label, height - 48); lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP); lv_obj_align(label, LV_ALIGN_TOP_LEFT, 66, 42);
-    create_arcade_marker(button, 66, height - 9, width - 84, icon_color);
+    apply_student_surface_style(button, 16);
+    lv_obj_align(button, LV_ALIGN_TOP_LEFT, x, y);
+    lv_obj_t *icon = make_shape(button, 40, 40, icon_color);
+    lv_obj_align(icon, LV_ALIGN_TOP_LEFT, APP_SPACE_16, (height - 40) / 2);
+    lv_obj_t *icon_dot = make_shape(icon, 10, 10, 0xFFFFFF);
+    lv_obj_align(icon_dot, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, title);
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(label, width - 92);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 72, APP_SPACE_8);
+    label = lv_label_create(button);
+    lv_label_set_text(label, description);
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_set_width(label, width - 92);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 72, 38);
     lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(button, demo_menu_event, LV_EVENT_ALL, reinterpret_cast<void *>(static_cast<uintptr_t>(target)));
 }
 
@@ -1933,29 +1931,33 @@ void create_student_menu_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, ui
 void create_arcade_student_home(lv_obj_t *screen)
 {
     create_student_topbar(screen, "Inicio", true, true);
-    lv_obj_t *balance = make_content_panel(screen, 18, 112, 764, 92, 0xE8F0FF);
-    lv_obj_t *avatar = make_shape(balance, 58, 58, SKY); lv_obj_align(avatar, LV_ALIGN_LEFT_MID, 18, 0);
-    lv_obj_t *face = make_shape(avatar, 40, 40, YELLOW); lv_obj_align(face, LV_ALIGN_CENTER, 0, 5);
-    lv_obj_t *hair = make_shape(face, 38, 15, ORANGE, 8); lv_obj_align(hair, LV_ALIGN_TOP_MID, 0, 8);
+    lv_obj_t *balance = make_content_panel(screen, APP_SPACE_24, 112, 752, 88, 0xE8F0FF);
+    apply_student_surface_style(balance, 16);
+    lv_obj_t *avatar = make_shape(balance, 52, 52, SKY); lv_obj_align(avatar, LV_ALIGN_LEFT_MID, APP_SPACE_16, 0);
+    lv_obj_t *face = make_shape(avatar, 36, 36, YELLOW); lv_obj_align(face, LV_ALIGN_CENTER, 0, 4);
+    lv_obj_t *hair = make_shape(face, 34, 14, ORANGE, 8); lv_obj_align(hair, LV_ALIGN_TOP_MID, 0, 7);
     lv_obj_t *eye = make_shape(face, 5, 5, INK); lv_obj_align(eye, LV_ALIGN_TOP_LEFT, 11, 18);
     eye = make_shape(face, 5, 5, INK); lv_obj_align(eye, LV_ALIGN_TOP_RIGHT, -11, 18);
-    lv_obj_t *name = lv_label_create(balance); lv_label_set_text(name, selected_student->preferred_name ? selected_student->preferred_name : selected_student->name); lv_obj_set_style_text_font(name, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(name, lv_color_hex(INK), 0); lv_obj_align(name, LV_ALIGN_TOP_LEFT, 94, 16);
+    lv_obj_t *name = lv_label_create(balance); lv_label_set_text(name, selected_student->preferred_name ? selected_student->preferred_name : selected_student->name); lv_obj_set_style_text_font(name, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(name, lv_color_hex(theme_palette().primary_text), 0); lv_obj_align(name, LV_ALIGN_TOP_LEFT, 84, 12);
     char grade_group[24]; snprintf(grade_group, sizeof(grade_group), "%u.\xC2\xBA %s", selected_student->grade, selected_student->group ? selected_student->group : "");
-    lv_obj_t *grade = lv_label_create(balance); lv_label_set_text(grade, grade_group); lv_obj_set_style_text_font(grade, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(grade, lv_color_hex(PURPLE), 0); lv_obj_align(grade, LV_ALIGN_TOP_LEFT, 94, 48);
-    lv_obj_t *level = lv_label_create(balance); lv_label_set_text(level, selected_student->level ? selected_student->level : "Nivel pendiente"); lv_obj_set_style_text_font(level, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(level, lv_color_hex(MUTED), 0); lv_obj_align(level, LV_ALIGN_TOP_LEFT, 220, 48);
-    lv_obj_t *currency_badge = lv_obj_create(balance); lv_obj_remove_style_all(currency_badge); lv_obj_set_size(currency_badge, 224, 70); lv_obj_align(currency_badge, LV_ALIGN_RIGHT_MID, -16, 0); apply_arcade_badge_style(currency_badge, 0xFFF4D8, ORANGE);
-    lv_obj_t *coin = make_shape(currency_badge, 38, 38, YELLOW); lv_obj_align(coin, LV_ALIGN_LEFT_MID, 12, 0);
+    lv_obj_t *grade = lv_label_create(balance); lv_label_set_text(grade, grade_group); lv_obj_set_style_text_font(grade, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(grade, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(grade, LV_ALIGN_TOP_LEFT, 84, 46);
+    lv_obj_t *level = lv_label_create(balance); lv_label_set_text(level, selected_student->level ? selected_student->level : "Nivel pendiente"); lv_obj_set_style_text_font(level, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(level, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(level, LV_ALIGN_TOP_LEFT, 192, 46);
+    lv_obj_t *currency_badge = lv_obj_create(balance); lv_obj_remove_style_all(currency_badge); lv_obj_set_size(currency_badge, 220, 68); lv_obj_align(currency_badge, LV_ALIGN_RIGHT_MID, -APP_SPACE_12, 0); apply_student_surface_style(currency_badge, 14);
+    lv_obj_t *coin = make_shape(currency_badge, 36, 36, YELLOW); lv_obj_align(coin, LV_ALIGN_LEFT_MID, APP_SPACE_12, 0);
     lv_obj_t *coin_label = lv_label_create(coin); lv_label_set_text(coin_label, "A"); lv_obj_set_style_text_font(coin_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(coin_label, lv_color_hex(INK), 0); lv_obj_center(coin_label);
-    lv_obj_t *caption = lv_label_create(currency_badge); lv_label_set_text(caption, "SALDO"); lv_obj_set_style_text_font(caption, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(caption, lv_color_hex(ORANGE), 0); lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 62, 8);
-    balance_amount_label = lv_label_create(currency_badge); lv_obj_set_style_text_font(balance_amount_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance_amount_label, lv_color_hex(INK), 0); lv_obj_align(balance_amount_label, LV_ALIGN_BOTTOM_LEFT, 62, -8);
-    balance_unit_label = lv_label_create(currency_badge); lv_label_set_text(balance_unit_label, CURRENCY_NAME); lv_obj_set_style_text_font(balance_unit_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance_unit_label, lv_color_hex(MUTED), 0); lv_obj_align(balance_unit_label, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
+    lv_obj_t *caption = lv_label_create(currency_badge); lv_label_set_text(caption, "SALDO"); lv_obj_set_style_text_font(caption, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(caption, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(caption, LV_ALIGN_TOP_LEFT, 58, 4);
+    lv_obj_t *demo = lv_label_create(currency_badge); lv_label_set_text(demo, "DEMO"); lv_obj_set_style_text_font(demo, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(demo, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(demo, LV_ALIGN_TOP_RIGHT, -10, 4);
+    balance_amount_label = lv_label_create(currency_badge); lv_obj_set_style_text_font(balance_amount_label, &lv_font_montserrat_26, 0); lv_obj_set_style_text_color(balance_amount_label, lv_color_hex(theme_palette().primary_text), 0); lv_obj_align(balance_amount_label, LV_ALIGN_BOTTOM_LEFT, 58, -7);
+    balance_unit_label = lv_label_create(currency_badge); lv_label_set_text(balance_unit_label, CURRENCY_NAME); lv_obj_set_style_text_font(balance_unit_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(balance_unit_label, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(balance_unit_label, LV_ALIGN_BOTTOM_RIGHT, -10, -8);
     updateBalanceUI();
     animate_balance_card(balance);
-    create_student_menu_button_sized(screen, 18, 226, 230, 96, 0xDDF3FF, BLUE, "Mi cuenta", "Consulta tus movimientos", PANTALLA_CUENTA);
-    create_student_menu_button_sized(screen, 285, 226, 230, 96, 0xFFF4D8, ORANGE, "Mi progreso", "Mira tu avance escolar", PANTALLA_PROGRESO);
-    create_student_menu_button_sized(screen, 552, 226, 230, 96, 0xE8F0FF, BLUE, "Registrar salida", "Restar Aureos", PANTALLA_TRANSFERIR);
-    create_student_menu_button_sized(screen, 148, 338, 230, 96, 0xFBEAF2, PURPLE, "Mis metas", "Mira cu\xC3\xA1nto has avanzado", PANTALLA_METAS);
-    create_student_menu_button_sized(screen, 408, 338, 230, 96, 0xE4F7EC, GREEN, "Logros", "Descubre lo que has conseguido", PANTALLA_LOGROS);
+    constexpr lv_coord_t CARD_WIDTH = 368;
+    constexpr lv_coord_t CARD_HEIGHT = 72;
+    create_student_menu_button_sized(screen, 24, 216, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, BLUE, "Mi cuenta", "Consulta tus movimientos", PANTALLA_CUENTA);
+    create_student_menu_button_sized(screen, 408, 216, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, ORANGE, "Mi progreso", "Mira tu avance escolar", PANTALLA_PROGRESO);
+    create_student_menu_button_sized(screen, 24, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, BLUE, "Registrar salida", "Registrar una salida", PANTALLA_TRANSFERIR);
+    create_student_menu_button_sized(screen, 408, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, PURPLE, "Mis metas", "Consulta tus metas", PANTALLA_METAS);
+    create_student_menu_button_sized(screen, 216, 392, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, GREEN, "Logros", "Revisa tus logros", PANTALLA_LOGROS);
 }
 
 void create_student_home(lv_obj_t *screen)
@@ -1986,6 +1988,7 @@ void demo_back_event(lv_event_t *event)
         register_student_activity();
         Pantalla destination = PANTALLA_ALUMNO;
         if (pantalla_actual == PANTALLA_CONFIGURACION) destination = PANTALLA_ESPERA;
+        else if (pantalla_actual == PANTALLA_HISTORIAL) destination = PANTALLA_CUENTA;
         else if (pantalla_actual == PANTALLA_FLUIDEZ || pantalla_actual == PANTALLA_DICTADO) destination = PANTALLA_PROGRESO;
         mostrar_pantalla(destination);
     }
@@ -2163,8 +2166,8 @@ void wifi_result_accept_event(lv_event_t *event)
 
 void create_back_button(lv_obj_t *screen)
 {
-    lv_obj_t *back = lv_obj_create(screen); lv_obj_remove_style_all(back); lv_obj_set_size(back, 132, 50); apply_arcade_button_style(back, 0xE8F7FF, BLUE); lv_obj_align(back, LV_ALIGN_BOTTOM_LEFT, 28, -16);
-    lv_obj_t *label = lv_label_create(back); lv_label_set_text(label, "Volver"); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(INK), 0); lv_obj_center(label);
+    lv_obj_t *back = lv_obj_create(screen); lv_obj_remove_style_all(back); lv_obj_set_size(back, 120, 48); apply_student_surface_style(back, 12); lv_obj_align(back, LV_ALIGN_BOTTOM_LEFT, APP_SPACE_24, -APP_SPACE_16);
+    lv_obj_t *label = lv_label_create(back); lv_label_set_text(label, "Volver"); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_center(label);
     lv_obj_add_flag(back, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(back, arcade_button_feedback_event, LV_EVENT_ALL, nullptr); lv_obj_add_event_cb(back, demo_back_event, LV_EVENT_CLICKED, nullptr);
 }
 
@@ -2813,28 +2816,36 @@ void set_content_title(lv_obj_t *parent, const char *title)
 void create_arcade_account_screen(lv_obj_t *screen)
 {
     create_student_topbar(screen, "Mi cuenta", false, false);
-    lv_obj_t *balance = make_content_panel(screen, 18, 112, 300, 278, 0xFFF4D8);
-    create_arcade_marker(balance, 24, 52, 92, ORANGE);
-    lv_obj_t *heading = lv_label_create(balance); lv_label_set_text(heading, "SALDO ACTUAL"); lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(heading, lv_color_hex(ORANGE), 0); lv_obj_align(heading, LV_ALIGN_TOP_LEFT, 24, 24);
-    lv_obj_t *coin = make_shape(balance, 54, 54, YELLOW); lv_obj_align(coin, LV_ALIGN_TOP_LEFT, 24, 74);
+    lv_obj_t *balance = make_content_panel(screen, 24, 112, 300, 278, 0xFFF4D8);
+    apply_student_surface_style(balance, 16);
+    lv_obj_t *heading = lv_label_create(balance); lv_label_set_text(heading, "Saldo actual"); lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(heading, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(heading, LV_ALIGN_TOP_LEFT, 24, 20);
+    lv_obj_t *coin = make_shape(balance, 48, 48, YELLOW); lv_obj_align(coin, LV_ALIGN_TOP_LEFT, 24, 72);
     lv_obj_t *coin_label = lv_label_create(coin); lv_label_set_text(coin_label, "A"); lv_obj_set_style_text_font(coin_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(coin_label, lv_color_hex(INK), 0); lv_obj_center(coin_label);
     lv_obj_t *amount = lv_label_create(balance); char amount_text[20]; snprintf(amount_text, sizeof(amount_text), "%ld", static_cast<long>(getStudentBalance()));
-    lv_label_set_text(amount, amount_text); lv_obj_set_style_text_font(amount, &lv_font_montserrat_30, 0); lv_obj_set_style_text_color(amount, lv_color_hex(INK), 0); lv_obj_align(amount, LV_ALIGN_TOP_LEFT, 98, 78);
-    lv_obj_t *unit = lv_label_create(balance); lv_label_set_text(unit, CURRENCY_NAME); lv_obj_set_style_text_font(unit, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(unit, lv_color_hex(ORANGE), 0); lv_obj_align(unit, LV_ALIGN_TOP_LEFT, 100, 122);
-    lv_obj_t *demo = lv_label_create(balance); lv_label_set_text(demo, "Dato DEMO"); lv_obj_set_style_text_font(demo, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(demo, lv_color_hex(MUTED), 0); lv_obj_align(demo, LV_ALIGN_BOTTOM_LEFT, 24, -18);
+    lv_label_set_text(amount, amount_text); lv_obj_set_style_text_font(amount, &lv_font_montserrat_30, 0); lv_obj_set_style_text_color(amount, lv_color_hex(theme_palette().primary_text), 0); lv_obj_align(amount, LV_ALIGN_TOP_LEFT, 88, 70);
+    lv_obj_t *unit = lv_label_create(balance); lv_label_set_text(unit, CURRENCY_NAME); lv_obj_set_style_text_font(unit, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(unit, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(unit, LV_ALIGN_TOP_LEFT, 88, 112);
+    lv_obj_t *demo = lv_label_create(balance); lv_label_set_text(demo, "Dato demo"); lv_obj_set_style_text_font(demo, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(demo, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(demo, LV_ALIGN_BOTTOM_LEFT, 24, -20);
 
-    lv_obj_t *movements = make_content_panel(screen, 334, 112, 448, 278, 0xE8F7FF);
-    lv_obj_t *movement_title = lv_label_create(movements); lv_label_set_text(movement_title, "MOVIMIENTOS RECIENTES"); lv_obj_set_style_text_font(movement_title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(movement_title, lv_color_hex(BLUE), 0); lv_obj_align(movement_title, LV_ALIGN_TOP_LEFT, 22, 24);
-    size_t movement_count = 0; const StudentMovement *student_movements = getStudentMovements(selected_student->student_id, &movement_count);
-    for (size_t i = 0; i < movement_count; ++i) {
-        lv_obj_t *row = lv_obj_create(movements); lv_obj_remove_style_all(row); lv_obj_set_size(row, 404, 42); lv_obj_align(row, LV_ALIGN_TOP_LEFT, 22, 58 + static_cast<lv_coord_t>(i * 48));
-        apply_arcade_badge_style(row, student_movements[i].amount >= 0 ? 0xE4F7EC : 0xFBEAF2, student_movements[i].amount >= 0 ? GREEN : ORANGE);
-        char amount_label[20]; snprintf(amount_label, sizeof(amount_label), "%+ld", static_cast<long>(student_movements[i].amount));
-        lv_obj_t *sign = lv_label_create(row); lv_label_set_text(sign, amount_label); lv_obj_set_style_text_font(sign, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(sign, lv_color_hex(student_movements[i].amount >= 0 ? GREEN : ORANGE), 0); lv_obj_align(sign, LV_ALIGN_LEFT_MID, 14, 0);
-        lv_obj_t *reason = lv_label_create(row); lv_label_set_text(reason, student_movements[i].reason); lv_obj_set_style_text_font(reason, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(reason, lv_color_hex(INK), 0); lv_obj_set_width(reason, 245); lv_label_set_long_mode(reason, LV_LABEL_LONG_DOT); lv_obj_align(reason, LV_ALIGN_LEFT_MID, 70, 0);
-        lv_obj_t *date = lv_label_create(row); lv_label_set_text(date, "DEMO"); lv_obj_set_style_text_font(date, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(date, lv_color_hex(MUTED), 0); lv_obj_align(date, LV_ALIGN_RIGHT_MID, -12, 0);
+    lv_obj_t *movements = make_content_panel(screen, 340, 112, 436, 278, 0xE8F7FF);
+    apply_student_surface_style(movements, 16);
+    lv_obj_t *movement_title = lv_label_create(movements); lv_label_set_text(movement_title, "Historial real"); lv_obj_set_style_text_font(movement_title, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(movement_title, lv_color_hex(theme_palette().primary_text), 0); lv_obj_align(movement_title, LV_ALIGN_TOP_LEFT, 20, 20);
+    char movement_count_text[56];
+    if (storage_manager.isReady()) {
+        const size_t movement_count = storage_manager.getMovementCount();
+        snprintf(movement_count_text, sizeof(movement_count_text), "%u movimiento%s guardado%s",
+                 static_cast<unsigned>(movement_count), movement_count == 1 ? "" : "s",
+                 movement_count == 1 ? "" : "s");
+    } else {
+        snprintf(movement_count_text, sizeof(movement_count_text), "Conteo no disponible");
     }
-    lv_obj_t *note = lv_label_create(movements); lv_label_set_text(note, "Movimientos temporales de demostraci\xC3\xB3n"); lv_obj_set_style_text_font(note, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(note, lv_color_hex(MUTED), 0); lv_obj_align(note, LV_ALIGN_BOTTOM_LEFT, 22, -14);
+    lv_obj_t *movement_count_label = lv_label_create(movements);
+    lv_label_set_text(movement_count_label, movement_count_text);
+    lv_obj_set_style_text_font(movement_count_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(movement_count_label, lv_color_hex(BLUE), 0);
+    lv_obj_align(movement_count_label, LV_ALIGN_TOP_LEFT, 20, 54);
+    lv_obj_t *movement_note = lv_label_create(movements); lv_label_set_text(movement_note, "Movimientos guardados en este dispositivo"); lv_obj_set_style_text_font(movement_note, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(movement_note, lv_color_hex(theme_palette().secondary_text), 0); lv_obj_align(movement_note, LV_ALIGN_TOP_LEFT, 20, 82);
+    create_student_menu_button_sized(movements, 16, 148, 404, 78, 0xFFFFFF, BLUE,
+                                     "Ver movimientos", "Consulta el historial guardado", PANTALLA_HISTORIAL);
     create_back_button(screen);
 }
 
@@ -3101,6 +3112,234 @@ lv_obj_t *create_transfer_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t y, l
     lv_obj_t *label = lv_label_create(button); lv_label_set_text(label, text); const bool is_single_digit = text[0] >= '0' && text[0] <= '9' && text[1] == '\0'; lv_obj_set_style_text_font(label, is_single_digit ? &lv_font_montserrat_30 : &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, enabled ? lv_color_hex(INK) : lv_color_hex(MUTED), 0); lv_obj_set_width(label, width - 12); lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_center(label);
     if (enabled) { lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE); lv_obj_add_event_cb(button, arcade_button_feedback_event, LV_EVENT_ALL, nullptr); lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, reinterpret_cast<void *>(user_data)); }
     return button;
+}
+
+bool read_movement_history_page(uint16_t student_id, size_t page, MovementRecord *records,
+                                size_t capacity, size_t &read_count, bool &has_older)
+{
+    constexpr size_t STORAGE_PAGE_SIZE = 4;
+    read_count = 0;
+    has_older = false;
+    const size_t skip_matches = page * capacity;
+    size_t skipped_matches = 0;
+    size_t end = storage_manager.getMovementCount();
+
+    while (end > 0) {
+        const size_t offset = end > STORAGE_PAGE_SIZE ? end - STORAGE_PAGE_SIZE : 0;
+        MovementRecord stored_page[STORAGE_PAGE_SIZE] = {};
+        size_t stored_count = 0;
+        if (storage_manager.readMovements(offset, stored_page, STORAGE_PAGE_SIZE, stored_count) !=
+            StorageResult::STORAGE_OK) return false;
+
+        for (size_t i = stored_count; i > 0; --i) {
+            const MovementRecord &movement = stored_page[i - 1];
+            if (student_id != 0 && movement.student_id != student_id) continue;
+            if (skipped_matches < skip_matches) {
+                ++skipped_matches;
+                continue;
+            }
+            if (read_count == capacity) {
+                has_older = true;
+                return true;
+            }
+            records[read_count++] = movement;
+        }
+        if (stored_count == 0 || offset == 0) break;
+        end = offset;
+    }
+    return true;
+}
+
+void movement_history_page_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const intptr_t direction = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+    if (direction < 0 && movement_history_page > 0) --movement_history_page;
+    else if (direction > 0) ++movement_history_page;
+    mostrar_pantalla(PANTALLA_HISTORIAL);
+}
+
+void create_movement_history_pager_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t width,
+                                          const char *text, bool enabled, intptr_t direction)
+{
+    lv_obj_t *button = lv_obj_create(parent);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, width, 44);
+    lv_obj_set_pos(button, x, 2);
+    set_panel_style(button, lv_color_hex(enabled ? 0xE8F0FF : theme_palette().surface), 12);
+    lv_obj_set_style_border_width(button, 1, 0);
+    lv_obj_set_style_border_color(button,
+                                  lv_color_hex(enabled ? BLUE : theme_palette().border), 0);
+    lv_obj_set_style_shadow_width(button, 0, 0);
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label,
+                                lv_color_hex(enabled ? theme_palette().primary_text : theme_palette().secondary_text), 0);
+    lv_obj_set_width(label, width - 12);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(label);
+    if (enabled) {
+        lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(button, arcade_button_feedback_event, LV_EVENT_ALL, nullptr);
+        lv_obj_add_event_cb(button, movement_history_page_event, LV_EVENT_CLICKED,
+                            reinterpret_cast<void *>(direction));
+    }
+}
+
+void create_movement_history_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Historial de movimientos", false, false);
+    lv_obj_t *panel = make_content_panel(screen, APP_SPACE_24, 108, 752, 296, 0xE8F7FF);
+    apply_student_surface_style(panel, 16);
+    const uint16_t filter_student_id = selected_student ? selected_student->student_id : 0;
+    MovementRecord records[4] = {};
+    size_t read_count = 0;
+    bool has_older = false;
+    const bool storage_ready = storage_manager.isReady();
+    const bool read_ok = storage_ready && read_movement_history_page(
+        filter_student_id, movement_history_page, records, 4, read_count, has_older);
+
+    if (!read_ok) {
+        lv_obj_t *message = lv_label_create(panel);
+        lv_label_set_text(message, "No se pudo leer el historial");
+        lv_obj_set_style_text_font(message, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(message, lv_color_hex(MUTED), 0);
+        lv_obj_align(message, LV_ALIGN_CENTER, 0, 0);
+    } else if (read_count == 0) {
+        lv_obj_t *message = lv_label_create(panel);
+        lv_label_set_text(message, "Sin movimientos registrados");
+        lv_obj_set_style_text_font(message, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(message, lv_color_hex(MUTED), 0);
+        lv_obj_align(message, LV_ALIGN_CENTER, 0, 0);
+    } else {
+        static const char *const months[] = {
+            "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+            "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"
+        };
+        const lv_coord_t row_gap = read_count >= 4 ? 2 : 12;
+        const lv_coord_t available_height = 280;
+        const lv_coord_t calculated_row_height = static_cast<lv_coord_t>(
+            (available_height - static_cast<lv_coord_t>(read_count - 1) * row_gap) /
+            static_cast<lv_coord_t>(read_count));
+        const lv_coord_t row_height = calculated_row_height < 82 ? calculated_row_height : 82;
+        const lv_coord_t rows_height = static_cast<lv_coord_t>(read_count) * row_height +
+            static_cast<lv_coord_t>(read_count - 1) * row_gap;
+        const lv_coord_t first_row_y = static_cast<lv_coord_t>((296 - rows_height) / 2);
+        for (size_t i = 0; i < read_count; ++i) {
+            const MovementRecord &movement = records[i];
+            lv_obj_t *row = lv_obj_create(panel);
+            lv_obj_remove_style_all(row);
+            lv_obj_set_size(row, 728, row_height);
+            lv_obj_align(row, LV_ALIGN_TOP_LEFT, 12,
+                         first_row_y + static_cast<lv_coord_t>(i) * (row_height + row_gap));
+            apply_student_surface_style(row, 12);
+
+            char fallback[40] = {};
+            const char *student_name = movement_student_display_name(
+                movement.student_id, fallback, sizeof(fallback));
+            lv_obj_t *name = lv_label_create(row);
+            lv_label_set_text(name, student_name);
+            lv_obj_set_style_text_font(name, &banco_escolar_font_16, 0);
+            lv_obj_set_style_text_color(name, lv_color_hex(INK), 0);
+            lv_obj_set_width(name, 450);
+            lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+            lv_obj_align(name, LV_ALIGN_TOP_LEFT, 16, 3);
+
+            char amount_text[48];
+            snprintf(amount_text, sizeof(amount_text), "%+ld %s",
+                     static_cast<long>(movement.amount), CURRENCY_NAME);
+            lv_obj_t *amount_badge = lv_obj_create(row);
+            lv_obj_remove_style_all(amount_badge);
+            lv_obj_set_size(amount_badge, 226, 26);
+            lv_obj_align(amount_badge, LV_ALIGN_TOP_RIGHT, -14, 2);
+            set_panel_style(amount_badge, lv_color_hex(theme_palette().surface), 8);
+            lv_obj_set_style_border_width(amount_badge, 1, 0);
+            lv_obj_set_style_border_color(amount_badge,
+                                          lv_color_hex(movement.amount >= 0 ? GREEN : ORANGE), 0);
+            lv_obj_t *amount = lv_label_create(amount_badge);
+            lv_label_set_text(amount, amount_text);
+            lv_obj_set_style_text_font(amount, &banco_escolar_font_16, 0);
+            lv_obj_set_style_text_color(amount, lv_color_hex(movement.amount >= 0 ? GREEN : ORANGE), 0);
+            lv_obj_center(amount);
+
+            lv_obj_t *reason = lv_label_create(row);
+            lv_label_set_text(reason, movement.reason);
+            lv_obj_set_style_text_font(reason, &banco_escolar_font_16, 0);
+            lv_obj_set_style_text_color(reason, lv_color_hex(theme_palette().primary_text), 0);
+            lv_obj_set_width(reason, 450);
+            lv_label_set_long_mode(reason, LV_LABEL_LONG_DOT);
+            lv_obj_align(reason, LV_ALIGN_TOP_LEFT, 16, 24);
+
+            char date_time[40];
+            const time_t timestamp = static_cast<time_t>(movement.timestamp);
+            struct tm local_time = {};
+            if (movement.timestamp > 0 && localtime_r(&timestamp, &local_time) != nullptr &&
+                local_time.tm_mon >= 0 && local_time.tm_mon < 12) {
+                snprintf(date_time, sizeof(date_time), "%02d %s %04d  |  %02d:%02d",
+                         local_time.tm_mday, months[local_time.tm_mon], local_time.tm_year + 1900,
+                         local_time.tm_hour, local_time.tm_min);
+            } else {
+                snprintf(date_time, sizeof(date_time), "Fecha no disponible");
+            }
+            lv_obj_t *date = lv_label_create(row);
+            lv_label_set_text(date, date_time);
+            lv_obj_set_style_text_font(date, &banco_escolar_font_16, 0);
+            lv_obj_set_style_text_color(date, lv_color_hex(MUTED), 0);
+            lv_obj_align(date, LV_ALIGN_BOTTOM_LEFT, 16, -2);
+
+            const char *type_text = movement.type == StoredMovementType::ENTRY ? "Entrada" : "Salida";
+            lv_obj_t *type = lv_label_create(row);
+            lv_label_set_text(type, type_text);
+            lv_obj_set_style_text_font(type, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(type, lv_color_hex(theme_palette().primary_text), 0);
+            lv_obj_set_width(type, 80);
+            lv_obj_align(type, LV_ALIGN_TOP_RIGHT, -160, 29);
+
+            lv_obj_t *status = lv_obj_create(row);
+            lv_obj_remove_style_all(status);
+            lv_obj_set_size(status, 110, 18);
+            lv_obj_align(status, LV_ALIGN_BOTTOM_RIGHT, -14, -3);
+            set_panel_style(status, lv_color_hex(theme_palette().surface), 10);
+            lv_obj_set_style_border_width(status, 1, 0);
+            lv_obj_set_style_border_color(status, lv_color_hex(theme_palette().border), 0);
+            const char *sync_text = movement.synced ? "Sincronizado" : "Pendiente";
+            lv_obj_t *status_text = lv_label_create(status);
+            lv_label_set_text(status_text, sync_text);
+            lv_obj_set_style_text_font(status_text, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(status_text, lv_color_hex(theme_palette().secondary_text), 0);
+            lv_obj_center(status_text);
+
+            char id_text[24];
+            snprintf(id_text, sizeof(id_text), "ID %llu", static_cast<unsigned long long>(movement.id));
+            lv_obj_t *id = lv_label_create(row);
+            lv_label_set_text(id, id_text);
+            lv_obj_set_style_text_font(id, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(id, lv_color_hex(theme_palette().secondary_text), 0);
+            lv_obj_set_width(id, 56);
+            lv_obj_set_style_text_align(id, LV_TEXT_ALIGN_RIGHT, 0);
+            lv_obj_align(id, LV_ALIGN_TOP_RIGHT, -18, 29);
+        }
+    }
+
+    const bool has_newer = movement_history_page > 0;
+    create_back_button(screen);
+    lv_obj_t *pager_bar = lv_obj_create(screen);
+    lv_obj_remove_style_all(pager_bar);
+    lv_obj_set_size(pager_bar, 464, 48);
+    apply_student_surface_style(pager_bar, 14);
+    lv_obj_align(pager_bar, LV_ALIGN_BOTTOM_RIGHT, -APP_SPACE_24, -APP_SPACE_16);
+    create_movement_history_pager_button(pager_bar, 8, 142, "Más recientes", has_newer, -1);
+    char page_text[24];
+    snprintf(page_text, sizeof(page_text), "Página %u", static_cast<unsigned>(movement_history_page + 1));
+    lv_obj_t *page_label = lv_label_create(pager_bar);
+    lv_label_set_text(page_label, page_text);
+    lv_obj_set_style_text_font(page_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(page_label, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_set_width(page_label, 140);
+    lv_obj_set_style_text_align(page_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(page_label);
+    create_movement_history_pager_button(pager_bar, 314, 142, "Anteriores", has_older, 1);
 }
 
 void create_transfer_profile(lv_obj_t *parent, lv_coord_t x, const char *role, const Student *student, uint32_t color)
@@ -3442,6 +3681,7 @@ bool is_back_navigation(Pantalla from, Pantalla to)
                from == PANTALLA_METAS || from == PANTALLA_LOGROS ||
                from == PANTALLA_TRANSFER_RESULTADO;
     }
+    if (to == PANTALLA_CUENTA) return from == PANTALLA_HISTORIAL;
     if (to == PANTALLA_PROGRESO) {
         return from == PANTALLA_FLUIDEZ || from == PANTALLA_DICTADO;
     }
@@ -3477,6 +3717,7 @@ void mostrar_pantalla(Pantalla pantalla)
         case PANTALLA_DETECCION: create_detection_screen(next_screen); break;
         case PANTALLA_ALUMNO: create_student_home(next_screen); break;
         case PANTALLA_CUENTA: create_account_screen(next_screen); break;
+        case PANTALLA_HISTORIAL: create_movement_history_screen(next_screen); break;
         case PANTALLA_PROGRESO: create_progress_screen(next_screen); break;
         case PANTALLA_FLUIDEZ: create_fluency_screen(next_screen); break;
         case PANTALLA_DICTADO: create_dictation_screen(next_screen); break;
