@@ -5,6 +5,10 @@
 
 constexpr uint16_t STORAGE_SCHEMA_VERSION = 1;
 constexpr size_t MOVEMENT_REASON_MAX_LENGTH = 95;
+constexpr int64_t MAX_ACCOUNT_BALANCE = 1000000000000LL;
+// Manual credits are capped to reduce accidental oversized entries while
+// remaining far above the quick-add amounts offered by the UI.
+constexpr int32_t MAX_SINGLE_CREDIT = 10000;
 
 enum class StorageState : uint8_t {
     STORAGE_UNINITIALIZED,

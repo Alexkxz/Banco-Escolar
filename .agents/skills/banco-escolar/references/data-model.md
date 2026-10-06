@@ -5,7 +5,7 @@ La fuente primaria es `src/student_model.h`, `src/academic_config.h` y `src/data
 ## Tipos
 
 - `Student`: `student_id`, `nfc_uid`, `name`, `preferred_name`, grado, grupo, número de lista, referencia de avatar y nivel temporal. El modelo no incorpora saldo dentro de `Student`.
-- `AccountRecord`: `student_id` y saldo demo provisional en RAM.
+- `AccountRecord`: `student_id` y saldo demo provisional en RAM; los flujos monetarios reales usan `StudentAccount`.
 - `StudentAccount` (Fase 5C): `student_id`, `int64_t balance` y `schema_version=1`; se persiste en LittleFS y no almacena nombre, UID ni número de lista.
 - `ReadingRecord`: alumno, fecha, PPM y `applied`.
 - `WritingRecord`: alumno, fecha, palabras, errores y `applied`.
@@ -46,3 +46,20 @@ La moneda se configura en `src/app_config.h` con `CURRENCY_NAME`, hoy Áureos. L
 La cuenta inicial de `student_id=7` se crea de forma idempotente con el valor demo vigente (125 Áureos), solo al entrar explícitamente en Demo y únicamente si todavía no existe. Los demás alumnos no reciben saldo automático. El historial previo no recalcula ni descuenta el saldo.
 
 La validación física de 5C.1 reportó una salida nueva de 5 Áureos (movimiento ID 4), saldo actualizado de 125 a 120 y persistencia tras reinicio: saldo 120, cuatro movimientos y sin duplicación. Los IDs históricos 1–3 se mantuvieron intactos. El archivo `/data/accounts.ndjson` no existía antes de la primera inicialización y se creó correctamente.
+
+Fase 5D añade entradas manuales con amount positivo y `StoredMovementType::ENTRY`, usando `StudentAccount` y el journal transaccional. No cambia `MovementRecord` ni su esquema. Prueba física reportada: saldo 120 + 10 = 130, movimiento ID 5, `student_id=7`, `synced=false`; tras reinicio hubo cinco movimientos sin duplicación. 5D está validada físicamente.
+
+## Actividades — FUTURO / PROPUESTO (no implementado en 5E)
+
+- `ActivitySession`: `id`, `activity_number` opcional, `reward_amount`, `duration_seconds`, `participant_mode`, `started_at`, `status`.
+- `ActivityClaim`: `id`, `activity_id`, `student_id`, `claimed_at`, `movement_id`, `status`, `void_movement_id`.
+
+Estos campos son una propuesta conceptual; no existen structs ni archivos persistentes para ellos. La arquitectura permitirá más de una actividad activa. Si un alumno solo es elegible para una, el registro futuro podrá ser directo; si hay varias, tendrá que seleccionar cuál completó. No se permitirá duplicar un cobro válido de la misma actividad por alumno. El flujo futuro identifica al alumno, valida la actividad, registra la participación, crea una entrada de Áureos mediante el motor transaccional existente y actualiza `StudentAccount`. Los cambios de dinero deberán distinguir su contexto/origen (entrada manual, actividad, Panel Maestro), pero esta fase no modifica `MovementRecord` ni define un cambio de esquema.
+
+Las anulaciones futuras desde el Panel marcarán la participación `VOIDED`/anulada y crearán un movimiento inverso que retire los Áureos; no eliminarán físicamente registros. Nada de lo anterior se implementa ni persiste en Fase 5E.
+
+## `ActivityDraft` — TEMPORAL EN MEMORIA (Fase 5E.1)
+
+`ActivityDraft` vive solo en RAM mientras se configura una actividad y se descarta al salir del Menú Maestro. Contiene `activity_number_enabled`, `activity_number`, `timed`, `duration_seconds`, `reward_amount`, `participant_mode`, `selected_student_ids` (solo claves `student_id`) y `valid`. No contiene `started_at`, `ends_at`, ID de actividad ni estado ACTIVE. `DISABLED` para participantes significa que no se aplica un filtro previo de elegibilidad; no significa cero alumnos. `ALL` expresa explícitamente todos los alumnos registrados, mientras que `SELECTED` necesita al menos un ID válido.
+
+En la futura Fase 5E.2, solo un borrador válido podrá convertirse en una entidad persistida `ActivitySession`. El formulario actual no reserva IDs, escribe archivos ni crea `ActivitySession`/`ActivityClaim`.

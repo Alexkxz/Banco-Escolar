@@ -33,11 +33,13 @@ La salida pasa por `applyAccountMovement()`: valida cuenta, hora, tipo, rango y 
 
 La validación física reportada para 5C.1 confirmó `student_id=7`, saldo inicial 125, una salida nueva de 5, saldo final 120 y movimiento ID 4 (conteo de 3 a 4). Tras reiniciar, saldo 120 y conteo 4; el movimiento no se duplicó ni la cuenta volvió a 125. Los IDs 1–3 permanecen intactos. Inicio, Mi cuenta y Registrar salida usan la cuenta persistida. Si la lectura no es válida, muestran que el saldo no está disponible. La prueba informó que la ausencia inicial de `accounts.ndjson` fue normal, no un fallo funcional. 5C queda validada físicamente; BUILD no sustituye esa evidencia. No se ejecuta Upload en el cierre documental.
 
+La Fase 5D reutiliza `applyAccountMovement()` y `/data/pending_transaction.json` para entradas manuales positivas. Usa tipo `ENTRY`, motivo `Entrada manual`, origen `TERMINAL` y `synced=false`. La recuperación valida `new_balance == old_balance + amount` para impedir aplicar dos veces una entrada tras reinicio. El límite `MAX_SINGLE_CREDIT` es 10,000 Áureos. Prueba física reportada: 120 + 10 = 130, movimiento ID 5, saldo y cinco movimientos conservados tras reinicio sin duplicación; 5D queda validada físicamente.
+
 `clearLocalData()` borra y recrea solo el archivo de movimientos conocido; conserva el namespace NVS y `next_mv_id`. Conserva las API `totalBytes()`, `usedBytes()`, `freeBytes()`, `getMovementCount()` y `clearLocalData()` al hacer cambios relacionados.
 
 ## microSD
 
-`SDManager` existe, pero hardware no instalado y sin montaje físico. Mantén sin montar, escribir o formatear hasta autorización/fase específica. Una capacidad de compra práctica (32 GB, Class 10, UHS-I, FAT32) no establece el máximo oficial admitido.
+`SDManager` es un placeholder. El usuario reporta una microSD de 64 GB instalada, pero el firmware no intenta detectar ni montar la tarjeta; se decidió omitir microSD por ahora y no incluirla en las siguientes fases inmediatas.
 
 ## Almacenamiento offline futuro
 

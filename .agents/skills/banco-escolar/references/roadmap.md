@@ -32,6 +32,7 @@
 | 5B.3 | Rediseño visual global y tema tecnológico | COMPLETADA; validada físicamente en 800 × 480 |
 | 5B.3A.1 | Corregir reinicio al abrir Fluidez y Dictado | COMPLETADA; validada físicamente sin reinicios |
 | 5C | Saldo persistente por alumno y operación coordinada de salida | COMPLETADA; validada físicamente en Fase 5C.1 |
+| 5D | Entradas manuales de Áureos con saldo y movimiento transaccionales | COMPLETADA; validada físicamente tras reinicio |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
 | 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
@@ -61,6 +62,19 @@ BLE aún está pendiente; no habilitarlo sin caso de uso. No inferir asistencia 
 
 La Fase 5C guarda snapshots de `StudentAccount` en `/data/accounts.ndjson`, mantiene separado el historial, inicializa de forma idempotente el saldo vigente de 125 Áureos para `student_id=7`, y coordina cada salida con un journal de recuperación. En 5C.1 se reportó validación física: salida de 5, movimiento ID 4, saldo 120, cuatro movimientos y persistencia tras reinicio sin duplicación ni reinicialización. 5C queda cerrada; no se inició la siguiente fase.
 
+La Fase 5D añade el flujo manual de entrada desde Inicio y reutiliza `ENTRY`, `StudentAccount` y el journal de 5C. Prueba física reportada: saldo 120 + 10 = 130, movimiento ID 5, cinco movimientos tras reinicio y sin duplicación.
+
 ## Documentación de estado
 
 La Fase 0S.2 corrigió estados históricos del firmware en `docs/FUTURE_ARCHITECTURE.md`. La Fase 0S.2B incorpora PWA multiplataforma y offline-first como decisión oficial, con API y base central futuras. No elige stack final ni implementa Panel, servidor o nueva persistencia.
+
+## Fase 5E y siguientes subfases
+
+- 5E — Menú Maestro base: IMPLEMENTADA y validada físicamente según reporte de fase.
+- 5E.1 — Configuración funcional de ActivityDraft en memoria: IMPLEMENTADA; validación física pendiente.
+- 5E.1A — Suspensión del timeout del contexto Maestro: IMPLEMENTADA en código y BUILD validado previamente; falta prueba física >60 s.
+- 5E.1B — Pulido visual y glifos del Menú Maestro: IMPLEMENTADA y BUILD validado; validación física en claro/oscuro pendiente.
+- 5E.2 — Persistencia de ActivitySession: FUTURO.
+- 5E.3 — Gestión de actividades activas simultáneas: FUTURO.
+- 5E.4 — Registro de ActivityClaim: FUTURO.
+- 5E.5 — Integración futura con NFC: FUTURO.

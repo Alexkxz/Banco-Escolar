@@ -11,10 +11,20 @@ previa y sincronización posterior mediante API.
 
 - ESP32-S3; pantalla RGB ST7262 de 800×480; touch GT911; expansor CH422G.
 - Wi-Fi en modo estación y sincronización NTP implementados.
-- LittleFS validado físicamente; StorageManager tiene infraestructura para
-  movimientos, aún no conectada a las transferencias de Áureos en pantalla.
+- LittleFS validado físicamente; `StorageManager` persiste `StudentAccount` y
+  movimientos de entradas/salidas mediante un journal transaccional. El flujo
+  de salida y la entrada manual 5D se validaron físicamente.
 - PN532 está deshabilitado (`PN532_ENABLED=false`) y desconectado. No conectar
   hasta verificar pines, alimentación y niveles lógicos de la placa lectora.
+
+El saldo físico conocido de prueba para Darío (`student_id=7`) es 130 Áureos,
+con cinco movimientos persistidos tras probar una entrada de +10 (movimiento
+ID 5). No hardcodees ese saldo: es estado del dispositivo, no valor inicial.
+
+La entrada `MENÚ MAESTRO DEV` y el borrador de actividad son temporales. `5E.1`
+no persiste ni inicia actividades; `5E.2` sigue futura. Consulta
+[`docs/CHAT_HANDOFF.md`](docs/CHAT_HANDOFF.md) para el estado completo y el orden
+de continuación. No se ha validado físicamente el pulido 5E.1B.
 
 ## Compilar
 

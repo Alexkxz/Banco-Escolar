@@ -1,4 +1,5 @@
 ﻿#include <Arduino.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -226,7 +227,7 @@ struct PerformanceScreenStats {
     uint32_t create_ms = 0;
     uint32_t transition_ms = 0;
 };
-PerformanceScreenStats performance_stats[24];
+PerformanceScreenStats performance_stats[40];
 struct FrameTimingStats {
     char label[48] = "";
     bool transition = false;
@@ -293,8 +294,83 @@ enum Pantalla : uint8_t {
     PANTALLA_TRANSFERIR,
     PANTALLA_TRANSFER_TECLADO,
     PANTALLA_TRANSFER_CONFIRMAR,
-    PANTALLA_TRANSFER_RESULTADO
+    PANTALLA_TRANSFER_RESULTADO,
+    PANTALLA_ACCOUNT_ENTRY,
+    PANTALLA_ACCOUNT_ENTRY_CONFIRM,
+    PANTALLA_ACCOUNT_ENTRY_RESULT,
+    PANTALLA_MASTER_MENU,
+    PANTALLA_ACTIVITY_SETUP,
+    PANTALLA_ACTIVITY_STUDENTS,
+    PANTALLA_ACTIVITY_KEYPAD,
+    PANTALLA_ACTIVITY_READY
 };
+static_assert(PANTALLA_ACTIVITY_READY < 40, "Performance screen stats capacity exceeded");
+
+constexpr uint16_t MAX_ACTIVITY_NUMBER = 9999;
+constexpr uint32_t MAX_ACTIVITY_REWARD = 10000;
+constexpr uint16_t MAX_ACTIVITY_MINUTES = 999;
+constexpr uint8_t MAX_ACTIVITY_SECONDS = 59;
+constexpr uint32_t MAX_ACTIVITY_DURATION_SECONDS =
+    static_cast<uint32_t>(MAX_ACTIVITY_MINUTES) * 60U + MAX_ACTIVITY_SECONDS;
+
+constexpr bool activity_number_value_valid(bool enabled, uint16_t number)
+{
+    return !enabled || (number > 0 && number <= MAX_ACTIVITY_NUMBER);
+}
+
+constexpr bool activity_duration_value_valid(bool timed, uint32_t duration_seconds)
+{
+    return !timed || (duration_seconds > 0 && duration_seconds <= MAX_ACTIVITY_DURATION_SECONDS);
+}
+
+constexpr bool activity_reward_value_valid(uint32_t amount)
+{
+    return amount > 0 && amount <= MAX_ACTIVITY_REWARD;
+}
+
+constexpr bool activity_selected_count_valid(bool selected_mode, size_t count)
+{
+    return !selected_mode || count > 0;
+}
+
+static_assert(activity_number_value_valid(false, 0), "Activity number is optional");
+static_assert(activity_number_value_valid(true, 12), "Positive activity number is valid");
+static_assert(!activity_number_value_valid(true, 0), "Enabled activity number must be positive");
+static_assert(!activity_number_value_valid(true, 10000), "Activity number is limited to 9999");
+static_assert(activity_duration_value_valid(false, 0), "Untimed activities use zero duration");
+static_assert(!activity_duration_value_valid(true, 0), "Timed activity duration must be positive");
+static_assert(activity_duration_value_valid(true, 30) && activity_duration_value_valid(true, 300),
+              "30 seconds and five minutes are valid durations");
+static_assert(!activity_duration_value_valid(true, MAX_ACTIVITY_DURATION_SECONDS + 1),
+              "Activity duration exceeds the configured limit");
+static_assert(!activity_reward_value_valid(0) && activity_reward_value_valid(10) &&
+              activity_reward_value_valid(MAX_ACTIVITY_REWARD) && !activity_reward_value_valid(MAX_ACTIVITY_REWARD + 1),
+              "Activity reward range is 1 to 10000");
+static_assert(!activity_selected_count_valid(true, 0) && activity_selected_count_valid(true, 3) &&
+              activity_selected_count_valid(false, 0), "Selected mode requires at least one student");
+
+enum class ActivityParticipantMode : uint8_t { ALL, SELECTED, PARTICIPANTS_DISABLED };
+enum class ActivityKeypadTarget : uint8_t { NONE, ACTIVITY_NUMBER, TIME_MINUTES, TIME_SECONDS, REWARD };
+
+struct ActivityDraft {
+    bool activity_number_enabled = false;
+    uint16_t activity_number = 0;
+    bool timed = false;
+    uint32_t duration_seconds = 0;
+    uint32_t reward_amount = 0;
+    ActivityParticipantMode participant_mode = ActivityParticipantMode::ALL;
+    std::vector<uint16_t> selected_student_ids;
+    bool valid = false;
+};
+
+ActivityDraft activity_draft;
+std::vector<uint16_t> activity_selection_staged;
+ActivityKeypadTarget activity_keypad_target = ActivityKeypadTarget::NONE;
+char activity_keypad_buffer[6] = {};
+char activity_keypad_feedback[80] = {};
+lv_coord_t activity_student_scroll_y = 0;
+lv_obj_t *activity_keypad_value_label = nullptr;
+lv_obj_t *activity_keypad_feedback_label = nullptr;
 
 Pantalla pantalla_actual = PANTALLA_ESPERA;
 Pantalla performance_transition_from = PANTALLA_ESPERA;
@@ -311,6 +387,17 @@ bool transfer_balance_warning = false;
 char transfer_keypad_buffer[8] = {};
 lv_obj_t *transfer_feedback_label = nullptr;
 lv_obj_t *transfer_keypad_input_label = nullptr;
+uint32_t account_entry_amount = 0;
+char account_entry_keypad_buffer[8] = {};
+char account_entry_feedback_text[96] = {};
+bool account_entry_keypad_active = false;
+bool account_entry_confirmation_in_progress = false;
+bool account_entry_movement_reload_failed = false;
+uint64_t account_entry_movement_id = 0;
+uint16_t account_entry_student_id = 0;
+size_t account_entry_movement_count = 0;
+int64_t account_entry_balance = 0;
+lv_obj_t *account_entry_confirm_button = nullptr;
 char movement_feedback_text[96] = {};
 uint64_t saved_movement_id = 0;
 uint16_t saved_movement_student_id = 0;
@@ -375,6 +462,7 @@ const char *movement_student_display_name(uint16_t student_id, char *fallback, s
 void mostrar_pantalla(Pantalla pantalla);
 void demo_menu_event(lv_event_t *event);
 void demo_back_event(lv_event_t *event);
+void activity_draft_reset();
 void demo_exit_event(lv_event_t *event);
 void create_movement_history_screen(lv_obj_t *screen);
 void create_global_header(lv_obj_t *screen, const char *title, bool show_exit);
@@ -503,6 +591,11 @@ void transfer_keypad_event(lv_event_t *event);
 void transfer_continue_event(lv_event_t *event);
 void transfer_confirm_event(lv_event_t *event);
 void transfer_cancel_event(lv_event_t *event);
+void account_entry_amount_event(lv_event_t *event);
+void account_entry_continue_event(lv_event_t *event);
+void account_entry_confirm_event(lv_event_t *event);
+void account_entry_cancel_event(lv_event_t *event);
+void account_entry_done_event(lv_event_t *event);
 lv_obj_t *make_content_panel(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
                              lv_coord_t width, lv_coord_t height, uint32_t color);
 void create_date_clock_card(lv_obj_t *parent, lv_coord_t width, lv_coord_t height,
@@ -703,9 +796,24 @@ void register_student_activity()
     last_student_activity_ms = millis();
 }
 
+bool is_master_context_active()
+{
+    switch (pantalla_actual) {
+        case PANTALLA_MASTER_MENU:
+        case PANTALLA_ACTIVITY_SETUP:
+        case PANTALLA_ACTIVITY_STUDENTS:
+        case PANTALLA_ACTIVITY_KEYPAD:
+        case PANTALLA_ACTIVITY_READY:
+            return true;
+        default:
+            return false;
+    }
+}
+
 void session_timeout_timer(lv_timer_t *timer)
 {
     (void)timer;
+    if (is_master_context_active()) return;
     if (pantalla_actual < PANTALLA_ALUMNO || pantalla_actual == PANTALLA_ESPERA ||
         (pantalla_actual >= PANTALLA_CONFIGURACION && pantalla_actual <= PANTALLA_STORAGE_CONFIRMAR_FINAL)) return;
     const uint32_t timeout_ms = SESSION_TIMEOUT_SECONDS * 1000UL;
@@ -1222,6 +1330,14 @@ uint8_t particle_intensity_for_screen(Pantalla pantalla)
         case PANTALLA_TRANSFER_TECLADO:
         case PANTALLA_TRANSFER_CONFIRMAR: return 2;
         case PANTALLA_TRANSFER_RESULTADO: return 3;
+        case PANTALLA_ACCOUNT_ENTRY:
+        case PANTALLA_ACCOUNT_ENTRY_CONFIRM:
+        case PANTALLA_ACCOUNT_ENTRY_RESULT: return 0;
+        case PANTALLA_MASTER_MENU:
+        case PANTALLA_ACTIVITY_SETUP:
+        case PANTALLA_ACTIVITY_STUDENTS:
+        case PANTALLA_ACTIVITY_KEYPAD:
+        case PANTALLA_ACTIVITY_READY: return 0;
         case PANTALLA_CONFIGURACION: return 3;
         case PANTALLA_FLUIDEZ:
         case PANTALLA_DICTADO: return 3;
@@ -1389,6 +1505,14 @@ const char *performance_screen_name(Pantalla screen)
         case PANTALLA_TRANSFER_TECLADO: return "TransferKeypad";
         case PANTALLA_TRANSFER_CONFIRMAR: return "TransferConfirm";
         case PANTALLA_TRANSFER_RESULTADO: return "TransferResult";
+        case PANTALLA_ACCOUNT_ENTRY: return "AccountEntry";
+        case PANTALLA_ACCOUNT_ENTRY_CONFIRM: return "AccountEntryConfirm";
+        case PANTALLA_ACCOUNT_ENTRY_RESULT: return "AccountEntryResult";
+        case PANTALLA_MASTER_MENU: return "MasterMenu";
+        case PANTALLA_ACTIVITY_SETUP: return "ActivitySetup";
+        case PANTALLA_ACTIVITY_STUDENTS: return "ActivityStudents";
+        case PANTALLA_ACTIVITY_KEYPAD: return "ActivityKeypad";
+        case PANTALLA_ACTIVITY_READY: return "ActivityReady";
     }
     return "Unknown";
 }
@@ -1994,6 +2118,15 @@ void demo_menu_event(lv_event_t *event)
             transfer_receiver_id = 0; transfer_amount = 0; transfer_receiver_detected = false; transfer_balance_warning = false; transfer_keypad_buffer[0] = '\0';
             movement_feedback_text[0] = '\0'; saved_movement_id = 0; saved_movement_count = 0; saved_movement_balance = 0;
         }
+        if (destination == PANTALLA_ACCOUNT_ENTRY) {
+            account_entry_amount = 0;
+            account_entry_keypad_buffer[0] = '\0';
+            account_entry_feedback_text[0] = '\0';
+            account_entry_keypad_active = false;
+            account_entry_confirmation_in_progress = false;
+            account_entry_confirm_button = nullptr;
+            account_entry_movement_reload_failed = false;
+        }
         if (static_cast<Pantalla>(target) == PANTALLA_HISTORIAL) {
             movement_history_page = 0;
             movement_history_filter = MovementHistoryFilter::ALL;
@@ -2016,8 +2149,16 @@ void create_student_menu_button_sized(lv_obj_t *parent, lv_coord_t x, lv_coord_t
     lv_obj_set_style_border_width(icon, 1, 0);
     lv_obj_set_style_border_color(icon, lv_color_hex(theme_palette().border), 0);
     lv_obj_align(icon, LV_ALIGN_TOP_LEFT, APP_SPACE_16, (height - 40) / 2);
-    lv_obj_t *icon_dot = make_shape(icon, 12, 12, icon_color);
-    lv_obj_align(icon_dot, LV_ALIGN_CENTER, 0, 0);
+    if (target == PANTALLA_ACCOUNT_ENTRY) {
+        lv_obj_t *plus = lv_label_create(icon);
+        lv_label_set_text(plus, "+");
+        lv_obj_set_style_text_font(plus, &lv_font_montserrat_26, 0);
+        lv_obj_set_style_text_color(plus, lv_color_hex(icon_color), 0);
+        lv_obj_center(plus);
+    } else {
+        lv_obj_t *icon_dot = make_shape(icon, 12, 12, icon_color);
+        lv_obj_align(icon_dot, LV_ALIGN_CENTER, 0, 0);
+    }
     lv_obj_t *label = lv_label_create(button);
     lv_label_set_text(label, title);
     lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
@@ -2068,9 +2209,10 @@ void create_arcade_student_home(lv_obj_t *screen)
     constexpr lv_coord_t CARD_HEIGHT = 72;
     create_student_menu_button_sized(screen, 24, 216, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, BLUE, "Mi cuenta", "Consulta tus movimientos", PANTALLA_CUENTA);
     create_student_menu_button_sized(screen, 408, 216, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, ORANGE, "Mi progreso", "Mira tu avance escolar", PANTALLA_PROGRESO);
-    create_student_menu_button_sized(screen, 24, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, BLUE, "Registrar salida", "Registrar una salida", PANTALLA_TRANSFERIR);
-    create_student_menu_button_sized(screen, 408, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, PURPLE, "Mis metas", "Consulta tus metas", PANTALLA_METAS);
-    create_student_menu_button_sized(screen, 216, 392, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, GREEN, "Logros", "Revisa tus logros", PANTALLA_LOGROS);
+    create_student_menu_button_sized(screen, 24, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, GREEN, "Registrar entrada", "Agregar Aureos manualmente", PANTALLA_ACCOUNT_ENTRY);
+    create_student_menu_button_sized(screen, 408, 304, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, ORANGE, "Registrar salida", "Registrar una salida", PANTALLA_TRANSFERIR);
+    create_student_menu_button_sized(screen, 24, 392, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, PURPLE, "Mis metas", "Consulta tus metas", PANTALLA_METAS);
+    create_student_menu_button_sized(screen, 408, 392, CARD_WIDTH, CARD_HEIGHT, 0xFFFFFF, GREEN, "Logros", "Revisa tus logros", PANTALLA_LOGROS);
 }
 
 void create_student_home(lv_obj_t *screen)
@@ -2373,6 +2515,767 @@ lv_obj_t *create_wifi_action_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t y
     return button;
 }
 
+void admin_navigation_event(lv_event_t *event)
+{
+    const lv_event_code_t code = lv_event_get_code(event);
+    lv_obj_t *button = lv_event_get_target(event);
+    if (code == LV_EVENT_PRESSED) {
+        start_button_press_feedback(button);
+    } else if (code == LV_EVENT_PRESS_LOST) {
+        end_button_press_feedback(button);
+    } else if (code == LV_EVENT_CLICKED) {
+        if (button_feedback_uses_outline(button)) end_button_press_feedback(button);
+        const Pantalla destination = static_cast<Pantalla>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+        if (destination == PANTALLA_ACTIVITY_SETUP) activity_draft_reset();
+        mostrar_pantalla(destination);
+    }
+}
+
+void open_master_menu_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) mostrar_pantalla(PANTALLA_MASTER_MENU);
+}
+
+void master_back_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    if (pantalla_actual == PANTALLA_MASTER_MENU) {
+        activity_draft_reset();
+        register_student_activity();
+        mostrar_pantalla(PANTALLA_CONFIGURACION);
+    } else {
+        activity_draft_reset();
+        mostrar_pantalla(PANTALLA_MASTER_MENU);
+    }
+}
+
+void create_admin_section_card(lv_obj_t *screen, lv_coord_t x, lv_coord_t y,
+                               lv_coord_t width, lv_coord_t height, const char *title)
+{
+    lv_obj_t *card = lv_obj_create(screen);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, width, height);
+    lv_obj_set_pos(card, x, y);
+    apply_student_surface_style(card, 16);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(theme_palette().border), 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *heading = lv_label_create(card);
+    lv_label_set_text(heading, title);
+    lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(heading, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_LEFT, 14, 10);
+}
+
+void create_master_menu_screen(lv_obj_t *screen)
+{
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    create_student_topbar(screen, "Menú Maestro", false, false);
+
+    lv_obj_t *status = make_content_panel(screen, 24, 108, 752, 72, theme_palette().surface);
+    lv_obj_set_style_border_width(status, 1, 0);
+    lv_obj_set_style_border_color(status, lv_color_hex(CYAN), 0);
+    lv_obj_t *label = lv_label_create(status);
+    lv_label_set_text(label, "MODO MAESTRO");
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 18, -10);
+    label = lv_label_create(status);
+    lv_label_set_text(label, "Acceso administrativo de la terminal");
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 18, 15);
+    lv_obj_t *dev = lv_label_create(status);
+    lv_label_set_text(dev, "DESARROLLO");
+    lv_obj_set_style_text_font(dev, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(dev, lv_color_hex(ORANGE), 0);
+    lv_obj_align(dev, LV_ALIGN_RIGHT_MID, -20, 0);
+
+    lv_obj_t *action = lv_obj_create(screen);
+    lv_obj_remove_style_all(action);
+    lv_obj_set_size(action, 752, 156);
+    lv_obj_set_pos(action, 24, 200);
+    apply_student_surface_style(action, 20);
+    lv_obj_set_style_border_width(action, 2, 0);
+    lv_obj_set_style_border_color(action, lv_color_hex(CYAN), 0);
+    lv_obj_add_flag(action, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(action, admin_navigation_event, LV_EVENT_ALL,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(PANTALLA_ACTIVITY_SETUP)));
+    lv_obj_t *accent = make_shape(action, 54, 54, theme_palette().surface, 16);
+    lv_obj_set_style_border_width(accent, 1, 0);
+    lv_obj_set_style_border_color(accent, lv_color_hex(ORANGE), 0);
+    lv_obj_align(accent, LV_ALIGN_LEFT_MID, 24, 0);
+    lv_obj_t *mark = lv_label_create(accent);
+    lv_label_set_text(mark, "+");
+    lv_obj_set_style_text_font(mark, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(mark, lv_color_hex(ORANGE), 0);
+    lv_obj_center(mark);
+    label = lv_label_create(action);
+    lv_label_set_text(label, "Iniciar actividad");
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 96, -18);
+    label = lv_label_create(action);
+    lv_label_set_text(label, "Configura una actividad y recompensa a los alumnos que la completen.");
+    lv_obj_set_width(label, 590);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 96, 18);
+
+    create_action_back_button(screen, master_back_event);
+}
+
+bool activity_student_id_selected(const std::vector<uint16_t> &ids, uint16_t student_id)
+{
+    for (uint16_t id : ids) if (id == student_id) return true;
+    return false;
+}
+
+void activity_draft_reset()
+{
+    activity_draft = ActivityDraft{};
+    activity_selection_staged.clear();
+    activity_keypad_target = ActivityKeypadTarget::NONE;
+    activity_keypad_buffer[0] = '\0';
+    activity_keypad_feedback[0] = '\0';
+    activity_student_scroll_y = 0;
+    activity_keypad_value_label = nullptr;
+    activity_keypad_feedback_label = nullptr;
+}
+
+bool activity_draft_is_valid()
+{
+    const bool number_valid = activity_number_value_valid(activity_draft.activity_number_enabled,
+                                                           activity_draft.activity_number);
+    const bool time_valid = activity_duration_value_valid(activity_draft.timed,
+                                                           activity_draft.duration_seconds);
+    const bool reward_valid = activity_reward_value_valid(activity_draft.reward_amount);
+    bool participants_valid = activity_selected_count_valid(
+        activity_draft.participant_mode == ActivityParticipantMode::SELECTED,
+        activity_draft.selected_student_ids.size());
+    if (participants_valid && activity_draft.participant_mode == ActivityParticipantMode::SELECTED) {
+        for (uint16_t student_id : activity_draft.selected_student_ids) {
+            if (getStudentById(student_id) == nullptr) {
+                participants_valid = false;
+                break;
+            }
+        }
+    }
+    activity_draft.valid = number_valid && time_valid && reward_valid && participants_valid;
+    return activity_draft.valid;
+}
+
+void activity_format_summary(char *buffer, size_t buffer_size)
+{
+    char number[24];
+    char time[24];
+    char participants[40];
+    if (activity_draft.activity_number_enabled) {
+        snprintf(number, sizeof(number), "%u", static_cast<unsigned>(activity_draft.activity_number));
+    } else {
+        snprintf(number, sizeof(number), "Sin número");
+    }
+    if (activity_draft.timed) {
+        snprintf(time, sizeof(time), "%u:%02u",
+                 static_cast<unsigned>(activity_draft.duration_seconds / 60U),
+                 static_cast<unsigned>(activity_draft.duration_seconds % 60U));
+    } else {
+        snprintf(time, sizeof(time), "Sin tiempo");
+    }
+    switch (activity_draft.participant_mode) {
+        case ActivityParticipantMode::ALL:
+            snprintf(participants, sizeof(participants), "Todos");
+            break;
+        case ActivityParticipantMode::SELECTED:
+            snprintf(participants, sizeof(participants), "%u seleccionados",
+                     static_cast<unsigned>(activity_draft.selected_student_ids.size()));
+            break;
+        case ActivityParticipantMode::PARTICIPANTS_DISABLED:
+            snprintf(participants, sizeof(participants), "Sin filtro previo");
+            break;
+    }
+    snprintf(buffer, buffer_size, "Actividad: %s   |   Tiempo: %s   |   Recompensa: %lu %s   |   Alumnos: %s",
+             number, time, static_cast<unsigned long>(activity_draft.reward_amount), CURRENCY_NAME, participants);
+}
+
+void create_activity_summary_blocks(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                    lv_coord_t width, lv_coord_t height, uint8_t columns)
+{
+    const char *labels[] = {"Actividad", "Tiempo", "Recompensa", "Alumnos"};
+    char values[4][40] = {};
+    if (activity_draft.activity_number_enabled) {
+        snprintf(values[0], sizeof(values[0]), "%u", static_cast<unsigned>(activity_draft.activity_number));
+    } else {
+        snprintf(values[0], sizeof(values[0]), "Sin número");
+    }
+    if (activity_draft.timed) {
+        snprintf(values[1], sizeof(values[1]), "%u:%02u",
+                 static_cast<unsigned>(activity_draft.duration_seconds / 60U),
+                 static_cast<unsigned>(activity_draft.duration_seconds % 60U));
+    } else {
+        snprintf(values[1], sizeof(values[1]), "Sin tiempo");
+    }
+    snprintf(values[2], sizeof(values[2]), "%lu %s",
+             static_cast<unsigned long>(activity_draft.reward_amount), CURRENCY_NAME);
+    switch (activity_draft.participant_mode) {
+        case ActivityParticipantMode::ALL:
+            snprintf(values[3], sizeof(values[3]), "Todos");
+            break;
+        case ActivityParticipantMode::SELECTED:
+            snprintf(values[3], sizeof(values[3]), "%u seleccionados",
+                     static_cast<unsigned>(activity_draft.selected_student_ids.size()));
+            break;
+        case ActivityParticipantMode::PARTICIPANTS_DISABLED:
+            snprintf(values[3], sizeof(values[3]), "Sin filtro previo");
+            break;
+    }
+
+    const lv_coord_t gap = 8;
+    const uint8_t rows = static_cast<uint8_t>((4U + columns - 1U) / columns);
+    const lv_coord_t cell_width = static_cast<lv_coord_t>((width - gap * (columns - 1U)) / columns);
+    const lv_coord_t cell_height = static_cast<lv_coord_t>((height - gap * (rows - 1U)) / rows);
+    for (uint8_t i = 0; i < 4; ++i) {
+        const uint8_t column = static_cast<uint8_t>(i % columns);
+        const uint8_t row_index = static_cast<uint8_t>(i / columns);
+        lv_obj_t *card = lv_obj_create(parent);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, cell_width, cell_height);
+        lv_obj_set_pos(card, x + column * (cell_width + gap), y + row_index * (cell_height + gap));
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(theme_palette().surface), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(theme_palette().border), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+        lv_obj_t *label = lv_label_create(card);
+        lv_label_set_text(label, labels[i]);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_set_pos(label, 10, 3);
+
+        lv_obj_t *value = lv_label_create(card);
+        lv_label_set_text(value, values[i]);
+        lv_obj_set_width(value, cell_width - 20);
+        lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(value, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(value, lv_color_hex(theme_palette().primary_text), 0);
+        lv_obj_align(value, LV_ALIGN_BOTTOM_LEFT, 10, -2);
+    }
+}
+
+lv_obj_t *create_activity_control_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                         lv_coord_t width, lv_coord_t height, const char *text,
+                                         lv_event_cb_t callback, intptr_t user_data,
+                                         ButtonVariant variant = ButtonVariant::SECONDARY,
+                                         bool enabled = true)
+{
+    lv_obj_t *button = lv_obj_create(parent);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_size(button, width, height);
+    lv_obj_set_pos(button, x, y);
+    apply_button_variant(button, variant, enabled);
+    if (variant == ButtonVariant::SECONDARY || !enabled) {
+        lv_obj_set_style_bg_color(button, lv_color_hex(theme_palette().surface), 0);
+        lv_obj_set_style_border_color(button, lv_color_hex(theme_palette().border), 0);
+    }
+    if (enabled) {
+        lv_obj_add_flag(button, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(button, arcade_button_feedback_event, LV_EVENT_ALL, nullptr);
+        lv_obj_add_event_cb(button, callback, LV_EVENT_CLICKED, reinterpret_cast<void *>(user_data));
+    } else {
+        lv_obj_clear_flag(button, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_state(button, LV_STATE_DISABLED);
+    }
+    lv_obj_t *label = lv_label_create(button);
+    lv_label_set_text(label, text);
+    const bool numeric_button = text[0] >= '0' && text[0] <= '9' && text[1] == '\0';
+    lv_obj_set_style_text_font(label, numeric_button ? &lv_font_montserrat_14 : &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(!enabled ? theme_palette().secondary_text :
+                                                        (variant == ButtonVariant::PRIMARY ? 0xFFFFFF : theme_palette().primary_text)), 0);
+    lv_obj_set_width(label, width - 8);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_center(label);
+    return button;
+}
+
+void activity_open_keypad(ActivityKeypadTarget target)
+{
+    activity_keypad_target = target;
+    activity_keypad_feedback[0] = '\0';
+    uint32_t current_value = 0;
+    switch (target) {
+        case ActivityKeypadTarget::ACTIVITY_NUMBER: current_value = activity_draft.activity_number; break;
+        case ActivityKeypadTarget::TIME_MINUTES: current_value = activity_draft.duration_seconds / 60U; break;
+        case ActivityKeypadTarget::TIME_SECONDS: current_value = activity_draft.duration_seconds % 60U; break;
+        case ActivityKeypadTarget::REWARD: current_value = activity_draft.reward_amount; break;
+        case ActivityKeypadTarget::NONE: break;
+    }
+    if (current_value > 0) snprintf(activity_keypad_buffer, sizeof(activity_keypad_buffer), "%lu",
+                                    static_cast<unsigned long>(current_value));
+    else activity_keypad_buffer[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_KEYPAD);
+}
+
+void activity_number_toggle_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_draft.activity_number_enabled = !activity_draft.activity_number_enabled;
+    if (activity_draft.activity_number_enabled && activity_draft.activity_number == 0) activity_draft.activity_number = 1;
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_number_edit_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED && activity_draft.activity_number_enabled)
+        activity_open_keypad(ActivityKeypadTarget::ACTIVITY_NUMBER);
+}
+
+void activity_time_mode_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const bool timed = reinterpret_cast<intptr_t>(lv_event_get_user_data(event)) != 0;
+    activity_draft.timed = timed;
+    if (!timed) activity_draft.duration_seconds = 0;
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_time_edit_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !activity_draft.timed) return;
+    const ActivityKeypadTarget target = reinterpret_cast<intptr_t>(lv_event_get_user_data(event)) == 0
+                                           ? ActivityKeypadTarget::TIME_MINUTES
+                                           : ActivityKeypadTarget::TIME_SECONDS;
+    activity_open_keypad(target);
+}
+
+void activity_reward_quick_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const uint32_t increment = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    const uint32_t remaining = MAX_ACTIVITY_REWARD - activity_draft.reward_amount;
+    activity_draft.reward_amount += increment > remaining ? remaining : increment;
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_reward_custom_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) activity_open_keypad(ActivityKeypadTarget::REWARD);
+}
+
+void activity_participant_mode_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const ActivityParticipantMode mode = static_cast<ActivityParticipantMode>(
+        reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (mode == ActivityParticipantMode::SELECTED) {
+        activity_selection_staged = activity_draft.selected_student_ids;
+        activity_student_scroll_y = 0;
+        mostrar_pantalla(PANTALLA_ACTIVITY_STUDENTS);
+        return;
+    }
+    activity_draft.participant_mode = mode;
+    activity_draft.selected_student_ids.clear();
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_student_toggle_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const uint16_t student_id = static_cast<uint16_t>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    if (getStudentById(student_id) == nullptr) return;
+    const lv_obj_t *target = lv_event_get_target(event);
+    if (target) activity_student_scroll_y = lv_obj_get_scroll_y(lv_obj_get_parent(target));
+    for (size_t i = 0; i < activity_selection_staged.size(); ++i) {
+        if (activity_selection_staged[i] == student_id) {
+            activity_selection_staged.erase(activity_selection_staged.begin() + static_cast<std::ptrdiff_t>(i));
+            mostrar_pantalla(PANTALLA_ACTIVITY_STUDENTS);
+            return;
+        }
+    }
+    activity_selection_staged.push_back(student_id);
+    mostrar_pantalla(PANTALLA_ACTIVITY_STUDENTS);
+}
+
+void activity_student_select_all_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_selection_staged.clear();
+    for (size_t i = 0; i < getStudentCount(); ++i) {
+        const Student *student = getStudentAtIndex(i);
+        if (student) activity_selection_staged.push_back(student->student_id);
+    }
+    mostrar_pantalla(PANTALLA_ACTIVITY_STUDENTS);
+}
+
+void activity_student_clear_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_selection_staged.clear();
+    mostrar_pantalla(PANTALLA_ACTIVITY_STUDENTS);
+}
+
+void activity_student_confirm_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_draft.selected_student_ids = activity_selection_staged;
+    std::sort(activity_draft.selected_student_ids.begin(), activity_draft.selected_student_ids.end());
+    activity_draft.participant_mode = ActivityParticipantMode::SELECTED;
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_student_cancel_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_selection_staged.clear();
+    activity_student_scroll_y = 0;
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_keypad_back_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_keypad_target = ActivityKeypadTarget::NONE;
+    activity_keypad_buffer[0] = '\0';
+    activity_keypad_feedback[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_keypad_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const intptr_t action = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+    if (action >= 0 && action <= 9) {
+        const size_t length = strlen(activity_keypad_buffer);
+        if (length < sizeof(activity_keypad_buffer) - 1) {
+            activity_keypad_buffer[length] = static_cast<char>('0' + action);
+            activity_keypad_buffer[length + 1] = '\0';
+        }
+        activity_keypad_feedback[0] = '\0';
+        if (activity_keypad_value_label) lv_label_set_text(activity_keypad_value_label,
+                                                            activity_keypad_buffer[0] ? activity_keypad_buffer : "0");
+        if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, "");
+        return;
+    }
+    if (action == -1) {
+        activity_keypad_buffer[0] = '\0';
+        activity_keypad_feedback[0] = '\0';
+        if (activity_keypad_value_label) lv_label_set_text(activity_keypad_value_label, "0");
+        if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, "");
+        return;
+    }
+    if (action == -3) {
+        activity_keypad_target = ActivityKeypadTarget::NONE;
+        activity_keypad_buffer[0] = '\0';
+        activity_keypad_feedback[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+        return;
+    }
+    if (action != -2) return;
+
+    char *end = nullptr;
+    const unsigned long parsed = activity_keypad_buffer[0] ? strtoul(activity_keypad_buffer, &end, 10) : 0;
+    if (!activity_keypad_buffer[0] || end == activity_keypad_buffer || *end != '\0') {
+        snprintf(activity_keypad_feedback, sizeof(activity_keypad_feedback), "Escribe un número válido.");
+        if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, activity_keypad_feedback);
+        return;
+    }
+    switch (activity_keypad_target) {
+        case ActivityKeypadTarget::ACTIVITY_NUMBER:
+            if (parsed == 0 || parsed > MAX_ACTIVITY_NUMBER) {
+                snprintf(activity_keypad_feedback, sizeof(activity_keypad_feedback), "El límite es de 1 a 9999.");
+                if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, activity_keypad_feedback);
+                return;
+            }
+            activity_draft.activity_number_enabled = true;
+            activity_draft.activity_number = static_cast<uint16_t>(parsed);
+            break;
+        case ActivityKeypadTarget::TIME_MINUTES:
+            if (parsed > MAX_ACTIVITY_MINUTES) {
+                snprintf(activity_keypad_feedback, sizeof(activity_keypad_feedback), "El límite es 999 minutos.");
+                if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, activity_keypad_feedback);
+                return;
+            }
+            activity_draft.duration_seconds = static_cast<uint32_t>(parsed) * 60U +
+                                              activity_draft.duration_seconds % 60U;
+            break;
+        case ActivityKeypadTarget::TIME_SECONDS:
+            if (parsed > MAX_ACTIVITY_SECONDS) {
+                snprintf(activity_keypad_feedback, sizeof(activity_keypad_feedback), "Los segundos van de 0 a 59.");
+                if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, activity_keypad_feedback);
+                return;
+            }
+            activity_draft.duration_seconds = (activity_draft.duration_seconds / 60U) * 60U +
+                                              static_cast<uint32_t>(parsed);
+            break;
+        case ActivityKeypadTarget::REWARD:
+            if (parsed == 0 || parsed > MAX_ACTIVITY_REWARD) {
+                snprintf(activity_keypad_feedback, sizeof(activity_keypad_feedback), "La recompensa va de 1 a 10000.");
+                if (activity_keypad_feedback_label) lv_label_set_text(activity_keypad_feedback_label, activity_keypad_feedback);
+                return;
+            }
+            activity_draft.reward_amount = static_cast<uint32_t>(parsed);
+            break;
+        case ActivityKeypadTarget::NONE:
+            mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+            return;
+    }
+    activity_keypad_target = ActivityKeypadTarget::NONE;
+    activity_keypad_buffer[0] = '\0';
+    activity_keypad_feedback[0] = '\0';
+    activity_draft_is_valid();
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_start_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !activity_draft_is_valid()) return;
+    mostrar_pantalla(PANTALLA_ACTIVITY_READY);
+}
+
+void activity_ready_edit_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void create_activity_setup_screen(lv_obj_t *screen)
+{
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    const bool valid = activity_draft_is_valid();
+    create_student_topbar(screen, "Configurar actividad", false, false);
+
+    create_admin_section_card(screen, 24, 108, 364, 104, "Número de actividad");
+    create_activity_control_button(screen, 40, 148, 140, 40,
+                                   activity_draft.activity_number_enabled ? "Número activo" : "Número opcional",
+                                   activity_number_toggle_event, 0,
+                                   activity_draft.activity_number_enabled ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    char number_text[40];
+    if (activity_draft.activity_number_enabled) snprintf(number_text, sizeof(number_text), "Editar: %u",
+                                                         static_cast<unsigned>(activity_draft.activity_number));
+    else snprintf(number_text, sizeof(number_text), "Sin número");
+    create_activity_control_button(screen, 188, 148, 184, 40, number_text,
+                                   activity_number_edit_event, 0, ButtonVariant::SECONDARY,
+                                   activity_draft.activity_number_enabled);
+
+    create_admin_section_card(screen, 408, 108, 368, 104, "Tiempo");
+    create_activity_control_button(screen, 424, 144, 164, 34, "Sin tiempo",
+                                   activity_time_mode_event, 0,
+                                   activity_draft.timed ? ButtonVariant::SECONDARY : ButtonVariant::PRIMARY);
+    create_activity_control_button(screen, 596, 144, 164, 34, "Con tiempo",
+                                   activity_time_mode_event, 1,
+                                   activity_draft.timed ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    char minutes_text[32];
+    char seconds_text[32];
+    snprintf(minutes_text, sizeof(minutes_text), "Minutos: %u",
+             static_cast<unsigned>(activity_draft.duration_seconds / 60U));
+    snprintf(seconds_text, sizeof(seconds_text), "Segundos: %02u",
+             static_cast<unsigned>(activity_draft.duration_seconds % 60U));
+    create_activity_control_button(screen, 424, 180, 164, 30, minutes_text,
+                                   activity_time_edit_event, 0, ButtonVariant::SECONDARY, activity_draft.timed);
+    create_activity_control_button(screen, 596, 180, 164, 30, seconds_text,
+                                   activity_time_edit_event, 1, ButtonVariant::SECONDARY, activity_draft.timed);
+
+    create_admin_section_card(screen, 24, 220, 364, 124, "Recompensa por alumno");
+    const uint32_t quick_amounts[] = {5, 10, 20, 50};
+    const char *quick_labels[] = {"+5", "+10", "+20", "+50"};
+    for (size_t i = 0; i < 4; ++i) {
+        create_activity_control_button(screen, 40 + static_cast<lv_coord_t>(i) * 82, 254, 74, 36,
+                                       quick_labels[i], activity_reward_quick_event, quick_amounts[i],
+                                       ButtonVariant::PRIMARY);
+    }
+    char reward_text[48];
+    snprintf(reward_text, sizeof(reward_text), "Actual: %lu %s",
+             static_cast<unsigned long>(activity_draft.reward_amount), CURRENCY_NAME);
+    lv_obj_t *reward_value = lv_label_create(screen);
+    lv_label_set_text(reward_value, reward_text);
+    lv_obj_set_style_text_font(reward_value, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(reward_value, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(reward_value, 202);
+    lv_label_set_long_mode(reward_value, LV_LABEL_LONG_DOT);
+    lv_obj_align(reward_value, LV_ALIGN_TOP_LEFT, 40, 300);
+    create_activity_control_button(screen, 248, 296, 124, 36, "Otra cantidad",
+                                   activity_reward_custom_event, 0, ButtonVariant::SECONDARY);
+
+    create_admin_section_card(screen, 408, 220, 368, 124, "Alumnos");
+    create_activity_control_button(screen, 424, 254, 104, 38, "Todos",
+                                   activity_participant_mode_event, static_cast<intptr_t>(ActivityParticipantMode::ALL),
+                                   activity_draft.participant_mode == ActivityParticipantMode::ALL ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 532, 254, 104, 38, "Seleccionar",
+                                   activity_participant_mode_event, static_cast<intptr_t>(ActivityParticipantMode::SELECTED),
+                                   activity_draft.participant_mode == ActivityParticipantMode::SELECTED ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 640, 254, 120, 38, "Deshabilitado",
+                                   activity_participant_mode_event, static_cast<intptr_t>(ActivityParticipantMode::PARTICIPANTS_DISABLED),
+                                   activity_draft.participant_mode == ActivityParticipantMode::PARTICIPANTS_DISABLED ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    char participants_text[96];
+    if (activity_draft.participant_mode == ActivityParticipantMode::SELECTED) {
+        snprintf(participants_text, sizeof(participants_text), "%u alumnos seleccionados",
+                 static_cast<unsigned>(activity_draft.selected_student_ids.size()));
+    } else if (activity_draft.participant_mode == ActivityParticipantMode::PARTICIPANTS_DISABLED) {
+        snprintf(participants_text, sizeof(participants_text), "Sin filtro previo de elegibilidad");
+    } else {
+        snprintf(participants_text, sizeof(participants_text), "Todos los alumnos registrados");
+    }
+    lv_obj_t *participants = lv_label_create(screen);
+    lv_label_set_text(participants, participants_text);
+    lv_obj_set_style_text_font(participants, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(participants, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_set_width(participants, 336);
+    lv_label_set_long_mode(participants, LV_LABEL_LONG_DOT);
+    lv_obj_set_pos(participants, 424, 300);
+
+    create_activity_summary_blocks(screen, 24, 352, 752, 56, 4);
+
+    create_action_back_button(screen, master_back_event);
+    lv_obj_t *start = create_activity_control_button(screen, 536, 416, 240, 48, "Iniciar actividad",
+                                                      activity_start_event, 0, ButtonVariant::PRIMARY, valid);
+    (void)start;
+}
+
+void create_activity_students_screen(lv_obj_t *screen)
+{
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    create_student_topbar(screen, "Seleccionar alumnos", false, false);
+    lv_obj_t *list = lv_obj_create(screen);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 752, 260);
+    lv_obj_set_pos(list, 24, 108);
+    apply_student_surface_style(list, 14);
+    lv_obj_set_style_pad_all(list, 6, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    for (size_t i = 0; i < getStudentCount(); ++i) {
+        const Student *student = getStudentAtIndex(i);
+        if (!student) continue;
+        const bool selected = activity_student_id_selected(activity_selection_staged, student->student_id);
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, 720, 46);
+        lv_obj_set_pos(row, 4, static_cast<lv_coord_t>(i * 50));
+        apply_student_surface_style(row, 10);
+        lv_obj_set_style_border_width(row, selected ? 2 : 1, 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(selected ? CYAN : theme_palette().border), 0);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, arcade_button_feedback_event, LV_EVENT_ALL, nullptr);
+        lv_obj_add_event_cb(row, activity_student_toggle_event, LV_EVENT_CLICKED,
+                            reinterpret_cast<void *>(static_cast<uintptr_t>(student->student_id)));
+        lv_obj_t *check = lv_obj_create(row);
+        lv_obj_remove_style_all(check);
+        lv_obj_set_size(check, 30, 30);
+        lv_obj_align(check, LV_ALIGN_LEFT_MID, 8, 0);
+        lv_obj_set_style_radius(check, 5, 0);
+        lv_obj_set_style_bg_opa(check, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(check, lv_color_hex(selected ? BLUE : theme_palette().surface), 0);
+        lv_obj_set_style_border_width(check, 1, 0);
+        lv_obj_set_style_border_color(check, lv_color_hex(selected ? BLUE : theme_palette().border), 0);
+        if (selected) {
+            lv_obj_t *mark = lv_label_create(check);
+            lv_label_set_text(mark, "X");
+            lv_obj_set_style_text_font(mark, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(mark, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_center(mark);
+        }
+        lv_obj_t *name = lv_label_create(row);
+        lv_label_set_text(name, student->preferred_name ? student->preferred_name : student->name);
+        lv_obj_set_width(name, 520);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(name, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(name, lv_color_hex(theme_palette().primary_text), 0);
+        lv_obj_align(name, LV_ALIGN_LEFT_MID, 48, 0);
+        char grade_group[32];
+        snprintf(grade_group, sizeof(grade_group), "%u.º%s%s", static_cast<unsigned>(student->grade),
+                 student->group && student->group[0] ? " " : "",
+                 student->group ? student->group : "");
+        lv_obj_t *grade = lv_label_create(row);
+        lv_label_set_text(grade, grade_group);
+        lv_obj_set_width(grade, 132);
+        lv_label_set_long_mode(grade, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(grade, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(grade, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_align(grade, LV_ALIGN_RIGHT_MID, -14, 0);
+    }
+    lv_obj_scroll_to_y(list, activity_student_scroll_y, LV_ANIM_OFF);
+    create_activity_control_button(screen, 24, 376, 200, 36, "Seleccionar todos",
+                                   activity_student_select_all_event, 0);
+    create_activity_control_button(screen, 236, 376, 160, 36, "Limpiar selección",
+                                   activity_student_clear_event, 0);
+    create_activity_control_button(screen, 636, 416, 140, 48, "Confirmar",
+                                   activity_student_confirm_event, 0, ButtonVariant::PRIMARY);
+    create_activity_control_button(screen, 24, 416, 140, 48, "Cancelar",
+                                   activity_student_cancel_event, 0);
+}
+
+void create_activity_keypad_screen(lv_obj_t *screen)
+{
+    const char *title = "Cantidad";
+    switch (activity_keypad_target) {
+        case ActivityKeypadTarget::ACTIVITY_NUMBER: title = "Número de actividad"; break;
+        case ActivityKeypadTarget::TIME_MINUTES: title = "Minutos"; break;
+        case ActivityKeypadTarget::TIME_SECONDS: title = "Segundos"; break;
+        case ActivityKeypadTarget::REWARD: title = "Recompensa en Áureos"; break;
+        case ActivityKeypadTarget::NONE: break;
+    }
+    create_student_topbar(screen, title, false, false);
+    lv_obj_t *panel = make_content_panel(screen, 18, 108, 764, 300, theme_palette().surface);
+    lv_obj_t *value = lv_label_create(panel);
+    activity_keypad_value_label = value;
+    lv_label_set_text(value, activity_keypad_buffer[0] ? activity_keypad_buffer : "0");
+    lv_obj_set_style_text_font(value, &lv_font_montserrat_30, 0);
+    lv_obj_set_style_text_color(value, lv_color_hex(BLUE), 0);
+    lv_obj_set_width(value, 740);
+    lv_obj_set_style_text_align(value, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(value, LV_ALIGN_TOP_MID, 0, 4);
+    lv_obj_t *feedback = lv_label_create(panel);
+    activity_keypad_feedback_label = feedback;
+    lv_label_set_text(feedback, activity_keypad_feedback);
+    lv_obj_set_style_text_font(feedback, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(feedback, lv_color_hex(DANGER), 0);
+    lv_obj_set_width(feedback, 740);
+    lv_obj_set_style_text_align(feedback, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(feedback, LV_ALIGN_TOP_MID, 0, 44);
+    const char *digits[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
+    for (int i = 0; i < 10; ++i) {
+        const int row = i < 9 ? i / 3 : 3;
+        const int col = i < 9 ? i % 3 : 1;
+        create_activity_control_button(panel, 47 + col * 115, 76 + row * 52, 105, 46,
+                                       digits[i], activity_keypad_event, i + 1 == 10 ? 0 : i + 1,
+                                       ButtonVariant::SECONDARY);
+    }
+    create_activity_control_button(panel, 450, 232, 95, 46, "Borrar", activity_keypad_event, -1);
+    create_activity_control_button(panel, 554, 232, 95, 46, "Aceptar", activity_keypad_event, -2,
+                                   ButtonVariant::PRIMARY);
+    create_activity_control_button(panel, 658, 232, 95, 46, "Cancelar", activity_keypad_event, -3);
+    create_action_back_button(screen, activity_keypad_back_event);
+}
+
+void create_activity_ready_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Configuración preparada", false, false);
+    lv_obj_t *panel = make_content_panel(screen, 80, 112, 640, 280, theme_palette().surface);
+    lv_obj_set_style_border_width(panel, 2, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(CYAN), 0);
+    lv_obj_t *heading = lv_label_create(panel);
+    lv_label_set_text(heading, "Configuración preparada");
+    lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(heading, lv_color_hex(GREEN), 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 18);
+    create_activity_summary_blocks(panel, 24, 66, 592, 150, 2);
+    lv_obj_t *notice = lv_label_create(panel);
+    lv_label_set_text(notice, "No se guardó ni inició una actividad");
+    lv_obj_set_style_text_font(notice, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(notice, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_align(notice, LV_ALIGN_BOTTOM_MID, 0, -24);
+    create_activity_control_button(screen, 304, 416, 184, 48, "Volver a editar",
+                                   activity_ready_edit_event, 0, ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 496, 416, 184, 48, "Volver al menú",
+                                   master_back_event, 0, ButtonVariant::PRIMARY);
+}
+
 void create_config_screen(lv_obj_t *screen)
 {
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
@@ -2409,6 +3312,8 @@ void create_config_screen(lv_obj_t *screen)
     create_wifi_action_button(network, 14, 222, 320, 44, "ALMACENAMIENTO LOCAL", config_storage_event);
 
     create_back_button(screen);
+    create_wifi_action_button(screen, 552, 416, 224, 48, "MENÚ MAESTRO DEV", open_master_menu_event,
+                              0xFFF6E1, ORANGE, ButtonVariant::SECONDARY);
     update_wifi_ui();
 }
 
@@ -3680,22 +4585,166 @@ void transfer_amount_event(lv_event_t *event)
     mostrar_pantalla(PANTALLA_TRANSFERIR);
 }
 
+void account_entry_amount_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !selected_student) return;
+    const intptr_t action = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+    if (action == -4) {
+        account_entry_keypad_active = true;
+        account_entry_keypad_buffer[0] = '\0';
+        account_entry_feedback_text[0] = '\0';
+        mostrar_pantalla(PANTALLA_TRANSFER_TECLADO);
+        return;
+    }
+    if (action <= 0) return;
+    const uint32_t amount = static_cast<uint32_t>(action);
+    if (amount == 0 || amount > MAX_SINGLE_CREDIT) return;
+    account_entry_amount = amount;
+    account_entry_feedback_text[0] = '\0';
+    register_student_activity();
+    mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+}
+
+void account_entry_continue_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !selected_student) return;
+    StudentAccount account = {};
+    if (!storage_manager.isReady() ||
+        storage_manager.getStudentAccount(selected_student->student_id, account) != StorageResult::STORAGE_OK) {
+        snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "Cuenta no disponible; no se creara un saldo automatico.");
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+        return;
+    }
+    if (account_entry_amount == 0 || account_entry_amount > MAX_SINGLE_CREDIT) {
+        snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "Elige una cantidad de 1 a %ld Aureos.", static_cast<long>(MAX_SINGLE_CREDIT));
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+        return;
+    }
+    account_entry_feedback_text[0] = '\0';
+    account_entry_confirmation_in_progress = false;
+    register_student_activity();
+    mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY_CONFIRM);
+}
+
+void account_entry_confirm_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        pantalla_actual != PANTALLA_ACCOUNT_ENTRY_CONFIRM ||
+        account_entry_confirmation_in_progress) return;
+    account_entry_confirmation_in_progress = true;
+    account_entry_confirm_button = lv_event_get_target(event);
+    if (account_entry_confirm_button) lv_obj_add_state(account_entry_confirm_button, LV_STATE_DISABLED);
+    register_student_activity();
+
+    if (!selected_student || account_entry_amount == 0 || account_entry_amount > MAX_SINGLE_CREDIT) {
+        snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "Cantidad invalida.");
+        account_entry_confirmation_in_progress = false;
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY_CONFIRM);
+        return;
+    }
+    if (!storage_manager.isReady()) {
+        snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "Almacenamiento no disponible.");
+        account_entry_confirmation_in_progress = false;
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY_CONFIRM);
+        return;
+    }
+
+    const uint16_t student_id = selected_student->student_id;
+    const size_t movement_count_before = storage_manager.getMovementCount();
+    StudentAccount updated = {};
+    uint64_t created_id = 0;
+    Serial.println("[Movement] Guardando entrada individual...");
+    const AccountMovementResult result = storage_manager.applyAccountMovement(
+        student_id, static_cast<int64_t>(account_entry_amount), StoredMovementType::ENTRY,
+        "Entrada manual", StoredRecordOrigin::TERMINAL, updated, &created_id);
+    if (result != AccountMovementResult::OK) {
+        const char *message = "Error al guardar la entrada.";
+        if (result == AccountMovementResult::ACCOUNT_NOT_FOUND) message = "Cuenta no disponible.";
+        else if (result == AccountMovementResult::INVALID_AMOUNT) message = "Cantidad invalida o superior al limite de entrada.";
+        else if (result == AccountMovementResult::INVALID_TIME) message = "Hora no valida; sincroniza la hora e intenta de nuevo.";
+        else if (result == AccountMovementResult::RECOVERY_REQUIRED) message = "Almacenamiento bloqueado por recuperacion. Reinicia el equipo.";
+        snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "%s", message);
+        Serial.printf("[Movement] Entrada rechazada: %u\n", static_cast<unsigned>(result));
+        account_entry_confirmation_in_progress = false;
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY_CONFIRM);
+        return;
+    }
+
+    account_entry_movement_id = created_id;
+    account_entry_student_id = student_id;
+    account_entry_movement_reload_failed = false;
+    MovementRecord persisted = {};
+    if (!read_stored_movement_by_id(created_id, persisted) || persisted.student_id != student_id ||
+        persisted.amount != static_cast<int32_t>(account_entry_amount) ||
+        persisted.type != StoredMovementType::ENTRY || strcmp(persisted.reason, "Entrada manual") != 0 ||
+        persisted.origin != StoredRecordOrigin::TERMINAL || persisted.synced) {
+        account_entry_movement_reload_failed = true;
+    }
+    StudentAccount verified = {};
+    account_entry_balance = storage_manager.getStudentAccount(student_id, verified) == StorageResult::STORAGE_OK
+                                ? verified.balance : updated.balance;
+    account_entry_movement_count = storage_manager.getMovementCount();
+    movement_history_cache_valid = false;
+    account_entry_feedback_text[0] = '\0';
+    Serial.printf("[Movement] ID=%llu student_id=%u amount=%ld\n",
+                  static_cast<unsigned long long>(created_id), static_cast<unsigned>(student_id),
+                  static_cast<long>(account_entry_amount));
+    Serial.println("[Movement] Entrada guardada correctamente; synced=false");
+    mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY_RESULT);
+}
+
+void account_entry_cancel_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    account_entry_feedback_text[0] = '\0';
+    account_entry_confirmation_in_progress = false;
+    register_student_activity();
+    mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+}
+
+void account_entry_done_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    account_entry_confirmation_in_progress = false;
+    account_entry_keypad_active = false;
+    register_student_activity();
+    mostrar_pantalla(PANTALLA_ALUMNO);
+}
+
 void transfer_keypad_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
     register_student_activity();
     const intptr_t action = reinterpret_cast<intptr_t>(lv_event_get_user_data(event));
+    const bool account_entry = account_entry_keypad_active && pantalla_actual == PANTALLA_TRANSFER_TECLADO;
+    char *const input_buffer = account_entry ? account_entry_keypad_buffer : transfer_keypad_buffer;
+    const size_t input_capacity = account_entry ? sizeof(account_entry_keypad_buffer) : sizeof(transfer_keypad_buffer);
     if (action >= 0 && action <= 9) {
-        const size_t length = strlen(transfer_keypad_buffer);
-        if (length < sizeof(transfer_keypad_buffer) - 1) {
-            transfer_keypad_buffer[length] = static_cast<char>('0' + action); transfer_keypad_buffer[length + 1] = '\0';
+        const size_t length = strlen(input_buffer);
+        if (length < input_capacity - 1) {
+            input_buffer[length] = static_cast<char>('0' + action); input_buffer[length + 1] = '\0';
         }
-        if (transfer_keypad_input_label) lv_label_set_text(transfer_keypad_input_label, transfer_keypad_buffer[0] ? transfer_keypad_buffer : "0");
+        if (transfer_keypad_input_label) lv_label_set_text(transfer_keypad_input_label, input_buffer[0] ? input_buffer : "0");
         return;
     }
-    if (action == -1) { transfer_keypad_buffer[0] = '\0'; if (transfer_keypad_input_label) lv_label_set_text(transfer_keypad_input_label, "0"); return; }
+    if (action == -1) { input_buffer[0] = '\0'; if (transfer_keypad_input_label) lv_label_set_text(transfer_keypad_input_label, "0"); return; }
     if (action == -2) {
-        const uint32_t value = transfer_keypad_buffer[0] ? static_cast<uint32_t>(strtoul(transfer_keypad_buffer, nullptr, 10)) : 0;
+        char *end = nullptr;
+        const unsigned long parsed = input_buffer[0] ? strtoul(input_buffer, &end, 10) : 0;
+        if (account_entry) {
+            if (!input_buffer[0] || end == input_buffer || *end != '\0' || parsed == 0 || parsed > MAX_SINGLE_CREDIT) {
+                snprintf(account_entry_feedback_text, sizeof(account_entry_feedback_text), "Usa una cantidad de 1 a %ld Aureos.", static_cast<long>(MAX_SINGLE_CREDIT));
+                mostrar_pantalla(PANTALLA_TRANSFER_TECLADO);
+                return;
+            }
+            account_entry_amount = static_cast<uint32_t>(parsed);
+            account_entry_keypad_buffer[0] = '\0';
+            account_entry_keypad_active = false;
+            account_entry_feedback_text[0] = '\0';
+            mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+            return;
+        }
+        const uint32_t value = input_buffer[0] ? static_cast<uint32_t>(parsed) : 0;
         const uint32_t balance = getStudentBalance() > 0 ? static_cast<uint32_t>(getStudentBalance()) : 0;
         if (value > balance) {
             transfer_balance_warning = true;
@@ -3703,6 +4752,13 @@ void transfer_keypad_event(lv_event_t *event)
             return;
         }
         transfer_amount = value; transfer_balance_warning = false; transfer_keypad_buffer[0] = '\0'; mostrar_pantalla(PANTALLA_TRANSFERIR); return;
+    }
+    if (account_entry) {
+        account_entry_keypad_buffer[0] = '\0';
+        account_entry_keypad_active = false;
+        account_entry_feedback_text[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+        return;
     }
     if (action == -4) { transfer_keypad_buffer[0] = '\0'; transfer_balance_warning = false; mostrar_pantalla(PANTALLA_TRANSFER_TECLADO); return; }
     transfer_keypad_buffer[0] = '\0'; mostrar_pantalla(PANTALLA_TRANSFERIR);
@@ -3789,6 +4845,12 @@ void transfer_cancel_event(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
     register_student_activity();
     if (pantalla_actual == PANTALLA_TRANSFER_CONFIRMAR) mostrar_pantalla(PANTALLA_TRANSFERIR);
+    else if (pantalla_actual == PANTALLA_TRANSFER_TECLADO && account_entry_keypad_active) {
+        account_entry_keypad_buffer[0] = '\0';
+        account_entry_keypad_active = false;
+        account_entry_feedback_text[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACCOUNT_ENTRY);
+    }
     else if (pantalla_actual == PANTALLA_TRANSFER_TECLADO) { transfer_keypad_buffer[0] = '\0'; mostrar_pantalla(PANTALLA_TRANSFERIR); }
     else { transfer_clear_state(); mostrar_pantalla(PANTALLA_ALUMNO); }
 }
@@ -3854,10 +4916,13 @@ void create_transfer_screen(lv_obj_t *screen)
 
 void create_arcade_transfer_keypad_screen(lv_obj_t *screen)
 {
+    const bool account_entry = account_entry_keypad_active;
     create_student_topbar(screen, "Otra cantidad", false, false);
     lv_obj_t *panel = make_content_panel(screen, 18, 108, 764, 300, 0xF7FBFF);
-    transfer_keypad_input_label = lv_label_create(panel); lv_label_set_text(transfer_keypad_input_label, transfer_keypad_buffer[0] ? transfer_keypad_buffer : "0"); lv_obj_set_style_text_font(transfer_keypad_input_label, &lv_font_montserrat_30, 0); lv_obj_set_style_text_color(transfer_keypad_input_label, lv_color_hex(PURPLE), 0); lv_obj_set_width(transfer_keypad_input_label, 740); lv_obj_set_style_text_align(transfer_keypad_input_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(transfer_keypad_input_label, LV_ALIGN_TOP_MID, 0, 6);
-    transfer_feedback_label = lv_label_create(panel); lv_label_set_text(transfer_feedback_label, transfer_balance_warning ? "No puedes transferir más de tu saldo." : ""); lv_obj_set_style_text_font(transfer_feedback_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(transfer_feedback_label, lv_color_hex(ORANGE), 0); lv_obj_set_width(transfer_feedback_label, 740); lv_obj_set_style_text_align(transfer_feedback_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(transfer_feedback_label, LV_ALIGN_TOP_MID, 0, 48);
+    char *const input_buffer = account_entry ? account_entry_keypad_buffer : transfer_keypad_buffer;
+    transfer_keypad_input_label = lv_label_create(panel); lv_label_set_text(transfer_keypad_input_label, input_buffer[0] ? input_buffer : "0"); lv_obj_set_style_text_font(transfer_keypad_input_label, &lv_font_montserrat_30, 0); lv_obj_set_style_text_color(transfer_keypad_input_label, lv_color_hex(account_entry ? GREEN : PURPLE), 0); lv_obj_set_width(transfer_keypad_input_label, 740); lv_obj_set_style_text_align(transfer_keypad_input_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(transfer_keypad_input_label, LV_ALIGN_TOP_MID, 0, 6);
+    const char *feedback = account_entry ? account_entry_feedback_text : (transfer_balance_warning ? "No puedes transferir más de tu saldo." : "");
+    transfer_feedback_label = lv_label_create(panel); lv_label_set_text(transfer_feedback_label, feedback); lv_obj_set_style_text_font(transfer_feedback_label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(transfer_feedback_label, lv_color_hex(ORANGE), 0); lv_obj_set_width(transfer_feedback_label, 740); lv_obj_set_style_text_align(transfer_feedback_label, LV_TEXT_ALIGN_CENTER, 0); lv_obj_align(transfer_feedback_label, LV_ALIGN_TOP_MID, 0, 48);
     const char *digits[] = {"1", "2", "3", "4", "5", "6", "7", "8", "9", "0"};
     for (int i = 0; i < 10; ++i) {
         const int row = i < 9 ? i / 3 : 3;
@@ -3869,6 +4934,7 @@ void create_arcade_transfer_keypad_screen(lv_obj_t *screen)
     create_transfer_button(panel, 450, 232, 95, 46, "BORRAR", transfer_keypad_event, -1);
     create_transfer_button(panel, 554, 232, 95, 46, "ACEPTAR", transfer_keypad_event, -2);
     create_transfer_button(panel, 658, 232, 95, 46, "CANCELAR", transfer_keypad_event, -3);
+    if (account_entry) create_action_back_button(screen, transfer_cancel_event);
 }
 
 void create_transfer_keypad_screen(lv_obj_t *screen)
@@ -3948,6 +5014,137 @@ void create_transfer_result_screen(lv_obj_t *screen)
     create_transfer_button(panel, 150, 164, 260, 42, "VOLVER AL INICIO", transfer_cancel_event, 0);
 }
 
+void create_account_entry_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Registrar entrada", false, false);
+    lv_obj_t *panel = make_content_panel(screen, 24, 112, 752, 282, theme_palette().surface);
+    const char *name = selected_student ? student_short_name(selected_student) : "Alumno no disponible";
+    lv_obj_t *student = lv_label_create(panel); lv_label_set_text(student, name);
+    lv_obj_set_style_text_font(student, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(student, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(student, LV_ALIGN_TOP_LEFT, 28, 18);
+    char grade_text[32];
+    snprintf(grade_text, sizeof(grade_text), "%u.\xC2\xBA %s",
+             selected_student ? selected_student->grade : 0,
+             selected_student && selected_student->group ? selected_student->group : "");
+    lv_obj_t *grade = lv_label_create(panel); lv_label_set_text(grade, grade_text);
+    lv_obj_set_style_text_font(grade, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(grade, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_align(grade, LV_ALIGN_TOP_LEFT, 28, 46);
+
+    StudentAccount account = {};
+    const bool account_available = selected_student && storage_manager.isReady() &&
+        storage_manager.getStudentAccount(selected_student->student_id, account) == StorageResult::STORAGE_OK;
+    char balance_text[64];
+    if (account_available) snprintf(balance_text, sizeof(balance_text), "Saldo actual: %lld %s", static_cast<long long>(account.balance), CURRENCY_NAME);
+    else snprintf(balance_text, sizeof(balance_text), "Saldo no disponible");
+    lv_obj_t *balance = lv_label_create(panel); lv_label_set_text(balance, balance_text);
+    lv_obj_set_style_text_font(balance, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(balance, lv_color_hex(account_available ? theme_palette().secondary_text : ORANGE), 0);
+    lv_obj_align(balance, LV_ALIGN_TOP_RIGHT, -28, 22);
+
+    char amount_text[64];
+    snprintf(amount_text, sizeof(amount_text), "Entrada seleccionada: +%lu %s",
+             static_cast<unsigned long>(account_entry_amount), CURRENCY_NAME);
+    lv_obj_t *amount = lv_label_create(panel); lv_label_set_text(amount, amount_text);
+    lv_obj_set_style_text_font(amount, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(amount, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(amount, LV_ALIGN_TOP_LEFT, 28, 94);
+
+    constexpr lv_coord_t QUICK_W = 112;
+    create_transfer_button(panel, 28, 142, QUICK_W, 44, "+5", account_entry_amount_event, 5, true, ButtonVariant::PRIMARY);
+    create_transfer_button(panel, 152, 142, QUICK_W, 44, "+10", account_entry_amount_event, 10, true, ButtonVariant::PRIMARY);
+    create_transfer_button(panel, 276, 142, QUICK_W, 44, "+20", account_entry_amount_event, 20, true, ButtonVariant::PRIMARY);
+    create_transfer_button(panel, 400, 142, QUICK_W, 44, "+50", account_entry_amount_event, 50, true, ButtonVariant::PRIMARY);
+    create_transfer_button(panel, 28, 202, 190, 44, "OTRA CANTIDAD", account_entry_amount_event, -4,
+                           account_available, ButtonVariant::SECONDARY);
+    const bool can_continue = account_available && account_entry_amount > 0 && account_entry_amount <= MAX_SINGLE_CREDIT;
+    create_transfer_button(panel, 548, 202, 176, 44, "CONTINUAR", account_entry_continue_event, 0,
+                           can_continue, ButtonVariant::PRIMARY);
+    if (account_entry_feedback_text[0]) {
+        lv_obj_t *feedback = lv_label_create(panel); lv_label_set_text(feedback, account_entry_feedback_text);
+        lv_obj_set_style_text_font(feedback, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(feedback, lv_color_hex(ORANGE), 0);
+        lv_obj_set_width(feedback, 320); lv_label_set_long_mode(feedback, LV_LABEL_LONG_WRAP);
+        lv_obj_align(feedback, LV_ALIGN_TOP_LEFT, 232, 204);
+    }
+    create_back_button(screen);
+}
+
+void create_account_entry_confirm_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Confirmar entrada", false, false);
+    lv_obj_t *panel = make_content_panel(screen, 118, 112, 564, 282, theme_palette().surface);
+    const char *name = selected_student ? student_short_name(selected_student) : "Alumno no disponible";
+    char title_text[96];
+    snprintf(title_text, sizeof(title_text), "Agregar %lu %s a %s",
+             static_cast<unsigned long>(account_entry_amount), CURRENCY_NAME, name);
+    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, title_text);
+    lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(title, 500); lv_obj_set_style_text_align(title, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 24);
+
+    StudentAccount account = {};
+    const bool account_available = selected_student && storage_manager.isReady() &&
+        storage_manager.getStudentAccount(selected_student->student_id, account) == StorageResult::STORAGE_OK;
+    const bool balance_safe = account_available && account_entry_amount > 0 &&
+        account_entry_amount <= MAX_SINGLE_CREDIT && account.balance <= MAX_ACCOUNT_BALANCE - account_entry_amount;
+    char details_text[144];
+    if (balance_safe) {
+        snprintf(details_text, sizeof(details_text), "Saldo actual: %lld %s\nNuevo saldo: %lld %s",
+                 static_cast<long long>(account.balance), CURRENCY_NAME,
+                 static_cast<long long>(account.balance + account_entry_amount), CURRENCY_NAME);
+    } else {
+        snprintf(details_text, sizeof(details_text), "%s",
+                 account_available ? "La cantidad supera el limite permitido." : "Cuenta no disponible.");
+    }
+    lv_obj_t *details = lv_label_create(panel); lv_label_set_text(details, details_text);
+    lv_obj_set_style_text_font(details, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(details, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_set_style_text_align(details, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(details, 500); lv_obj_align(details, LV_ALIGN_TOP_MID, 0, 94);
+    if (account_entry_feedback_text[0]) {
+        lv_obj_t *feedback = lv_label_create(panel); lv_label_set_text(feedback, account_entry_feedback_text);
+        lv_obj_set_style_text_font(feedback, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(feedback, lv_color_hex(ORANGE), 0);
+        lv_obj_set_width(feedback, 500); lv_obj_set_style_text_align(feedback, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(feedback, LV_LABEL_LONG_WRAP); lv_obj_align(feedback, LV_ALIGN_TOP_MID, 0, 158);
+    }
+    account_entry_confirm_button = create_transfer_button(panel, 76, 218, 190, 42,
+        "CONFIRMAR", account_entry_confirm_event, 0, balance_safe && !account_entry_confirmation_in_progress,
+        ButtonVariant::PRIMARY);
+    create_transfer_button(panel, 298, 218, 190, 42, "CANCELAR", account_entry_cancel_event, 0,
+                           !account_entry_confirmation_in_progress, ButtonVariant::SECONDARY);
+    create_back_button(screen);
+}
+
+void create_account_entry_result_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Entrada registrada", false, false);
+    lv_obj_t *panel = make_content_panel(screen, 150, 126, 500, 246, theme_palette().surface);
+    lv_obj_t *title = lv_label_create(panel); lv_label_set_text(title, "ENTRADA GUARDADA EN LITTLEFS");
+    lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(GREEN), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 18);
+    const Student *student = getStudentById(account_entry_student_id);
+    char details_text[224];
+    snprintf(details_text, sizeof(details_text), "%s\n+%lu %s registrados\nSaldo actual: %lld %s\nID: %llu | Movimientos: %u%s",
+             student_short_name(student), static_cast<unsigned long>(account_entry_amount), CURRENCY_NAME,
+             static_cast<long long>(account_entry_balance), CURRENCY_NAME,
+             static_cast<unsigned long long>(account_entry_movement_id),
+             static_cast<unsigned>(account_entry_movement_count),
+             account_entry_movement_reload_failed ? "\nNo se pudo verificar la relectura" : "");
+    lv_obj_t *details = lv_label_create(panel); lv_label_set_text(details, details_text);
+    lv_obj_set_style_text_font(details, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(details, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_style_text_align(details, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(details, 460); lv_label_set_long_mode(details, LV_LABEL_LONG_WRAP);
+    lv_obj_align(details, LV_ALIGN_TOP_MID, 0, 64);
+    create_transfer_button(panel, 120, 184, 260, 42, "VOLVER AL INICIO", account_entry_done_event, 0,
+                           true, ButtonVariant::PRIMARY);
+}
+
 void demo_detection_timer_cb(lv_timer_t *timer)
 {
     lv_timer_del(timer); demo_detection_timer = nullptr; register_student_activity(); mostrar_pantalla(PANTALLA_ALUMNO);
@@ -3972,7 +5169,7 @@ bool is_back_navigation(Pantalla from, Pantalla to)
     if (to == PANTALLA_ALUMNO) {
         return from == PANTALLA_CUENTA || from == PANTALLA_PROGRESO ||
                from == PANTALLA_METAS || from == PANTALLA_LOGROS ||
-               from == PANTALLA_TRANSFER_RESULTADO;
+               from == PANTALLA_TRANSFER_RESULTADO || from == PANTALLA_ACCOUNT_ENTRY_RESULT;
     }
     if (to == PANTALLA_CUENTA) return from == PANTALLA_HISTORIAL;
     if (to == PANTALLA_PROGRESO) {
@@ -3980,6 +5177,15 @@ bool is_back_navigation(Pantalla from, Pantalla to)
     }
     if (to == PANTALLA_TRANSFERIR) {
         return from == PANTALLA_TRANSFER_TECLADO || from == PANTALLA_TRANSFER_CONFIRMAR;
+    }
+    if (to == PANTALLA_ACCOUNT_ENTRY) {
+        return from == PANTALLA_TRANSFER_TECLADO || from == PANTALLA_ACCOUNT_ENTRY_CONFIRM;
+    }
+    if (to == PANTALLA_CONFIGURACION) return from == PANTALLA_MASTER_MENU;
+    if (to == PANTALLA_MASTER_MENU) return from == PANTALLA_ACTIVITY_SETUP || from == PANTALLA_ACTIVITY_READY;
+    if (to == PANTALLA_ACTIVITY_SETUP) {
+        return from == PANTALLA_ACTIVITY_STUDENTS || from == PANTALLA_ACTIVITY_KEYPAD ||
+               from == PANTALLA_ACTIVITY_READY;
     }
     return false;
 }
@@ -4001,8 +5207,9 @@ void mostrar_pantalla(Pantalla pantalla)
 
     pantalla_actual = pantalla;
     wifi_ui_needs_refresh = true;
-    nfc_message_label = nullptr; nfc_hint_label = nullptr; nfc_status_label = nullptr; wifi_status_label = nullptr; wifi_config_state_label = nullptr; wifi_config_ssid_label = nullptr; wifi_config_ip_label = nullptr; wifi_config_rssi_label = nullptr; wifi_scan_status_label = nullptr; wifi_scan_list = nullptr; wifi_password_textarea = nullptr; wifi_manual_ssid_textarea = nullptr; wifi_keyboard = nullptr; wifi_connect_status_label = nullptr; motivation_label = nullptr; waiting_indicator = nullptr; nfc_panel = nullptr; clock_label = nullptr; date_label = nullptr; balance_amount_label = nullptr; balance_demo_label = nullptr; balance_unit_label = nullptr; transfer_feedback_label = nullptr; transfer_keypad_input_label = nullptr;
+    nfc_message_label = nullptr; nfc_hint_label = nullptr; nfc_status_label = nullptr; wifi_status_label = nullptr; wifi_config_state_label = nullptr; wifi_config_ssid_label = nullptr; wifi_config_ip_label = nullptr; wifi_config_rssi_label = nullptr; wifi_scan_status_label = nullptr; wifi_scan_list = nullptr; wifi_password_textarea = nullptr; wifi_manual_ssid_textarea = nullptr; wifi_keyboard = nullptr; wifi_connect_status_label = nullptr; motivation_label = nullptr; waiting_indicator = nullptr; nfc_panel = nullptr; clock_label = nullptr; date_label = nullptr; balance_amount_label = nullptr; balance_demo_label = nullptr; balance_unit_label = nullptr; transfer_feedback_label = nullptr; transfer_keypad_input_label = nullptr; account_entry_confirm_button = nullptr;
     performance_overlay = nullptr; performance_label = nullptr;
+    activity_keypad_value_label = nullptr; activity_keypad_feedback_label = nullptr;
     if (pantalla == PANTALLA_ALUMNO) register_student_activity();
     create_particle_background(next_screen, particle_intensity_for_screen(pantalla));
     switch (pantalla) {
@@ -4030,6 +5237,14 @@ void mostrar_pantalla(Pantalla pantalla)
         case PANTALLA_TRANSFER_TECLADO: create_transfer_keypad_screen(next_screen); break;
         case PANTALLA_TRANSFER_CONFIRMAR: create_transfer_confirm_screen(next_screen); break;
         case PANTALLA_TRANSFER_RESULTADO: create_transfer_result_screen(next_screen); break;
+        case PANTALLA_ACCOUNT_ENTRY: create_account_entry_screen(next_screen); break;
+        case PANTALLA_ACCOUNT_ENTRY_CONFIRM: create_account_entry_confirm_screen(next_screen); break;
+        case PANTALLA_ACCOUNT_ENTRY_RESULT: create_account_entry_result_screen(next_screen); break;
+        case PANTALLA_MASTER_MENU: create_master_menu_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_SETUP: create_activity_setup_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_STUDENTS: create_activity_students_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_KEYPAD: create_activity_keypad_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_READY: create_activity_ready_screen(next_screen); break;
     }
     create_performance_overlay(next_screen);
     performance_screen_create_ms = millis() - screen_create_started_ms;

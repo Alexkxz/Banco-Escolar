@@ -21,10 +21,9 @@ física se indica por separado y no se deduce de compilar.
   `CST6`; el arranque espera sincronización con fallback no bloqueante.
 - **PREPARADO / DESHABILITADO:** lógica de lectura PN532 desarrollada, pero
   `PN532_ENABLED=false` y el lector está desconectado. No se considera operativo.
-- **IMPLEMENTADO / DEMO:** modelo de 13 alumnos provisionales y vistas académicas,
-  cuenta y logros demo; `Registrar salida` usa persistencia local validada.
-- **IMPLEMENTADO / VALIDADO:** `Registrar salida` escribe un movimiento individual
-  en LittleFS y lo relee por ID; el nombre se resuelve desde el `student_id` persistido.
+- **IMPLEMENTADO / DEMO:** modelo de 13 alumnos provisionales y vistas académicas; las cuentas y movimientos monetarios usan persistencia local.
+- **IMPLEMENTADO / VALIDADO:** registrar salida y entrada manual usan `StudentAccount` y el journal transaccional; la entrada 5D se validó tras reinicio.
+- **IMPLEMENTADO / VALIDADO:** el historial guarda movimientos en LittleFS y resuelve el nombre visible desde el `student_id` persistido.
 - **PREPARADO:** nombre de moneda configurable en `src/app_config.h` mediante
   `CURRENCY_NAME`.
 - **IMPLEMENTADO:** umbrales de Fluidez lectora por grado en
@@ -38,19 +37,11 @@ física se indica por separado y no se deduce de compilar.
 
 `src/student_model.h` define `Student` con identidad, UID, nombre preferido,
 grado, grupo, número de lista, referencia opcional a avatar y nivel temporal.
-`AccountRecord` conserva aparte el saldo demo; el saldo no es un campo de
-`Student`. Los campos de avatar y número de lista preparan futuras funciones.
+`AccountRecord` conserva el saldo demo provisional. `StudentAccount` persiste aparte `student_id`, saldo y versión en LittleFS; la UI monetaria lee esa cuenta y no reconstruye el saldo desde movimientos.
 
-El saldo se modifica mediante `setStudentBalance()` y la UI se refresca desde
-`updateBalanceUI()`. El valor actual vive en RAM como dato demo.
+Las funciones `setStudentBalance()` y `updateBalanceUI()` permanecen para vistas demo; no son la fuente de saldo de Inicio, Mi cuenta ni las operaciones reales.
 
-`StudentMovement` contempla alumno, cantidad, tipo entrada/salida, motivo,
-fecha/hora y origen (`Banco Escolar` o `Panel del Maestro`). `StorageManager`
-implementa `MovementRecord` y las operaciones `appendMovement()`,
-`readMovements()`, conteo y pendientes en LittleFS. La salida individual de Áureos
-ya usa `appendMovement()` y relee el registro guardado para presentar el alumno
-vinculado por `student_id`; el historial visible completo corresponde a 5B.
-
+`StudentMovement` es el modelo de presentación. `MovementRecord` persiste `student_id`, cantidad, tipo, motivo, fecha, origen y estado de sincronización; `getStudentById()` resuelve el nombre para mostrar. Registrar salida y entrada manual actualizan cuenta y movimiento con el journal transaccional. La transferencia entre alumnos y sincronización siguen pendientes.
 El nombre actual de la moneda es **Áureos**, pero la interfaz lo obtiene de
 `CURRENCY_NAME`; para renombrarlo en el futuro se cambia un solo lugar.
 
@@ -143,7 +134,7 @@ del Panel será protegido, inicialmente para un administrador/docente principal,
 con crecimiento posterior a maestros, roles, permisos, grupos y escuelas.
 
 Cada cambio de Áureos desde ESP32 o Panel deberá generar un movimiento
-trazable; el saldo debe poder reconstruirse o validarse a partir del historial.
+trazable; el saldo persistente se actualiza con el movimiento y no se reconstruye desde el historial.
 Flujo previsto: operación local → guardar → marcar pendiente → detectar acceso
 a API → enviar → validar → confirmar → marcar sincronizado. Sin confirmación
 del servidor, el registro permanece pendiente.
@@ -240,9 +231,8 @@ Nunca escribir saldo o historial en la tarjeta.
   DARIO`) en el modelo `Student`, con nombre amigable para la interfaz.
 - **IMPLEMENTADO:** menú del alumno con `Mi cuenta`, `Mi progreso`, `Mis metas`
   y `Logros`. `Tienda` no forma parte de esta fase.
-- **IMPLEMENTADO / DEMO:** `Mi cuenta` muestra saldo demo, `CURRENCY_NAME` y tres
-  movimientos temporales del día. Los movimientos reales guardados aún no tienen
-  una pantalla de historial; esa vista corresponde a 5B.
+- **IMPLEMENTADO:** Mi cuenta muestra `StudentAccount` persistente e historial real de movimientos, filtrado por `student_id`; el historial es de solo lectura.
+- **IMPLEMENTADO / DEMO:** la información académica y Logros usan datos provisionales; las transferencias entre alumnos son futuras.
 - **IMPLEMENTADO / DEMO:** `Mi progreso` enlaza a Fluidez lectora y Dictado de
   oraciones. Las pantallas consumen estructuras `ReadingRecord` y
   `WritingRecord`.
@@ -409,25 +399,12 @@ son `STORAGE_ALLOW_ONE_TIME_FORMAT=false` y `STORAGE_SELF_TEST=false`; ante un
 fallo de montaje no debe formatear ni borrar datos automáticamente. La
 validación física registró dos arranques consecutivos con montaje correcto.
 
-El archivo de datos es `/data/movements.ndjson` y cada línea usa NDJSON,
-`schema_version=1`. `appendMovement()` requiere hora válida (epoch desde 2025)
-y reserva `next_mv_id` en NVS antes de escribir; gaps son aceptables y los IDs
-no se reutilizan. `clearLocalData()` borra solo el archivo conocido y conserva
-NVS y el contador. La infraestructura incluye `getPendingMovementCount()` y
-lectura de movimientos pendientes; la sincronización y el marcado durable como
-sincronizado siguen pendientes. La UI de salida individual agrega y relee el
-movimiento por ID; las pruebas físicas confirmaron los IDs secuenciales 1–3,
-el conteo persistente tras reinicio y el vínculo `student_id=7` → Darío. Los
-registros siguen con `synced=false`; el saldo de UI permanece demo/RAM y no se
-reconstruye desde movimientos. `MovementRecord` mantiene `schema_version=1` y
-no almacena el nombre del alumno.
+El archivo `/data/movements.ndjson` usa NDJSON, `schema_version=1`; `next_mv_id` se reserva en NVS y los IDs no se reutilizan. `clearLocalData()` borra solo el archivo de movimientos conocido y conserva NVS y el contador. LittleFS mantiene `/data/accounts.ndjson` y `/data/pending_transaction.json` para cuenta y recuperación transaccional.
 
+La sincronización y el marcado durable como sincronizado siguen pendientes; los registros físicos actuales conservan `synced=false`. La UI resuelve el nombre desde `student_id`; `MovementRecord` no almacena el nombre. El saldo visible procede de `StudentAccount` y no se reconstruye desde el historial.
 ## microSD
 
-La pantalla de Configuración y `SDManager` están **PREPARADOS**. El driver
-actual es un placeholder: no toca GPIO ni realiza I/O. La microSD física no
-está instalada, por lo que no hay montaje ni capacidad detectada.
-
+La pantalla de Configuración y `SDManager` son placeholders. El usuario reporta una microSD de 64 GB instalada, pero el firmware no accede a GPIO ni realiza I/O; por eso no la detecta ni monta. Se decidió omitir microSD de los próximos pasos inmediatos.
 ## Rendimiento de Inicio
 
 Inicio presentaba stutter. La medición previa informó promedio ~112.4 ms y
@@ -484,10 +461,10 @@ de rendimiento; Skill `banco-escolar`.
 | 18 | BLE solo si existe caso de uso | FUTURO |
 | 19 | OTA | FUTURO |
 
-El bloque 5A.4–5A.7 quedó completado y validado físicamente. El historial real
-5B.1 y el bloque visual 5B.1C–5B.1F quedaron completados y validados físicamente;
-el respaldo estable de este bloque se registra en GitHub. El saldo persistente
-completo, la sincronización y la atomicidad de transferencias entre alumnos siguen pendientes.
+Las fases 5A.4–5A.7, 5B.1 y 5B.1C–5B.1F quedaron completadas y validadas físicamente.
+5C/5C.1 validaron saldo persistente y salidas; 5D validó físicamente una entrada +10 que llevó el saldo de 120 a 130, movimiento ID 5, cinco movimientos tras reinicio sin duplicación.
+5E Menú Maestro base fue reportada validada físicamente. 5E.1 implementa `ActivityDraft` en RAM; no persiste ni inicia actividades. 5E.1A ya está implementada en código para suspender el timeout en contexto Maestro, con prueba física pendiente. 5E.1B compiló y espera validación física visual en temas claro y oscuro.
+El saldo monetario persistente ya está implementado localmente; sincronización, transferencias entre alumnos y Panel siguen pendientes.
 Todos los componentes de
 Panel/API/base central y sincronización aquí descritos son futuros: no se crean
 backend, endpoints, esquema de base de datos, manifest, Service Worker,

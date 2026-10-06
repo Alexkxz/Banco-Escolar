@@ -22,7 +22,7 @@ No cambies estas opciones solo para que coincidan con la etiqueta de la board. L
 
 ## microSD
 
-Asignación Waveshare reportada: MOSI GPIO11, SCK GPIO12, MISO GPIO13, CS por EXIO4. La tarjeta no está instalada. `SDManager` está preparado, pero debe permanecer sin montaje físico, escrituras ni formato hasta una fase autorizada. No declares un límite oficial de capacidad no verificado.
+Asignación Waveshare reportada: MOSI GPIO11, SCK GPIO12, MISO GPIO13, CS por EXIO4. El usuario reporta una microSD de 64 GB instalada; `SDManager` no accede a GPIO ni intenta montar, por lo que el firmware no la detecta. Se decidió omitir microSD en las fases inmediatas. No formatear ni cambiar conexión en este cierre; no declares un límite oficial de capacidad no verificado.
 
 ## Fuente de estos datos
 

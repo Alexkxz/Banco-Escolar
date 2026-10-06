@@ -28,7 +28,6 @@ constexpr char TEST_ID_KEY[] = "storage_test_id";
 constexpr uint32_t EXPECTED_FS_OFFSET = 0xC90000;
 constexpr size_t EXPECTED_FS_SIZE = 0x360000;
 constexpr size_t MAX_MOVEMENT_LINE_LENGTH = 384;
-constexpr int64_t MAX_ACCOUNT_BALANCE = 1000000000000LL;
 constexpr time_t MIN_VALID_EPOCH = 1735689600; // 2025-01-01 UTC, same gate as TimeManager.
 
 constexpr bool validBalanceChange(int64_t balance, int64_t amount)
@@ -41,6 +40,10 @@ static_assert(validBalanceChange(125, -5) && 125 + (-5) == 120, "125 - 5 validat
 static_assert(validBalanceChange(125, -125) && 125 + (-125) == 0, "125 - 125 validation");
 static_assert(!validBalanceChange(125, -126), "insufficient balance validation");
 static_assert(!validBalanceChange(0, -5), "negative balance rejection");
+static_assert(validBalanceChange(120, 5) && 120 + 5 == 125, "120 + 5 validation");
+static_assert(validBalanceChange(120, 10) && 120 + 10 == 130, "120 + 10 validation");
+static_assert(!validBalanceChange(120, 0), "zero movement rejection");
+static_assert(!validBalanceChange(MAX_ACCOUNT_BALANCE, 1), "balance overflow rejection");
 
 const char *movementTypeName(StoredMovementType type)
 {
@@ -804,6 +807,7 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
     if (account_result != StorageResult::STORAGE_OK) return AccountMovementResult::RECOVERY_REQUIRED;
     if (amount == 0 || amount < std::numeric_limits<int32_t>::min() || amount > std::numeric_limits<int32_t>::max()) return AccountMovementResult::INVALID_AMOUNT;
     if ((type == StoredMovementType::EXIT && amount >= 0) || (type == StoredMovementType::ENTRY && amount <= 0)) return AccountMovementResult::INVALID_AMOUNT;
+    if (type == StoredMovementType::ENTRY && amount > MAX_SINGLE_CREDIT) return AccountMovementResult::INVALID_AMOUNT;
     if (type == StoredMovementType::EXIT && current.balance < -amount) return AccountMovementResult::INSUFFICIENT_FUNDS;
     if (!validBalanceChange(current.balance, amount)) return AccountMovementResult::INVALID_AMOUNT;
     const int64_t next_balance = current.balance + amount;
@@ -863,7 +867,10 @@ bool StorageManager::recoverPendingAccountMovement()
     expected.type = strcmp(type_name, "exit") == 0 ? StoredMovementType::EXIT : (strcmp(type_name, "entry") == 0 ? StoredMovementType::ENTRY : static_cast<StoredMovementType>(255));
     expected.origin = strcmp(origin_name_value, "terminal") == 0 ? StoredRecordOrigin::TERMINAL : (strcmp(origin_name_value, "panel") == 0 ? StoredRecordOrigin::PANEL : static_cast<StoredRecordOrigin>(255));
     expected.synced = false; expected.schema_version = STORAGE_SCHEMA_VERSION; memcpy(expected.reason, reason, strlen(reason) + 1);
-    if (expected.type == static_cast<StoredMovementType>(255) || expected.origin == static_cast<StoredRecordOrigin>(255) || new_balance != old_balance + amount) return false;
+    if (expected.type == static_cast<StoredMovementType>(255) || expected.origin == static_cast<StoredRecordOrigin>(255) ||
+        (expected.type == StoredMovementType::ENTRY && (amount <= 0 || amount > MAX_SINGLE_CREDIT)) ||
+        (expected.type == StoredMovementType::EXIT && amount >= 0) ||
+        !validBalanceChange(old_balance, amount) || new_balance != old_balance + amount) return false;
     StudentAccount current = {}; bool found = false;
     if (!readLatestAccount(student_id, current, found) || !found || (current.balance != old_balance && current.balance != new_balance)) return false;
     MovementRecord existing = {}; size_t matches = 0;

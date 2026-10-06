@@ -89,6 +89,11 @@ const Student *getStudentById(uint16_t student_id)
     return nullptr;
 }
 
+const Student *getStudentAtIndex(size_t index)
+{
+    return index < sizeof(students) / sizeof(students[0]) ? &students[index] : nullptr;
+}
+
 const Student *getDemoStudent() { return getStudentById(DEMO_STUDENT_ID); }
 
 const AccountRecord *getAccountByStudentId(uint16_t student_id)
