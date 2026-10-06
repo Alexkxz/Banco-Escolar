@@ -5,7 +5,8 @@ La fuente primaria es `src/student_model.h`, `src/academic_config.h` y `src/data
 ## Tipos
 
 - `Student`: `student_id`, `nfc_uid`, `name`, `preferred_name`, grado, grupo, número de lista, referencia de avatar y nivel temporal. El modelo no incorpora saldo dentro de `Student`.
-- `AccountRecord`: `student_id` y saldo entero en Áureos.
+- `AccountRecord`: `student_id` y saldo demo provisional en RAM.
+- `StudentAccount` (Fase 5C): `student_id`, `int64_t balance` y `schema_version=1`; se persiste en LittleFS y no almacena nombre, UID ni número de lista.
 - `ReadingRecord`: alumno, fecha, PPM y `applied`.
 - `WritingRecord`: alumno, fecha, palabras, errores y `applied`.
 - `StudentMovement`: alumno, cantidad firmada, tipo, motivo, fecha/hora y origen.
@@ -40,4 +41,8 @@ Darío está en 4.º; con 107 PPM se clasifica Estándar, meta Avanzado 115 y di
 
 ## Dinero y demo de transferencia
 
-La moneda se configura en `src/app_config.h` con `CURRENCY_NAME`, hoy Áureos. La UI de transferencia Darío → Fernanda es demo, con controles +5, +10, -5, -10 y cantidad libre, y validación de saldo/rango; no representa movimientos reales persistidos.
+La moneda se configura en `src/app_config.h` con `CURRENCY_NAME`, hoy Áureos. La salida individual de Darío usa la cuenta persistente, exige fondos y persiste movimiento más saldo de forma coordinada. La transferencia Darío → Fernanda entre dos alumnos continúa siendo futura; no se implementa un crédito/débito doble.
+
+La cuenta inicial de `student_id=7` se crea de forma idempotente con el valor demo vigente (125 Áureos), solo al entrar explícitamente en Demo y únicamente si todavía no existe. Los demás alumnos no reciben saldo automático. El historial previo no recalcula ni descuenta el saldo.
+
+La validación física de 5C.1 reportó una salida nueva de 5 Áureos (movimiento ID 4), saldo actualizado de 125 a 120 y persistencia tras reinicio: saldo 120, cuatro movimientos y sin duplicación. Los IDs históricos 1–3 se mantuvieron intactos. El archivo `/data/accounts.ndjson` no existía antes de la primera inicialización y se creó correctamente.

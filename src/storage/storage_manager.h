@@ -51,6 +51,17 @@ struct MovementRecord {
     uint16_t schema_version;
 };
 
+struct StudentAccount {
+    uint16_t student_id;
+    int64_t balance;
+    uint16_t schema_version;
+};
+
+enum class AccountMovementResult : uint8_t {
+    OK, ACCOUNT_NOT_FOUND, INSUFFICIENT_FUNDS, INVALID_AMOUNT,
+    INVALID_TIME, MOVEMENT_WRITE_FAILED, ACCOUNT_WRITE_FAILED, RECOVERY_REQUIRED
+};
+
 struct StoredAttendanceRecord {
     uint64_t id;
     uint16_t student_id;
@@ -93,6 +104,13 @@ public:
     // Append-only acknowledgement events are intentionally deferred until a
     // synchronization phase defines the durable server acknowledgement flow.
     StorageResult markMovementSynced(uint64_t id);
+    StorageResult getStudentAccount(uint16_t student_id, StudentAccount &out) const;
+    StorageResult createAccountIfMissing(uint16_t student_id, int64_t initial_balance,
+                                         StudentAccount &out);
+    AccountMovementResult applyAccountMovement(uint16_t student_id, int64_t amount,
+                                               StoredMovementType type, const char *reason,
+                                               StoredRecordOrigin origin,
+                                               StudentAccount &updated, uint64_t *created_id = nullptr);
 
 private:
     StorageState state_ = StorageState::STORAGE_UNINITIALIZED;
@@ -101,6 +119,10 @@ private:
     size_t used_bytes_ = 0;
     bool self_test_initialized_ = false;
     bool self_test_finished_ = false;
+    bool recovery_required_ = false;
+    bool recoverPendingAccountMovement();
+    StorageResult appendAccountSnapshot(const StudentAccount &account);
+    StorageResult appendReservedMovement(const MovementRecord &record);
 };
 
 extern StorageManager storage_manager;

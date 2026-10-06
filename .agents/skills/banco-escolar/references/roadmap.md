@@ -31,6 +31,7 @@
 | 5B.2 | Filtros y resumen de historial local de movimientos | COMPLETADA; validada físicamente |
 | 5B.3 | Rediseño visual global y tema tecnológico | COMPLETADA; validada físicamente en 800 × 480 |
 | 5B.3A.1 | Corregir reinicio al abrir Fluidez y Dictado | COMPLETADA; validada físicamente sin reinicios |
+| 5C | Saldo persistente por alumno y operación coordinada de salida | COMPLETADA; validada físicamente en Fase 5C.1 |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
 | 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
@@ -57,6 +58,8 @@ La Fase 5B.3 integra una identidad visual común inspirada en el logo para las 1
 La Fase 5B.3A.1 investigó el `StoreProhibited` (`EXCVADDR=0`) al abrir Fluidez y Dictado. El backtrace ubicó `lv_memset_00()` durante la creación de una capa del renderizador software de LVGL. Se protegió la inicialización ante fallo de `lv_mem_alloc()` y se evitó la escala táctil en controles grandes mediante feedback de borde. La prueba física posterior fue satisfactoria, sin reinicios.
 
 BLE aún está pendiente; no habilitarlo sin caso de uso. No inferir asistencia de dictados no aplicados. Excel corresponde al Panel del Maestro/servidor, no al ESP32.
+
+La Fase 5C guarda snapshots de `StudentAccount` en `/data/accounts.ndjson`, mantiene separado el historial, inicializa de forma idempotente el saldo vigente de 125 Áureos para `student_id=7`, y coordina cada salida con un journal de recuperación. En 5C.1 se reportó validación física: salida de 5, movimiento ID 4, saldo 120, cuatro movimientos y persistencia tras reinicio sin duplicación ni reinicialización. 5C queda cerrada; no se inició la siguiente fase.
 
 ## Documentación de estado
 
