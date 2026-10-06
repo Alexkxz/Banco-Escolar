@@ -28,6 +28,9 @@
 | 5B.1D | Ajuste final del encabezado superior | COMPLETADA; validada físicamente |
 | 5B.1E | Integrar logo oficial estático al splash | COMPLETADA; validada físicamente |
 | 5B.1F | Integrar logo compacto en el encabezado común | COMPLETADA; validada físicamente |
+| 5B.2 | Filtros y resumen de historial local de movimientos | COMPLETADA; validada físicamente |
+| 5B.3 | Rediseño visual global y tema tecnológico | COMPLETADA; validada físicamente en 800 × 480 |
+| 5B.3A.1 | Corregir reinicio al abrir Fluidez y Dictado | COMPLETADA; validada físicamente sin reinicios |
 | 6 | Sincronización | FUTURO |
 | 7 | Panel Maestro PWA 1.0 | FUTURO |
 | 7.1 | Sincronización Panel ↔ ESP32 | FUTURO |
@@ -46,6 +49,12 @@
 | 19 | OTA | FUTURO |
 
 La fase 0S.3 quedó cerrada con el commit estable en GitHub. Las fases 5A.4–5A.7 quedaron validadas: LittleFS conserva los movimientos 1–3 y su conteo tras reinicio, y la UI resuelve el nombre del alumno desde el `student_id` persistido. La vista 5B.1 del historial real fue validada físicamente; es de solo lectura, no altera el esquema y no reconstruye saldo. El pulido 5B.1B se integró en 5B.1C. Las fases visuales 5B.1C–5B.1F fueron validadas físicamente; el bloque visual 5B.1 queda cerrado con Inicio, Mi cuenta e Historial coordinados, encabezado común, logos del splash y del encabezado, fecha/hora y Salir. `synced=false` permanece porque no existe servidor ni sincronización operativa. La fase 6 define sincronización; el Panel PWA 1.0 es 7, su integración con ESP32 es 7.1 y la operación offline completa es 7.2. Consulta [panel-master.md](panel-master.md) antes de esos trabajos.
+
+La Fase 5B.2 implementa filtros temporales y conteos de entradas, salidas y pendientes sobre los movimientos reales cargados para el alumno. Es de solo lectura, no reconstruye saldo ni modifica el modelo o el almacenamiento; fue validada físicamente.
+
+La Fase 5B.3 integra una identidad visual común inspirada en el logo para las 12 pantallas principales, con encabezado, paleta, tarjetas y variantes de botones reutilizables. Se validó físicamente en 800 × 480; navegación y callbacks continúan funcionando.
+
+La Fase 5B.3A.1 investigó el `StoreProhibited` (`EXCVADDR=0`) al abrir Fluidez y Dictado. El backtrace ubicó `lv_memset_00()` durante la creación de una capa del renderizador software de LVGL. Se protegió la inicialización ante fallo de `lv_mem_alloc()` y se evitó la escala táctil en controles grandes mediante feedback de borde. La prueba física posterior fue satisfactoria, sin reinicios.
 
 BLE aún está pendiente; no habilitarlo sin caso de uso. No inferir asistencia de dictados no aplicados. Excel corresponde al Panel del Maestro/servidor, no al ESP32.
 

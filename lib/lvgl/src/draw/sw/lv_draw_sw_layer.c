@@ -73,11 +73,11 @@ struct _lv_draw_layer_ctx_t * lv_draw_sw_layer_create(struct _lv_draw_ctx_t * dr
         layer_sw_ctx->base_draw.area_act = layer_sw_ctx->base_draw.area_full;
         layer_sw_ctx->buf_size_bytes = lv_area_get_size(&layer_sw_ctx->base_draw.area_full) * px_size;
         layer_sw_ctx->base_draw.buf = lv_mem_alloc(layer_sw_ctx->buf_size_bytes);
-        lv_memset_00(layer_sw_ctx->base_draw.buf, layer_sw_ctx->buf_size_bytes);
-        layer_sw_ctx->has_alpha = flags & LV_DRAW_LAYER_FLAG_HAS_ALPHA ? 1 : 0;
         if(layer_sw_ctx->base_draw.buf == NULL) {
             return NULL;
         }
+        lv_memset_00(layer_sw_ctx->base_draw.buf, layer_sw_ctx->buf_size_bytes);
+        layer_sw_ctx->has_alpha = flags & LV_DRAW_LAYER_FLAG_HAS_ALPHA ? 1 : 0;
 
         draw_ctx->buf = layer_sw_ctx->base_draw.buf;
         draw_ctx->buf_area = &layer_sw_ctx->base_draw.area_act;

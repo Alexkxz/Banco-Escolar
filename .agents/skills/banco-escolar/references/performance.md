@@ -22,3 +22,9 @@ Los flags actuales en `src/main.cpp` deben permanecer `false` en firmware normal
 - `HOME_POST_OPT_TEST_ENABLED`
 
 El código diagnóstico puede quedarse disponible. Activa una prueba solo con solicitud explícita y mide condiciones descritas por esa fase. No cambies LVGL refresh/tick, buffers de 40 líneas, RGB, GT911, CH422G o PSRAM por una optimización de animación sin aislar causa y medirla.
+
+## Capas LVGL y feedback en controles grandes
+
+En LVGL 8.4, una transformación de escala puede requerir una capa temporal completa que no se subdivide. No apliques escala táctil a tarjetas grandes si el buffer transformado puede exceder el pool LVGL disponible; para ellas usa borde, color o un acento estático. Los botones pequeños pueden conservar el feedback de escala breve.
+
+La revisión de un `StoreProhibited` con `EXCVADDR=0x00000000` localizó un caso en `lib/lvgl/src/draw/sw/lv_draw_sw_layer.c`: `lv_mem_alloc()` podía devolver `NULL` y el código llamaba a `lv_memset_00()` antes de comprobarlo. El proyecto conserva un parche local que comprueba la asignación antes de inicializar el buffer y devuelve `NULL`; `lv_draw_layer_create()` y `refr_obj()` ya manejan ese retorno fallido. Las tarjetas grandes de progreso usan ahora feedback de borde para evitar la solicitud de una capa transformada superior al pool de 48 KiB. Revisar este parche si se actualiza LVGL y volver a contrastarlo con la versión nueva.
