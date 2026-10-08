@@ -42,6 +42,12 @@ grado, grupo, número de lista, referencia opcional a avatar y nivel temporal.
 Las funciones `setStudentBalance()` y `updateBalanceUI()` permanecen para vistas demo; no son la fuente de saldo de Inicio, Mi cuenta ni las operaciones reales.
 
 `StudentMovement` es el modelo de presentación. `MovementRecord` persiste `student_id`, cantidad, tipo, motivo, fecha, origen y estado de sincronización; `getStudentById()` resuelve el nombre para mostrar. Registrar salida y entrada manual actualizan cuenta y movimiento con el journal transaccional. La transferencia entre alumnos y sincronización siguen pendientes.
+
+El Panel Maestro PM.4 presenta un directorio con seis alumnos ficticios y una selección de imagen solo en memoria, asociada al `student_id`; no escribe imagen ni estado al firmware. El modelo actual conserva `avatar_asset` como referencia opcional, pero la UI consultada dibuja avatares genéricos con LVGL y no se encontró decodificación PNG/JPEG general ni ruta de recepción/almacenamiento. Una futura vinculación debe identificar alumno por ID e incluir referencia y versión de imagen, y solo indicar sincronización tras confirmación. No se define formato final hasta evaluar decoder LVGL, dimensiones, memoria disponible, flash/particiones, LittleFS y costo de conversión. Ver [PM.4](PANEL_MAESTRO_PM4.md).
+
+PM.5 añade consultas de lectura al conjunto de cuentas y movimientos demo. La cuenta muestra el snapshot de saldo directamente; el resumen de entradas/salidas describe solo el historial disponible y no ajusta ese saldo. Para el cliente, un detalle de cuenta demo se direcciona mediante `student_id`, ya que el modelo actual no provee ID separado de cuenta. Los filtros de fecha usan días locales de `America/Mexico_City` convertidos con zona IANA, manteniendo inalterados los timestamps. Ninguna ruta agrega escritura o sincronización. Ver [PM.5](PANEL_MAESTRO_PM5.md).
+
+PM.6 agrega crear, editar, finalizar y cancelar actividades únicamente al servicio de demostración del Panel Maestro. Sus cambios duran en memoria durante la navegación y dependen del reloj de la computadora; recargar los descarta. PM.7 agrega consulta y operaciones ficticias de anulación y re-cobro autorizado en el mismo servicio demo; no implementa la anulación ni autorización en firmware, no persiste y no sincroniza. PM.7A añade ajustes manuales de saldo desde el perfil, en memoria y solo en el servicio demo; el firmware conserva su límite de abono individual y rechaza saldo negativo. PM.8 añade registros académicos, asistencia y reglas configurables con aplicaciones monetarias simuladas y versionadas, también en memoria; los modelos de evaluación, estados de asistencia y aplicaciones no existen así en el firmware. Estas funciones de cliente no son un contrato de API ni capacidades reales de la terminal. Ver [PM.6](PANEL_MAESTRO_PM6.md), [PM.7](PANEL_MAESTRO_PM7.md), [PM.7A](PANEL_MAESTRO_PM7A.md) y [PM.8](PANEL_MAESTRO_PM8.md).
 El nombre actual de la moneda es **Áureos**, pero la interfaz lo obtiene de
 `CURRENCY_NAME`; para renombrarlo en el futuro se cambia un solo lugar.
 
@@ -463,9 +469,27 @@ de rendimiento; Skill `banco-escolar`.
 
 Las fases 5A.4–5A.7, 5B.1 y 5B.1C–5B.1F quedaron completadas y validadas físicamente.
 5C/5C.1 validaron saldo persistente y salidas; 5D validó físicamente una entrada +10 que llevó el saldo de 120 a 130, movimiento ID 5, cinco movimientos tras reinicio sin duplicación.
-5E Menú Maestro base fue reportada validada físicamente. 5E.1 implementa `ActivityDraft` en RAM; no persiste ni inicia actividades. 5E.1A ya está implementada en código para suspender el timeout en contexto Maestro, con prueba física pendiente. 5E.1B compiló y espera validación física visual en temas claro y oscuro.
+5E Menú Maestro fue reportada validada físicamente. 5E.1 implementa ActivityDraft en RAM y 5E.2 persiste ActivitySession en LittleFS; aún no crea participaciones, movimientos ni recompensas. 5E.1A está implementada en código con prueba física pendiente. 5E.1B compiló y espera validación física visual en temas claro y oscuro.
 El saldo monetario persistente ya está implementado localmente; sincronización, transferencias entre alumnos y Panel siguen pendientes.
 Todos los componentes de
 Panel/API/base central y sincronización aquí descritos son futuros: no se crean
 backend, endpoints, esquema de base de datos, manifest, Service Worker,
 IndexedDB ni pantallas en esta fase documental.
+
+
+
+## Estado de actividades — Fase 5E.2
+
+ActivitySession ya está implementada en firmware como modelo independiente de LVGL y se persiste en `/data/activities.ndjson` mediante snapshots append-only. El menú permite iniciar sesiones independientes y consultar las guardadas después de reiniciar. Los IDs usan NVS `next_act_id`, separado de `next_mv_id`. Las sesiones guardan el snapshot de participantes y la fecha de inicio; la duración se calcula contra hora válida, sin escritura por segundo. Sin hora válida, el tiempo queda pendiente de verificar. El vencimiento no cierra la sesión automáticamente; queda por decidir en 5E.3. ActivityClaim, NFC y movimientos/saldos por actividad siguen fuera de alcance. Pruebas lógicas/BUILD y validación física deben documentarse con sus resultados reales al cerrar esta fase.
+
+## Fase 5E.3 — Consulta y gestión de actividades
+
+La consulta existente del Menú Maestro filtra actividades activas, finalizadas y canceladas, ordenadas por ID descendente. El detalle permite finalizar o cancelar mediante confirmación; cada cambio guarda un snapshot append-only con hora válida. El vencimiento se calcula en tiempo de consulta: la sesión permanece ACTIVE con la leyenda “Tiempo agotado” y no hay cobros. Las horas no verificables se identifican como tales. La elegibilidad temporal está centralizada en el dominio. La edición se ofrece solo para sesiones ACTIVE y actualmente usa la ausencia de historial de claims; 5E.4 debe sustituirla por la consulta real de ActivityClaim, incluyendo claims anulados. No se generan cobros, claims ni cambios monetarios.
+
+BUILD PlatformIO (06/10/2026): SUCCESS. RAM 101,076/327,680 bytes (30.8%); Flash 1,929,336/6,553,600 bytes (29.4%). Sin warnings de compilador observados. `git diff --check` pasó. Las pruebas de filtros/orden, límites temporales, reinicio/apagado, hora inválida, recuperación de snapshots y fallos de guardado requieren validación física o pruebas de dominio dedicadas; ninguna prueba física se infiere del BUILD. No Upload, Commit ni Push.
+\r\n
+\r\n
+
+## Phase 5E.4 - Activity rewards
+
+Activity rewards extend the pending account journal to schema 2 while preserving schema 1 entry/exit recovery. A v2 journal captures both reserved IDs, the original timestamp, movement, claim, and balance delta. Recovery completes movement, account snapshot, and claim in order, verifies each exact record, and removes the journal only after all three exist. Damaged or ambiguous state preserves the journal and blocks further Storage operations. Existing claims block ordinary repeat rewards; an explicitly authorized re-claim is future work.

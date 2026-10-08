@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -20,9 +21,12 @@ LV_IMG_DECLARE(logo_y_nombre);
 #include "academic_config.h"
 #include "data/provisional_data.h"
 #include "student_model.h"
+#include "activity_session.h"
 #include "network/wifi_manager.h"
 #include "time/time_manager.h"
 #include "storage/storage_manager.h"
+#include "storage/activity_storage_manager.h"
+#include "storage/activity_claim_storage_manager.h"
 #include "storage/sd_manager.h"
 
 using namespace esp_panel::board;
@@ -302,16 +306,17 @@ enum Pantalla : uint8_t {
     PANTALLA_ACTIVITY_SETUP,
     PANTALLA_ACTIVITY_STUDENTS,
     PANTALLA_ACTIVITY_KEYPAD,
-    PANTALLA_ACTIVITY_READY
+    PANTALLA_ACTIVITY_READY,
+    PANTALLA_ACTIVITY_SESSIONS,
+    PANTALLA_ACTIVITY_DETAIL,
+    PANTALLA_ACTIVITY_CLAIM,
+    PANTALLA_ACTIVITY_CLAIM_CONFIRM,
+    PANTALLA_ACTIVITY_CLAIMS
 };
-static_assert(PANTALLA_ACTIVITY_READY < 40, "Performance screen stats capacity exceeded");
+static_assert(PANTALLA_ACTIVITY_CLAIMS < 40, "Performance screen stats capacity exceeded");
 
-constexpr uint16_t MAX_ACTIVITY_NUMBER = 9999;
-constexpr uint32_t MAX_ACTIVITY_REWARD = 10000;
 constexpr uint16_t MAX_ACTIVITY_MINUTES = 999;
 constexpr uint8_t MAX_ACTIVITY_SECONDS = 59;
-constexpr uint32_t MAX_ACTIVITY_DURATION_SECONDS =
-    static_cast<uint32_t>(MAX_ACTIVITY_MINUTES) * 60U + MAX_ACTIVITY_SECONDS;
 
 constexpr bool activity_number_value_valid(bool enabled, uint16_t number)
 {
@@ -349,7 +354,6 @@ static_assert(!activity_reward_value_valid(0) && activity_reward_value_valid(10)
 static_assert(!activity_selected_count_valid(true, 0) && activity_selected_count_valid(true, 3) &&
               activity_selected_count_valid(false, 0), "Selected mode requires at least one student");
 
-enum class ActivityParticipantMode : uint8_t { ALL, SELECTED, PARTICIPANTS_DISABLED };
 enum class ActivityKeypadTarget : uint8_t { NONE, ACTIVITY_NUMBER, TIME_MINUTES, TIME_SECONDS, REWARD };
 
 struct ActivityDraft {
@@ -364,6 +368,37 @@ struct ActivityDraft {
 };
 
 ActivityDraft activity_draft;
+ActivitySession saved_activity_session;
+ActivitySession selected_activity_session;
+bool selected_activity_session_valid = false;
+ActivitySessionStatus pending_activity_close_status = ActivitySessionStatus::ACTIVE;
+char activity_detail_feedback[128] = {};
+std::vector<uint64_t> activity_visible_session_ids;
+std::vector<uint64_t> activity_claim_session_options;
+std::vector<uint16_t> activity_claim_student_options;
+uint64_t activity_claim_selected_activity_id = 0;
+uint16_t activity_claim_selected_student_id = 0;
+bool activity_claim_in_progress = false;
+ActivityClaim activity_claim_saved;
+StudentAccount activity_claim_updated_account = {};
+char activity_claim_feedback[192] = {};
+uint64_t activity_claims_view_activity_id = 0;
+enum class ActivityListFilter : uint8_t { ACTIVE, FINISHED, CANCELLED };
+ActivityListFilter activity_list_filter = ActivityListFilter::ACTIVE;
+lv_timer_t *activity_ui_timer = nullptr;
+struct ActivityTimeLabel {
+    lv_obj_t *label = nullptr;
+    ActivitySession session;
+    char prefix[176] = {};
+};
+std::vector<ActivityTimeLabel> activity_time_labels;
+bool saved_activity_session_valid = false;
+bool activity_start_in_progress = false;
+bool activity_edit_mode = false;
+uint64_t activity_edit_id = 0;
+ActivityStorageResult activity_storage_startup_result = ActivityStorageResult::NOT_READY;
+ActivityClaimStorageResult activity_claim_startup_result = ActivityClaimStorageResult::NOT_READY;
+char activity_start_feedback[128] = {};
 std::vector<uint16_t> activity_selection_staged;
 ActivityKeypadTarget activity_keypad_target = ActivityKeypadTarget::NONE;
 char activity_keypad_buffer[6] = {};
@@ -465,6 +500,11 @@ void demo_back_event(lv_event_t *event);
 void activity_draft_reset();
 void demo_exit_event(lv_event_t *event);
 void create_movement_history_screen(lv_obj_t *screen);
+lv_obj_t *create_activity_control_button(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
+                                         lv_coord_t width, lv_coord_t height,
+                                         const char *text, lv_event_cb_t callback,
+                                         intptr_t user_data, ButtonVariant variant,
+                                         bool enabled);
 void create_global_header(lv_obj_t *screen, const char *title, bool show_exit);
 void config_event(lv_event_t *event);
 void config_theme_event(lv_event_t *event);
@@ -652,7 +692,7 @@ void obtener_texto_fecha_hora(char *date_buffer, size_t date_size,
                               char *time_buffer, size_t time_size)
 {
     struct tm local_time = {};
-    if (!time_manager.getLocalTime(local_time)) {
+    if (!activity_edit_mode && !time_manager.getLocalTime(local_time)) {
         snprintf(date_buffer, date_size, "--- -- --- ----");
         snprintf(time_buffer, time_size, "--:--:--");
         return;
@@ -804,6 +844,11 @@ bool is_master_context_active()
         case PANTALLA_ACTIVITY_STUDENTS:
         case PANTALLA_ACTIVITY_KEYPAD:
         case PANTALLA_ACTIVITY_READY:
+        case PANTALLA_ACTIVITY_SESSIONS:
+        case PANTALLA_ACTIVITY_DETAIL:
+        case PANTALLA_ACTIVITY_CLAIM:
+        case PANTALLA_ACTIVITY_CLAIM_CONFIRM:
+        case PANTALLA_ACTIVITY_CLAIMS:
             return true;
         default:
             return false;
@@ -1337,7 +1382,12 @@ uint8_t particle_intensity_for_screen(Pantalla pantalla)
         case PANTALLA_ACTIVITY_SETUP:
         case PANTALLA_ACTIVITY_STUDENTS:
         case PANTALLA_ACTIVITY_KEYPAD:
-        case PANTALLA_ACTIVITY_READY: return 0;
+        case PANTALLA_ACTIVITY_READY:
+        case PANTALLA_ACTIVITY_SESSIONS:
+        case PANTALLA_ACTIVITY_DETAIL:
+        case PANTALLA_ACTIVITY_CLAIM:
+        case PANTALLA_ACTIVITY_CLAIM_CONFIRM:
+        case PANTALLA_ACTIVITY_CLAIMS: return 0;
         case PANTALLA_CONFIGURACION: return 3;
         case PANTALLA_FLUIDEZ:
         case PANTALLA_DICTADO: return 3;
@@ -1513,6 +1563,11 @@ const char *performance_screen_name(Pantalla screen)
         case PANTALLA_ACTIVITY_STUDENTS: return "ActivityStudents";
         case PANTALLA_ACTIVITY_KEYPAD: return "ActivityKeypad";
         case PANTALLA_ACTIVITY_READY: return "ActivityReady";
+        case PANTALLA_ACTIVITY_SESSIONS: return "ActivitySessions";
+        case PANTALLA_ACTIVITY_DETAIL: return "ActivityDetail";
+        case PANTALLA_ACTIVITY_CLAIM: return "ActivityClaim";
+        case PANTALLA_ACTIVITY_CLAIM_CONFIRM: return "ActivityClaimConfirm";
+        case PANTALLA_ACTIVITY_CLAIMS: return "ActivityClaims";
     }
     return "Unknown";
 }
@@ -2536,15 +2591,45 @@ void open_master_menu_event(lv_event_t *event)
     if (lv_event_get_code(event) == LV_EVENT_CLICKED) mostrar_pantalla(PANTALLA_MASTER_MENU);
 }
 
+void open_activity_sessions_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        mostrar_pantalla(PANTALLA_ACTIVITY_SESSIONS);
+    }
+}
+
+void open_activity_claim_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_claim_feedback[0] = '\0';
+    activity_claim_selected_activity_id = 0;
+    activity_claim_selected_student_id = 0;
+    mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM);
+}
+
 void master_back_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
     if (pantalla_actual == PANTALLA_MASTER_MENU) {
         activity_draft_reset();
+        saved_activity_session_valid = false;
         register_student_activity();
         mostrar_pantalla(PANTALLA_CONFIGURACION);
+    } else if (pantalla_actual == PANTALLA_ACTIVITY_DETAIL) {
+        mostrar_pantalla(PANTALLA_ACTIVITY_SESSIONS);
+    } else if (pantalla_actual == PANTALLA_ACTIVITY_CLAIM_CONFIRM) {
+        mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM);
+    } else if (pantalla_actual == PANTALLA_ACTIVITY_CLAIMS) {
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+    } else if (pantalla_actual == PANTALLA_ACTIVITY_SETUP && activity_edit_mode) {
+        activity_edit_mode = false;
+        activity_edit_id = 0;
+        activity_start_feedback[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
     } else {
         activity_draft_reset();
+        saved_activity_session_valid = false;
+        activity_claim_feedback[0] = '\0';
         mostrar_pantalla(PANTALLA_MASTER_MENU);
     }
 }
@@ -2623,6 +2708,19 @@ void create_master_menu_screen(lv_obj_t *screen)
     lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
     lv_obj_align(label, LV_ALIGN_LEFT_MID, 96, 18);
 
+    std::vector<ActivitySession> sessions;
+    const ActivityStorageResult sessions_result = activity_storage_manager.readSessions(sessions);
+    char sessions_button_text[80];
+    if (sessions_result == ActivityStorageResult::OK) {
+        snprintf(sessions_button_text, sizeof(sessions_button_text),
+                 "Actividades guardadas (%u)", static_cast<unsigned>(sessions.size()));
+    } else {
+        snprintf(sessions_button_text, sizeof(sessions_button_text), "Ver actividades guardadas");
+    }
+    create_activity_control_button(screen, 24, 368, 752, 40, sessions_button_text,
+                                   open_activity_sessions_event, 0, ButtonVariant::SECONDARY, true);
+    create_activity_control_button(screen, 168, 416, 608, 48, "COBROS REALES · ACCESO DEV",
+                                   open_activity_claim_event, 0, ButtonVariant::PRIMARY, true);
     create_action_back_button(screen, master_back_event);
 }
 
@@ -2635,6 +2733,9 @@ bool activity_student_id_selected(const std::vector<uint16_t> &ids, uint16_t stu
 void activity_draft_reset()
 {
     activity_draft = ActivityDraft{};
+    activity_start_feedback[0] = '\0';
+    activity_start_in_progress = false;
+    saved_activity_session_valid = false;
     activity_selection_staged.clear();
     activity_keypad_target = ActivityKeypadTarget::NONE;
     activity_keypad_buffer[0] = '\0';
@@ -2644,25 +2745,36 @@ void activity_draft_reset()
     activity_keypad_feedback_label = nullptr;
 }
 
+std::vector<uint16_t> registered_activity_student_ids()
+{
+    std::vector<uint16_t> ids;
+    ids.reserve(getStudentCount());
+    for (size_t i = 0; i < getStudentCount(); ++i) {
+        const Student *student = getStudentAtIndex(i);
+        if (student != nullptr) ids.push_back(student->student_id);
+    }
+    return ids;
+}
+
+ActivityConfiguration activity_configuration_from_draft()
+{
+    ActivityConfiguration configuration;
+    configuration.activity_number_enabled = activity_draft.activity_number_enabled;
+    configuration.activity_number = activity_draft.activity_number;
+    configuration.timed = activity_draft.timed;
+    configuration.duration_seconds = activity_draft.timed ? activity_draft.duration_seconds : 0;
+    configuration.reward_amount = activity_draft.reward_amount;
+    configuration.participant_mode = activity_draft.participant_mode;
+    configuration.selected_student_ids = activity_draft.selected_student_ids;
+    return configuration;
+}
+
 bool activity_draft_is_valid()
 {
-    const bool number_valid = activity_number_value_valid(activity_draft.activity_number_enabled,
-                                                           activity_draft.activity_number);
-    const bool time_valid = activity_duration_value_valid(activity_draft.timed,
-                                                           activity_draft.duration_seconds);
-    const bool reward_valid = activity_reward_value_valid(activity_draft.reward_amount);
-    bool participants_valid = activity_selected_count_valid(
-        activity_draft.participant_mode == ActivityParticipantMode::SELECTED,
-        activity_draft.selected_student_ids.size());
-    if (participants_valid && activity_draft.participant_mode == ActivityParticipantMode::SELECTED) {
-        for (uint16_t student_id : activity_draft.selected_student_ids) {
-            if (getStudentById(student_id) == nullptr) {
-                participants_valid = false;
-                break;
-            }
-        }
-    }
-    activity_draft.valid = number_valid && time_valid && reward_valid && participants_valid;
+    const ActivityConfiguration configuration = activity_configuration_from_draft();
+    const std::vector<uint16_t> registered_ids = registered_activity_student_ids();
+    activity_draft.valid = validateActivityConfiguration(configuration, registered_ids) ==
+                           ActivityValidationResult::VALID;
     return activity_draft.valid;
 }
 
@@ -3034,10 +3146,86 @@ void activity_keypad_event(lv_event_t *event)
     mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
 }
 
+const char *activity_storage_error_text(ActivityStorageResult result)
+{
+    switch (result) {
+        case ActivityStorageResult::TIME_UNSYNCED:
+            return "La hora no está lista. Espera la sincronización; se conserva la configuración.";
+        case ActivityStorageResult::INCOMPLETE_TAIL:
+            return "Guardado bloqueado: el archivo termina incompleto; la configuración se conserva.";
+        case ActivityStorageResult::CORRUPT_DATA:
+            return "Guardado bloqueado por un registro inválido; no se borraron datos.";
+        case ActivityStorageResult::NOT_READY:
+            return "LittleFS no está disponible. La configuración se conserva.";
+        case ActivityStorageResult::ID_ERROR:
+            return "No se pudo reservar un ID de actividad. La configuración se conserva.";
+        case ActivityStorageResult::IO_ERROR:
+            return "No se pudo escribir la actividad. La configuración se conserva.";
+        case ActivityStorageResult::INVALID_ARGUMENT:
+            return "Revisa los campos y participantes seleccionados.";
+        default:
+            return "No se pudo guardar la actividad. La configuración se conserva.";
+    }
+}
+
 void activity_start_event(lv_event_t *event)
 {
-    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !activity_draft_is_valid()) return;
-    mostrar_pantalla(PANTALLA_ACTIVITY_READY);
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED ||
+        pantalla_actual != PANTALLA_ACTIVITY_SETUP || activity_start_in_progress) return;
+    if (!activity_draft_is_valid()) {
+        snprintf(activity_start_feedback, sizeof(activity_start_feedback),
+                 "Revisa número, tiempo, recompensa y participantes.");
+        mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+        return;
+    }
+
+    struct tm local_time = {};
+    if (!time_manager.getLocalTime(local_time)) {
+        snprintf(activity_start_feedback, sizeof(activity_start_feedback),
+                 "%s", activity_storage_error_text(ActivityStorageResult::TIME_UNSYNCED));
+        mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+        return;
+    }
+    time_t epoch = 0;
+    time(&epoch);
+    if (!activity_edit_mode && epoch < MIN_VALID_ACTIVITY_EPOCH) {
+        snprintf(activity_start_feedback, sizeof(activity_start_feedback),
+                 "%s", activity_storage_error_text(ActivityStorageResult::TIME_UNSYNCED));
+        mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+        return;
+    }
+
+    activity_start_in_progress = true;
+    lv_obj_t *button = lv_event_get_target(event);
+    if (button != nullptr) lv_obj_add_state(button, LV_STATE_DISABLED);
+    ActivitySession created;
+    const ActivityConfiguration configuration = activity_configuration_from_draft();
+    const std::vector<uint16_t> registered_ids = registered_activity_student_ids();
+    const ActivityStorageResult result = activity_edit_mode
+        ? activity_storage_manager.updateActiveSession(activity_edit_id, configuration, registered_ids, created)
+        : activity_storage_manager.createSession(configuration, registered_ids, static_cast<int64_t>(epoch), created);
+    activity_start_in_progress = false;
+
+    if (result == ActivityStorageResult::OK) {
+        if (activity_edit_mode) {
+            selected_activity_session = created;
+            selected_activity_session_valid = true;
+            activity_edit_mode = false;
+            activity_edit_id = 0;
+            snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "Cambios guardados correctamente.");
+            mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+            return;
+        }
+        saved_activity_session = created;
+        saved_activity_session_valid = true;
+        activity_start_feedback[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACTIVITY_READY);
+        return;
+    }
+
+    snprintf(activity_start_feedback, sizeof(activity_start_feedback), "%s",
+             activity_storage_error_text(result));
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
 }
 
 void activity_ready_edit_event(lv_event_t *event)
@@ -3049,7 +3237,7 @@ void create_activity_setup_screen(lv_obj_t *screen)
 {
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     const bool valid = activity_draft_is_valid();
-    create_student_topbar(screen, "Configurar actividad", false, false);
+    create_student_topbar(screen, activity_edit_mode ? "Editar actividad" : "Configurar actividad", false, false);
 
     create_admin_section_card(screen, 24, 108, 364, 104, "Número de actividad");
     create_activity_control_button(screen, 40, 148, 140, 40,
@@ -3132,8 +3320,46 @@ void create_activity_setup_screen(lv_obj_t *screen)
 
     create_activity_summary_blocks(screen, 24, 352, 752, 56, 4);
 
+    if (activity_edit_mode && selected_activity_session_valid) {
+        ActivitySession preview = selected_activity_session;
+        preview.duration_seconds = activity_draft.timed ? activity_draft.duration_seconds : 0;
+        time_t preview_epoch = 0;
+        time(&preview_epoch);
+        struct tm preview_tm = {};
+        const ActivityRemainingTime remaining = getActivityRemainingTime(
+            preview, static_cast<int64_t>(preview_epoch), time_manager.getLocalTime(preview_tm));
+        char preview_text[96];
+        if (remaining.state == ActivityRemainingState::UNTIMED) {
+            snprintf(preview_text, sizeof(preview_text), "Al guardar: Sin tiempo");
+        } else if (remaining.state == ActivityRemainingState::EXPIRED) {
+            snprintf(preview_text, sizeof(preview_text), "Al guardar: Tiempo agotado");
+        } else if (remaining.state == ActivityRemainingState::PENDING_VALID_TIME) {
+            snprintf(preview_text, sizeof(preview_text), "Al guardar: Hora pendiente de verificar");
+        } else {
+            snprintf(preview_text, sizeof(preview_text), "Al guardar: quedan %lu s",
+                     static_cast<unsigned long>(remaining.seconds));
+        }
+        lv_obj_t *preview_label = lv_label_create(screen);
+        lv_label_set_text(preview_label, preview_text);
+        lv_obj_set_width(preview_label, 360);
+        lv_label_set_long_mode(preview_label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(preview_label, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(preview_label, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_set_pos(preview_label, 160, 422);
+    }
+
     create_action_back_button(screen, master_back_event);
-    lv_obj_t *start = create_activity_control_button(screen, 536, 416, 240, 48, "Iniciar actividad",
+    if (activity_start_feedback[0] != '\0') {
+        lv_obj_t *feedback = lv_label_create(screen);
+        lv_label_set_text(feedback, activity_start_feedback);
+        lv_obj_set_width(feedback, 352);
+        lv_label_set_long_mode(feedback, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(feedback, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(feedback, lv_color_hex(DANGER), 0);
+        lv_obj_align(feedback, LV_ALIGN_BOTTOM_LEFT, 168, -20);
+    }
+    lv_obj_t *start = create_activity_control_button(screen, 536, 416, 240, 48,
+                                                      activity_edit_mode ? "Guardar cambios" : "Iniciar actividad",
                                                       activity_start_event, 0, ButtonVariant::PRIMARY, valid);
     (void)start;
 }
@@ -3253,27 +3479,860 @@ void create_activity_keypad_screen(lv_obj_t *screen)
     create_action_back_button(screen, activity_keypad_back_event);
 }
 
+void activity_session_participants_text(const ActivitySession &session,
+                                        char *buffer, size_t buffer_size)
+{
+    if (buffer == nullptr || buffer_size == 0) return;
+    buffer[0] = '\0';
+    if (session.participant_mode == ActivityParticipantMode::ALL) {
+        snprintf(buffer, buffer_size, "Todos (%u)",
+                 static_cast<unsigned>(session.participant_student_ids.size()));
+        return;
+    }
+    if (session.participant_mode == ActivityParticipantMode::PARTICIPANTS_DISABLED) {
+        snprintf(buffer, buffer_size, "Sin filtro previo");
+        return;
+    }
+    size_t used = static_cast<size_t>(snprintf(buffer, buffer_size, "Seleccionados: "));
+    for (size_t i = 0; i < session.participant_student_ids.size() && used < buffer_size; ++i) {
+        const Student *student = getStudentById(session.participant_student_ids[i]);
+        const char *name = student_short_name(student);
+        const int written = snprintf(buffer + used, buffer_size - used, "%s%s",
+                                     i == 0 ? "" : ", ", name);
+        if (written < 0 || static_cast<size_t>(written) >= buffer_size - used) {
+            buffer[buffer_size - 1] = '\0';
+            break;
+        }
+        used += static_cast<size_t>(written);
+    }
+    if (session.participant_student_ids.empty()) {
+        snprintf(buffer, buffer_size, "Seleccionados (0)");
+    }
+}
+
+const char *activity_session_status_text(ActivitySessionStatus status)
+{
+    switch (status) {
+        case ActivitySessionStatus::ACTIVE: return "Activa";
+        case ActivitySessionStatus::FINISHED: return "Finalizada";
+        case ActivitySessionStatus::CANCELLED: return "Cancelada";
+    }
+    return "Desconocido";
+}
+
+void activity_session_time_text(const ActivitySession &session,
+                                char *buffer, size_t buffer_size)
+{
+    struct tm local_time = {};
+    const bool valid_time = time_manager.getLocalTime(local_time);
+    time_t epoch = 0;
+    time(&epoch);
+    const ActivityRemainingTime remaining = getActivityRemainingTime(
+        session, static_cast<int64_t>(epoch), valid_time);
+    switch (remaining.state) {
+        case ActivityRemainingState::UNTIMED:
+            snprintf(buffer, buffer_size, "Sin tiempo");
+            break;
+        case ActivityRemainingState::PENDING_VALID_TIME:
+            snprintf(buffer, buffer_size, "Hora pendiente de verificar");
+            break;
+        case ActivityRemainingState::RUNNING: {
+            const uint32_t hours = remaining.seconds / 3600U;
+            const uint32_t minutes = (remaining.seconds % 3600U) / 60U;
+            const uint32_t seconds = remaining.seconds % 60U;
+            snprintf(buffer, buffer_size, "Quedan %02lu:%02lu:%02lu",
+                     static_cast<unsigned long>(hours),
+                     static_cast<unsigned long>(minutes),
+                     static_cast<unsigned long>(seconds));
+            break;
+        }
+        case ActivityRemainingState::EXPIRED:
+            snprintf(buffer, buffer_size, "Tiempo agotado");
+            break;
+        case ActivityRemainingState::CLOSED:
+            snprintf(buffer, buffer_size, "%s", activity_session_status_text(session.status));
+            break;
+    }
+}
+
+void activity_ui_timer_cb(lv_timer_t *timer)
+{
+    if (pantalla_actual != PANTALLA_ACTIVITY_SESSIONS && pantalla_actual != PANTALLA_ACTIVITY_DETAIL) {
+        lv_timer_del(timer);
+        if (activity_ui_timer == timer) activity_ui_timer = nullptr;
+        activity_time_labels.clear();
+        return;
+    }
+    for (const ActivityTimeLabel &entry : activity_time_labels) {
+        if (entry.label == nullptr) continue;
+        char remaining[64];
+        char text[256];
+        activity_session_time_text(entry.session, remaining, sizeof(remaining));
+        snprintf(text, sizeof(text), "%s%s", entry.prefix, remaining);
+        lv_label_set_text(entry.label, text);
+    }
+}
+
+void create_activity_session_summary_blocks(lv_obj_t *parent, const ActivitySession &session)
+{
+    char values[4][176] = {};
+    snprintf(values[0], sizeof(values[0]), "%s%u",
+             session.activity_number_enabled ? "N.º " : "Sin número",
+             session.activity_number_enabled ? static_cast<unsigned>(session.activity_number) : 0U);
+    if (!session.activity_number_enabled) snprintf(values[0], sizeof(values[0]), "Sin número");
+    if (session.duration_seconds == 0) {
+        snprintf(values[1], sizeof(values[1]), "Sin tiempo");
+    } else {
+        snprintf(values[1], sizeof(values[1]), "%lu min %lu s",
+                 static_cast<unsigned long>(session.duration_seconds / 60U),
+                 static_cast<unsigned long>(session.duration_seconds % 60U));
+    }
+    snprintf(values[2], sizeof(values[2]), "%lu %s",
+             static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME);
+    activity_session_participants_text(session, values[3], sizeof(values[3]));
+    const char *labels[] = {"Actividad", "Tiempo", "Recompensa", "Participantes"};
+    constexpr lv_coord_t gap = 8;
+    constexpr lv_coord_t cell_width = 292;
+    constexpr lv_coord_t cell_height = 70;
+    for (uint8_t i = 0; i < 4; ++i) {
+        lv_obj_t *card = lv_obj_create(parent);
+        lv_obj_remove_style_all(card);
+        lv_obj_set_size(card, cell_width, cell_height);
+        lv_obj_set_pos(card, 0 + (i % 2) * (cell_width + gap),
+                       0 + (i / 2) * (cell_height + gap));
+        lv_obj_set_style_radius(card, 10, 0);
+        lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+        lv_obj_set_style_bg_color(card, lv_color_hex(theme_palette().surface), 0);
+        lv_obj_set_style_border_width(card, 1, 0);
+        lv_obj_set_style_border_color(card, lv_color_hex(theme_palette().border), 0);
+        lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *label = lv_label_create(card);
+        lv_label_set_text(label, labels[i]);
+        lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_set_pos(label, 10, 3);
+        lv_obj_t *value = lv_label_create(card);
+        lv_label_set_text(value, values[i]);
+        lv_obj_set_width(value, cell_width - 20);
+        lv_label_set_long_mode(value, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(value, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(value, lv_color_hex(theme_palette().primary_text), 0);
+        lv_obj_align(value, LV_ALIGN_BOTTOM_LEFT, 10, -2);
+    }
+}
+
+void activity_ready_sessions_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        mostrar_pantalla(PANTALLA_ACTIVITY_SESSIONS);
+    }
+}
+
 void create_activity_ready_screen(lv_obj_t *screen)
 {
-    create_student_topbar(screen, "Configuración preparada", false, false);
+    create_student_topbar(screen, "Actividad guardada", false, false);
     lv_obj_t *panel = make_content_panel(screen, 80, 112, 640, 280, theme_palette().surface);
     lv_obj_set_style_border_width(panel, 2, 0);
     lv_obj_set_style_border_color(panel, lv_color_hex(CYAN), 0);
     lv_obj_t *heading = lv_label_create(panel);
-    lv_label_set_text(heading, "Configuración preparada");
+    char heading_text[64];
+    snprintf(heading_text, sizeof(heading_text), "Sesión guardada · ID %llu",
+             static_cast<unsigned long long>(saved_activity_session.id));
+    lv_label_set_text(heading, heading_text);
     lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0);
     lv_obj_set_style_text_color(heading, lv_color_hex(GREEN), 0);
     lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 18);
-    create_activity_summary_blocks(panel, 24, 66, 592, 150, 2);
+    if (saved_activity_session_valid) {
+        create_activity_session_summary_blocks(panel, saved_activity_session);
+    }
     lv_obj_t *notice = lv_label_create(panel);
-    lv_label_set_text(notice, "No se guardó ni inició una actividad");
+    lv_label_set_text(notice, "Activa. No inicia cobros ni modifica saldos.");
     lv_obj_set_style_text_font(notice, &banco_escolar_font_16, 0);
     lv_obj_set_style_text_color(notice, lv_color_hex(theme_palette().secondary_text), 0);
-    lv_obj_align(notice, LV_ALIGN_BOTTOM_MID, 0, -24);
-    create_activity_control_button(screen, 304, 416, 184, 48, "Volver a editar",
-                                   activity_ready_edit_event, 0, ButtonVariant::SECONDARY);
-    create_activity_control_button(screen, 496, 416, 184, 48, "Volver al menú",
+    lv_obj_align(notice, LV_ALIGN_BOTTOM_MID, 0, -14);
+    create_activity_control_button(screen, 304, 416, 216, 48, "Ver actividades",
+                                   activity_ready_sessions_event, 0, ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 536, 416, 240, 48, "Volver al menú",
                                    master_back_event, 0, ButtonVariant::PRIMARY);
+}
+
+void activity_filter_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    activity_list_filter = static_cast<ActivityListFilter>(reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)));
+    mostrar_pantalla(PANTALLA_ACTIVITY_SESSIONS);
+}
+
+void activity_list_row_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    const uintptr_t index = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (index >= activity_visible_session_ids.size()) return;
+    const ActivityStorageResult result = activity_storage_manager.readSession(
+        activity_visible_session_ids[index], selected_activity_session);
+    selected_activity_session_valid = result == ActivityStorageResult::OK ||
+        result == ActivityStorageResult::INCOMPLETE_TAIL || result == ActivityStorageResult::CORRUPT_DATA;
+    if (!selected_activity_session_valid) snprintf(activity_detail_feedback, sizeof(activity_detail_feedback),
+                                                    "No se pudo leer la actividad.");
+    else activity_detail_feedback[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+}
+
+void activity_close_action_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !selected_activity_session_valid) return;
+    const uintptr_t action = reinterpret_cast<uintptr_t>(lv_event_get_user_data(event));
+    if (action == 0) {
+        pending_activity_close_status = ActivitySessionStatus::FINISHED;
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "Confirma finalizar ID %llu.",
+                 static_cast<unsigned long long>(selected_activity_session.id));
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+        return;
+    }
+    if (action == 1) {
+        pending_activity_close_status = ActivitySessionStatus::CANCELLED;
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "Confirma cancelar ID %llu.",
+                 static_cast<unsigned long long>(selected_activity_session.id));
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+        return;
+    }
+    if (action == 2) {
+        activity_detail_feedback[0] = '\0';
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+        return;
+    }
+    struct tm local_time = {};
+    time_t epoch = 0;
+    time(&epoch);
+    if (!time_manager.getLocalTime(local_time) || epoch < MIN_VALID_ACTIVITY_EPOCH) {
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "No se cerró: hora no válida.");
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+        return;
+    }
+    ActivitySession updated;
+    const ActivityStorageResult result = activity_storage_manager.closeSession(
+        selected_activity_session.id, pending_activity_close_status, static_cast<int64_t>(epoch), updated);
+    if (result == ActivityStorageResult::OK) {
+        selected_activity_session = updated;
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "%s guardada correctamente.",
+                 activity_session_status_text(updated.status));
+    } else {
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback), "No se guardó: %s",
+                 activity_storage_error_text(result));
+    }
+    mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+}
+
+void activity_edit_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !selected_activity_session_valid) return;
+    bool has_claim = false;
+    if (activity_claim_storage_manager.hasClaimForActivity(selected_activity_session.id, has_claim) !=
+        ActivityClaimStorageResult::OK || has_claim ||
+        !canEditActivityBeforeFirstClaim(selected_activity_session, has_claim)) {
+        snprintf(activity_detail_feedback, sizeof(activity_detail_feedback),
+                 "No se puede editar: hay un cobro o no se pudo leer su historial.");
+        mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
+        return;
+    }
+    const ActivitySession &session = selected_activity_session;
+    activity_draft.activity_number_enabled = session.activity_number_enabled;
+    activity_draft.activity_number = session.activity_number;
+    activity_draft.timed = session.duration_seconds > 0;
+    activity_draft.duration_seconds = session.duration_seconds;
+    activity_draft.reward_amount = session.reward_amount;
+    activity_draft.participant_mode = session.participant_mode;
+    activity_draft.selected_student_ids = session.participant_mode == ActivityParticipantMode::SELECTED
+        ? session.participant_student_ids : std::vector<uint16_t>();
+    activity_draft_is_valid();
+    activity_edit_mode = true;
+    activity_edit_id = session.id;
+    activity_start_feedback[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_SETUP);
+}
+
+void activity_claims_open_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || !selected_activity_session_valid) return;
+    activity_claims_view_activity_id = selected_activity_session.id;
+    mostrar_pantalla(PANTALLA_ACTIVITY_CLAIMS);
+}
+
+void create_activity_detail_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Detalle de actividad", false, false);
+    if (!selected_activity_session_valid) {
+        lv_obj_t *error = lv_label_create(screen);
+        lv_label_set_text(error, "No se pudo leer una actividad válida.");
+        lv_obj_center(error);
+        create_action_back_button(screen, master_back_event);
+        return;
+    }
+    lv_obj_t *panel = make_content_panel(screen, 72, 112, 656, 236, theme_palette().surface);
+    create_activity_session_summary_blocks(panel, selected_activity_session);
+    char meta[160], timestamp[48];
+    time_t started = static_cast<time_t>(selected_activity_session.started_at);
+    struct tm started_tm = {};
+    if (selected_activity_session.started_at >= MIN_VALID_ACTIVITY_EPOCH && localtime_r(&started, &started_tm))
+        strftime(timestamp, sizeof(timestamp), "%d/%m/%Y %H:%M", &started_tm);
+    else snprintf(timestamp, sizeof(timestamp), "Hora no disponible");
+    snprintf(meta, sizeof(meta), "ID %llu · Inicio: %s · Estado: %s",
+             static_cast<unsigned long long>(selected_activity_session.id), timestamp,
+             activity_session_status_text(selected_activity_session.status));
+    lv_obj_t *label = lv_label_create(screen);
+    lv_label_set_text(label, meta); lv_obj_set_width(label, 720); lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(theme_palette().primary_text), 0); lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 350);
+    lv_obj_t *time_label = lv_label_create(screen);
+    lv_obj_set_style_text_font(time_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(time_label, lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_align(time_label, LV_ALIGN_TOP_MID, 0, 374);
+    ActivityTimeLabel time_entry;
+    time_entry.label = time_label; time_entry.session = selected_activity_session;
+    snprintf(time_entry.prefix, sizeof(time_entry.prefix), "Tiempo: ");
+    activity_time_labels.push_back(time_entry);
+    if (activity_detail_feedback[0]) {
+        label = lv_label_create(screen); lv_label_set_text(label, activity_detail_feedback);
+        lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0); lv_obj_set_style_text_color(label, lv_color_hex(DANGER), 0);
+        lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 398);
+    }
+    if (selected_activity_session.status == ActivitySessionStatus::ACTIVE) {
+        if (activity_detail_feedback[0] && pending_activity_close_status != ActivitySessionStatus::ACTIVE) {
+            create_activity_control_button(screen, 450, 416, 160, 48, "Confirmar",
+                activity_close_action_event, 3, ButtonVariant::DANGER);
+            create_activity_control_button(screen, 620, 416, 156, 48, "Cancelar",
+                activity_close_action_event, 2, ButtonVariant::SECONDARY);
+        } else {
+            bool has_claim = false;
+            const bool claim_read_ok = activity_claim_storage_manager.hasClaimForActivity(
+                selected_activity_session.id, has_claim) == ActivityClaimStorageResult::OK;
+            create_activity_control_button(screen, 280, 416, 140, 48, "Editar",
+                activity_edit_event, 0, ButtonVariant::SECONDARY,
+                claim_read_ok && canEditActivityBeforeFirstClaim(selected_activity_session, has_claim));
+            create_activity_control_button(screen, 432, 416, 140, 48, "Finalizar",
+                activity_close_action_event, 0, ButtonVariant::PRIMARY);
+            create_activity_control_button(screen, 584, 416, 192, 48, "Cancelar actividad",
+                activity_close_action_event, 1, ButtonVariant::DANGER);
+        }
+    }
+    create_activity_control_button(screen, 148, 416, 120, 48, "Cobros",
+        activity_claims_open_event, 0, ButtonVariant::SECONDARY);
+    create_action_back_button(screen, master_back_event);
+}
+
+void create_activity_sessions_screen(lv_obj_t *screen)
+{
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    create_student_topbar(screen, "Actividades", false, false);
+    create_activity_control_button(screen, 24, 104, 230, 42, "Activas",
+        activity_filter_event, static_cast<intptr_t>(ActivityListFilter::ACTIVE),
+        activity_list_filter == ActivityListFilter::ACTIVE ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 264, 104, 230, 42, "Finalizadas",
+        activity_filter_event, static_cast<intptr_t>(ActivityListFilter::FINISHED),
+        activity_list_filter == ActivityListFilter::FINISHED ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    create_activity_control_button(screen, 504, 104, 272, 42, "Canceladas",
+        activity_filter_event, static_cast<intptr_t>(ActivityListFilter::CANCELLED),
+        activity_list_filter == ActivityListFilter::CANCELLED ? ButtonVariant::PRIMARY : ButtonVariant::SECONDARY);
+    std::vector<ActivitySession> sessions;
+    const ActivityStorageResult result = activity_storage_manager.readSessions(sessions);
+    lv_obj_t *status_panel = make_content_panel(screen, 24, 152, 752, 40, theme_palette().surface);
+    lv_obj_t *status_label = lv_label_create(status_panel);
+    char status_text[192];
+    if (result == ActivityStorageResult::OK) {
+        size_t active_count = 0;
+        for (const ActivitySession &session : sessions) {
+            if (session.status == ActivitySessionStatus::ACTIVE) ++active_count;
+        }
+        snprintf(status_text, sizeof(status_text), "%u actividades guardadas · %u activas",
+                 static_cast<unsigned>(sessions.size()), static_cast<unsigned>(active_count));
+    } else if (result == ActivityStorageResult::INCOMPLETE_TAIL) {
+        snprintf(status_text, sizeof(status_text),
+                 "El último registro está incompleto. Se conservan las sesiones válidas y se bloquean nuevos guardados.");
+    } else if (result == ActivityStorageResult::CORRUPT_DATA) {
+        snprintf(status_text, sizeof(status_text),
+                 "Se encontró un registro inválido. No se borraron datos y se bloquean nuevos guardados.");
+    } else {
+        snprintf(status_text, sizeof(status_text), "Almacenamiento de actividades no disponible.");
+    }
+    lv_label_set_text(status_label, status_text);
+    lv_obj_set_width(status_label, 720);
+    lv_label_set_long_mode(status_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(status_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(status_label,
+        result == ActivityStorageResult::OK ? lv_color_hex(theme_palette().primary_text) : lv_color_hex(DANGER), 0);
+    lv_obj_center(status_label);
+
+    lv_obj_t *list = lv_obj_create(screen);
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 752, 210);
+    lv_obj_set_pos(list, 24, 198);
+    apply_student_surface_style(list, 14);
+    lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    activity_visible_session_ids.clear();
+    std::sort(sessions.begin(), sessions.end(), [](const ActivitySession &a, const ActivitySession &b) {
+        const int64_t a_recent = a.status == ActivitySessionStatus::ACTIVE ? a.started_at : a.closed_at;
+        const int64_t b_recent = b.status == ActivitySessionStatus::ACTIVE ? b.started_at : b.closed_at;
+        return a_recent != b_recent ? a_recent > b_recent : a.id > b.id;
+    });
+    std::vector<ActivitySession> filtered;
+    const ActivitySessionStatus wanted = activity_list_filter == ActivityListFilter::ACTIVE ? ActivitySessionStatus::ACTIVE :
+        activity_list_filter == ActivityListFilter::FINISHED ? ActivitySessionStatus::FINISHED : ActivitySessionStatus::CANCELLED;
+    for (const ActivitySession &session : sessions) if (session.status == wanted) filtered.push_back(session);
+    if (filtered.empty()) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, result == ActivityStorageResult::OK ?
+                          "No hay actividades en este filtro." :
+                          "No hay sesiones válidas disponibles para mostrar.");
+        lv_obj_set_style_text_font(empty, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(empty, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_center(empty);
+    }
+
+    for (size_t i = 0; i < filtered.size(); ++i) {
+        const ActivitySession &session = filtered[i];
+        activity_visible_session_ids.push_back(session.id);
+        lv_obj_t *row = lv_obj_create(list);
+        lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, 720, 76);
+        lv_obj_set_pos(row, 0, static_cast<lv_coord_t>(i * 82));
+        apply_student_surface_style(row, 10);
+        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(row, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_event_cb(row, activity_list_row_event, LV_EVENT_CLICKED,
+                            reinterpret_cast<void *>(static_cast<uintptr_t>(i)));
+        char first_line[128];
+        if (session.activity_number_enabled) {
+            snprintf(first_line, sizeof(first_line), "ID %llu · Actividad %u · %s · %lu %s",
+                     static_cast<unsigned long long>(session.id),
+                     static_cast<unsigned>(session.activity_number),
+                     activity_session_status_text(session.status),
+                     static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME);
+        } else {
+            snprintf(first_line, sizeof(first_line), "ID %llu · Sin número · %s · %lu %s",
+                     static_cast<unsigned long long>(session.id),
+                     activity_session_status_text(session.status),
+                     static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME);
+        }
+        lv_obj_t *line = lv_label_create(row);
+        lv_label_set_text(line, first_line);
+        lv_obj_set_width(line, 696);
+        lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(line, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(line, lv_color_hex(theme_palette().primary_text), 0);
+        lv_obj_align(line, LV_ALIGN_TOP_LEFT, 10, 4);
+
+        char time_text[64];
+        char participants_text[176];
+        char second_line[256];
+        char started_text[40];
+        time_t started_epoch = static_cast<time_t>(session.started_at);
+        struct tm started_tm = {};
+        if (session.started_at >= MIN_VALID_ACTIVITY_EPOCH && localtime_r(&started_epoch, &started_tm))
+            strftime(started_text, sizeof(started_text), "%d/%m/%y %H:%M", &started_tm);
+        else snprintf(started_text, sizeof(started_text), "Hora no disponible");
+        activity_session_time_text(session, time_text, sizeof(time_text));
+        activity_session_participants_text(session, participants_text, sizeof(participants_text));
+        snprintf(second_line, sizeof(second_line), "%s · Participantes: %s · %s",
+                 started_text, participants_text, time_text);
+        line = lv_label_create(row);
+        lv_label_set_text(line, second_line);
+        lv_obj_set_width(line, 696);
+        lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(line, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(line, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_align(line, LV_ALIGN_BOTTOM_LEFT, 10, -4);
+        ActivityTimeLabel time_entry;
+        time_entry.label = line; time_entry.session = session;
+        snprintf(time_entry.prefix, sizeof(time_entry.prefix), "%s · Participantes: %s · ",
+                 started_text, participants_text);
+        activity_time_labels.push_back(time_entry);
+    }
+    create_action_back_button(screen, master_back_event);
+}
+
+enum class ActivityClaimCheck : uint8_t { READY, ACCOUNT_MISSING, INVALID };
+
+ActivityClaimCheck check_activity_claim_inputs(uint64_t activity_id, uint16_t student_id,
+                                               ActivitySession &session, StudentAccount &account,
+                                               int64_t &now_epoch, char *message, size_t message_size)
+{
+    if (!storage_manager.isReady() || activity_claim_startup_result != ActivityClaimStorageResult::OK) {
+        snprintf(message, message_size, "Almacenamiento de claims no disponible o requiere revisión.");
+        return ActivityClaimCheck::INVALID;
+    }
+    const Student *student = getStudentById(student_id);
+    if (!student || !activity_id) {
+        snprintf(message, message_size, "Selecciona un alumno y una actividad válidos.");
+        return ActivityClaimCheck::INVALID;
+    }
+    const ActivityStorageResult session_result = activity_storage_manager.readSession(activity_id, session);
+    if (session_result != ActivityStorageResult::OK) {
+        snprintf(message, message_size, "No se pudo leer la actividad. No se inició el cobro.");
+        return ActivityClaimCheck::INVALID;
+    }
+    if (session.status != ActivitySessionStatus::ACTIVE) {
+        snprintf(message, message_size, "La actividad ya está finalizada o cancelada.");
+        return ActivityClaimCheck::INVALID;
+    }
+    struct tm local_time = {};
+    time_t epoch = 0;
+    time(&epoch);
+    if (!time_manager.isSynchronized() || !time_manager.getLocalTime(local_time) ||
+        epoch < MIN_VALID_ACTIVITY_EPOCH) {
+        snprintf(message, message_size, "Hora pendiente de verificar. No se admite el cobro.");
+        return ActivityClaimCheck::INVALID;
+    }
+    now_epoch = static_cast<int64_t>(epoch);
+    const ActivityEligibility eligibility = getActivityEligibility(session, now_epoch, true);
+    if (eligibility != ActivityEligibility::ELIGIBLE) {
+        snprintf(message, message_size, "%s", eligibility == ActivityEligibility::EXPIRED
+                 ? "Tiempo agotado. No se admite el cobro."
+                 : "La actividad no admite cobros en este momento.");
+        return ActivityClaimCheck::INVALID;
+    }
+    const bool participant = session.participant_mode == ActivityParticipantMode::PARTICIPANTS_DISABLED ||
+        std::find(session.participant_student_ids.begin(), session.participant_student_ids.end(), student_id) !=
+            session.participant_student_ids.end();
+    if (!participant) {
+        snprintf(message, message_size, "Este alumno no está incluido en la actividad.");
+        return ActivityClaimCheck::INVALID;
+    }
+    bool has_claim = false;
+    if (activity_claim_storage_manager.hasClaimForPair(activity_id, student_id, has_claim) !=
+        ActivityClaimStorageResult::OK) {
+        snprintf(message, message_size, "No se pudo consultar el historial de cobros.");
+        return ActivityClaimCheck::INVALID;
+    }
+    if (has_claim) {
+        snprintf(message, message_size, "Este alumno ya tiene un cobro registrado para la actividad.");
+        return ActivityClaimCheck::INVALID;
+    }
+    const StorageResult account_result = storage_manager.getStudentAccount(student_id, account);
+    if (account_result == StorageResult::STORAGE_NOT_FOUND) {
+        snprintf(message, message_size, "Este alumno no tiene cuenta. Solicita al maestro crearla.");
+        return ActivityClaimCheck::ACCOUNT_MISSING;
+    }
+    if (account_result != StorageResult::STORAGE_OK) {
+        snprintf(message, message_size, "No se pudo leer la cuenta del alumno. No se interpreta como cuenta inexistente.");
+        return ActivityClaimCheck::INVALID;
+    }
+    if (session.reward_amount > static_cast<uint64_t>(MAX_ACCOUNT_BALANCE - account.balance)) {
+        snprintf(message, message_size, "El saldo excedería el límite permitido.");
+        return ActivityClaimCheck::INVALID;
+    }
+    message[0] = '\0';
+    return ActivityClaimCheck::READY;
+}
+
+void activity_claim_dropdown_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_VALUE_CHANGED) return;
+    lv_obj_t *dropdown = lv_event_get_target(event);
+    const size_t selected = lv_dropdown_get_selected(dropdown);
+    if (reinterpret_cast<uintptr_t>(lv_event_get_user_data(event)) == 0) {
+        if (selected < activity_claim_session_options.size())
+            activity_claim_selected_activity_id = activity_claim_session_options[selected];
+    } else if (selected < activity_claim_student_options.size()) {
+        activity_claim_selected_student_id = activity_claim_student_options[selected];
+    }
+    activity_claim_feedback[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM);
+}
+
+void activity_claim_continue_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || activity_claim_in_progress) return;
+    activity_claim_feedback[0] = '\0';
+    mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM_CONFIRM);
+}
+
+const char *activity_claim_status_text(ActivityClaimStatus status)
+{
+    return status == ActivityClaimStatus::PAID ? "Pagado" : "Anulado";
+}
+
+void activity_claim_commit_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || activity_claim_in_progress) return;
+    activity_claim_in_progress = true;
+    ActivitySession session;
+    StudentAccount account;
+    int64_t now_epoch = 0;
+    char message[192] = {};
+    const ActivityClaimCheck check = check_activity_claim_inputs(
+        activity_claim_selected_activity_id, activity_claim_selected_student_id,
+        session, account, now_epoch, message, sizeof(message));
+    if (check != ActivityClaimCheck::READY) {
+        if (check == ActivityClaimCheck::ACCOUNT_MISSING) {
+            ActivityAccountIssue issue;
+            issue.activity_id = activity_claim_selected_activity_id;
+            issue.student_id = activity_claim_selected_student_id;
+            issue.occurred_at = now_epoch;
+            const ActivityClaimStorageResult issue_result =
+                activity_claim_storage_manager.recordMissingAccountIssue(issue);
+            if (issue_result != ActivityClaimStorageResult::OK)
+                snprintf(message, sizeof(message), "Este alumno no tiene cuenta. Solicita al maestro crearla. No se pudo guardar el aviso local.");
+        }
+        snprintf(activity_claim_feedback, sizeof(activity_claim_feedback), "%s", message);
+        activity_claim_in_progress = false;
+        mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM_CONFIRM);
+        return;
+    }
+
+    ActivityClaim claim;
+    const ActivityClaimStorageResult reserve_result = activity_claim_storage_manager.reserveClaimId(claim.id);
+    if (reserve_result != ActivityClaimStorageResult::OK) {
+        snprintf(activity_claim_feedback, sizeof(activity_claim_feedback), "No se pudo reservar el ID del cobro.");
+        activity_claim_in_progress = false;
+        mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM_CONFIRM);
+        return;
+    }
+    claim.activity_id = session.id;
+    claim.student_id = activity_claim_selected_student_id;
+    claim.reward_amount = session.reward_amount;
+    claim.claimed_at = now_epoch;
+    claim.status = ActivityClaimStatus::PAID;
+    StudentAccount updated;
+    const AccountMovementResult result = storage_manager.applyActivityReward(claim, updated);
+    activity_claim_in_progress = false;
+    if (result == AccountMovementResult::OK) {
+        activity_claim_saved = claim;
+        activity_claim_updated_account = updated;
+        snprintf(activity_claim_feedback, sizeof(activity_claim_feedback),
+                 "Cobro completado. Movimiento ID %llu. Saldo: %lld %s.",
+                 static_cast<unsigned long long>(claim.movement_id),
+                 static_cast<long long>(updated.balance), CURRENCY_NAME);
+    } else if (result == AccountMovementResult::ACCOUNT_NOT_FOUND) {
+        ActivityAccountIssue issue;
+        issue.activity_id = session.id; issue.student_id = activity_claim_selected_student_id;
+        issue.occurred_at = now_epoch;
+        const ActivityClaimStorageResult issue_result =
+            activity_claim_storage_manager.recordMissingAccountIssue(issue);
+        snprintf(activity_claim_feedback, sizeof(activity_claim_feedback),
+                 issue_result == ActivityClaimStorageResult::OK
+                    ? "Este alumno no tiene cuenta. Solicita al maestro crearla."
+                    : "Este alumno no tiene cuenta. No se pudo guardar el aviso local.");
+    } else {
+        snprintf(activity_claim_feedback, sizeof(activity_claim_feedback),
+                 "Cobro no confirmado; revisa el almacenamiento antes de reintentar (código %u).",
+                 static_cast<unsigned>(result));
+    }
+    mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM_CONFIRM);
+}
+
+void create_activity_claim_screen(lv_obj_t *screen)
+{
+    lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
+    create_student_topbar(screen, "Cobro real · Acceso DEV", false, false);
+    lv_obj_t *badge = make_content_panel(screen, 24, 104, 752, 44, theme_palette().surface);
+    lv_obj_t *badge_text = lv_label_create(badge);
+    lv_label_set_text(badge_text, "ACCESO DEV · Operación real sobre saldo persistente");
+    lv_obj_set_style_text_font(badge_text, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(badge_text, lv_color_hex(ORANGE), 0);
+    lv_obj_center(badge_text);
+
+    activity_claim_session_options.clear();
+    activity_claim_student_options.clear();
+    std::vector<ActivitySession> sessions;
+    const ActivityStorageResult session_result = activity_storage_manager.readSessions(sessions);
+    String activity_options;
+    if (session_result == ActivityStorageResult::OK &&
+        activity_claim_startup_result == ActivityClaimStorageResult::OK && storage_manager.isReady()) {
+        for (const ActivitySession &session : sessions) {
+            if (session.status != ActivitySessionStatus::ACTIVE) continue;
+            char option[112];
+            if (session.activity_number_enabled)
+                snprintf(option, sizeof(option), "ID %llu · N.º %u · %lu %s\n",
+                         static_cast<unsigned long long>(session.id),
+                         static_cast<unsigned>(session.activity_number),
+                         static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME);
+            else
+                snprintf(option, sizeof(option), "ID %llu · %lu %s\n",
+                         static_cast<unsigned long long>(session.id),
+                         static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME);
+            activity_options += option;
+            activity_claim_session_options.push_back(session.id);
+        }
+    }
+    if (activity_claim_session_options.empty()) {
+        lv_obj_t *error = lv_label_create(screen);
+        lv_label_set_text(error, session_result == ActivityStorageResult::OK
+            ? "No hay actividades activas disponibles o el almacenamiento de claims requiere revisión."
+            : "No se pudieron leer las actividades; el cobro está bloqueado.");
+        lv_obj_set_width(error, 740); lv_label_set_long_mode(error, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(error, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(error, lv_color_hex(DANGER), 0); lv_obj_set_style_text_align(error, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(error, LV_ALIGN_TOP_MID, 0, 170);
+        create_action_back_button(screen, master_back_event);
+        return;
+    }
+    if (std::find(activity_claim_session_options.begin(), activity_claim_session_options.end(),
+                  activity_claim_selected_activity_id) == activity_claim_session_options.end())
+        activity_claim_selected_activity_id = activity_claim_session_options.front();
+    if (activity_options.endsWith("\n")) activity_options.remove(activity_options.length() - 1);
+
+    lv_obj_t *activity_label = lv_label_create(screen);
+    lv_label_set_text(activity_label, "Actividad activa");
+    lv_obj_set_style_text_font(activity_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(activity_label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_pos(activity_label, 40, 170);
+    lv_obj_t *activity_dropdown = lv_dropdown_create(screen);
+    lv_obj_set_size(activity_dropdown, 720, 44); lv_obj_set_pos(activity_dropdown, 40, 198);
+    lv_dropdown_set_options(activity_dropdown, activity_options.c_str());
+    const auto activity_selected = std::find(activity_claim_session_options.begin(), activity_claim_session_options.end(),
+                                             activity_claim_selected_activity_id);
+    lv_dropdown_set_selected(activity_dropdown, static_cast<uint16_t>(activity_selected - activity_claim_session_options.begin()));
+    lv_obj_add_event_cb(activity_dropdown, activity_claim_dropdown_event, LV_EVENT_VALUE_CHANGED,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(0)));
+
+    String student_options;
+    for (size_t i = 0; i < getStudentCount(); ++i) {
+        const Student *student = getStudentAtIndex(i);
+        if (!student || student->student_id == 0) continue;
+        student_options += student_short_name(student);
+        student_options += "\n";
+        activity_claim_student_options.push_back(student->student_id);
+    }
+    if (activity_claim_student_options.empty()) {
+        create_action_back_button(screen, master_back_event);
+        return;
+    }
+    if (std::find(activity_claim_student_options.begin(), activity_claim_student_options.end(),
+                  activity_claim_selected_student_id) == activity_claim_student_options.end())
+        activity_claim_selected_student_id = activity_claim_student_options.front();
+    if (student_options.endsWith("\n")) student_options.remove(student_options.length() - 1);
+    lv_obj_t *student_label = lv_label_create(screen);
+    lv_label_set_text(student_label, "Alumno"); lv_obj_set_style_text_font(student_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(student_label, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_pos(student_label, 40, 258);
+    lv_obj_t *student_dropdown = lv_dropdown_create(screen);
+    lv_obj_set_size(student_dropdown, 720, 44); lv_obj_set_pos(student_dropdown, 40, 286);
+    lv_dropdown_set_options(student_dropdown, student_options.c_str());
+    const auto student_selected = std::find(activity_claim_student_options.begin(), activity_claim_student_options.end(),
+                                            activity_claim_selected_student_id);
+    lv_dropdown_set_selected(student_dropdown, static_cast<uint16_t>(student_selected - activity_claim_student_options.begin()));
+    lv_obj_add_event_cb(student_dropdown, activity_claim_dropdown_event, LV_EVENT_VALUE_CHANGED,
+                        reinterpret_cast<void *>(static_cast<uintptr_t>(1)));
+
+    ActivitySession session; StudentAccount account; int64_t now_epoch = 0; char preview[192] = {};
+    const ActivityClaimCheck check = check_activity_claim_inputs(activity_claim_selected_activity_id,
+        activity_claim_selected_student_id, session, account, now_epoch, preview, sizeof(preview));
+    lv_obj_t *summary = make_content_panel(screen, 40, 344, 720, 54, theme_palette().surface);
+    char summary_text[192];
+    if (check == ActivityClaimCheck::READY)
+        snprintf(summary_text, sizeof(summary_text), "Recompensa: %lu %s · Saldo actual: %lld %s",
+                 static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME,
+                 static_cast<long long>(account.balance), CURRENCY_NAME);
+    else snprintf(summary_text, sizeof(summary_text), "%s", preview);
+    lv_obj_t *summary_label = lv_label_create(summary); lv_label_set_text(summary_label, summary_text);
+    lv_obj_set_width(summary_label, 680); lv_label_set_long_mode(summary_label, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_font(summary_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(summary_label, lv_color_hex(check == ActivityClaimCheck::READY
+        ? theme_palette().primary_text : DANGER), 0); lv_obj_center(summary_label);
+    create_activity_control_button(screen, 536, 416, 240, 48,
+        check == ActivityClaimCheck::ACCOUNT_MISSING ? "Registrar aviso" : "Revisar cobro",
+        activity_claim_continue_event, 0, ButtonVariant::PRIMARY,
+        check == ActivityClaimCheck::READY || check == ActivityClaimCheck::ACCOUNT_MISSING);
+    create_action_back_button(screen, master_back_event);
+}
+
+void create_activity_claim_confirm_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Confirmar cobro real", false, false);
+    lv_obj_t *panel = make_content_panel(screen, 72, 112, 656, 248, theme_palette().surface);
+    const bool completed = strncmp(activity_claim_feedback, "Cobro completado", 15) == 0;
+    ActivitySession session; StudentAccount account; int64_t now_epoch = 0; char message[192] = {};
+    const ActivityClaimCheck check = completed ? ActivityClaimCheck::READY : check_activity_claim_inputs(activity_claim_selected_activity_id,
+        activity_claim_selected_student_id, session, account, now_epoch, message, sizeof(message));
+    const Student *student = getStudentById(activity_claim_selected_student_id);
+    char details[288];
+    if (completed) {
+        snprintf(details, sizeof(details), "Cobro guardado\nActividad ID %llu\nAlumno: %s\nCantidad: %lu %s\nMovimiento ID %llu\nSaldo nuevo: %lld %s",
+                 static_cast<unsigned long long>(activity_claim_saved.activity_id), student_short_name(student),
+                 static_cast<unsigned long>(activity_claim_saved.reward_amount), CURRENCY_NAME,
+                 static_cast<unsigned long long>(activity_claim_saved.movement_id),
+                 static_cast<long long>(activity_claim_updated_account.balance), CURRENCY_NAME);
+    } else if (check == ActivityClaimCheck::READY) {
+        snprintf(details, sizeof(details), "Actividad ID %llu\nAlumno: %s\nRecompensa: %lu %s\nSaldo actual: %lld %s\nSaldo después: %lld %s",
+                 static_cast<unsigned long long>(session.id), student_short_name(student),
+                 static_cast<unsigned long>(session.reward_amount), CURRENCY_NAME,
+                 static_cast<long long>(account.balance), CURRENCY_NAME,
+                 static_cast<long long>(account.balance + session.reward_amount), CURRENCY_NAME);
+    } else {
+        snprintf(details, sizeof(details), "No se puede confirmar el cobro.\n\n%s", message);
+    }
+    lv_obj_t *label = lv_label_create(panel); lv_label_set_text(label, details);
+    lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(label, lv_color_hex(completed ? GREEN : check == ActivityClaimCheck::READY
+        ? theme_palette().primary_text : DANGER), 0); lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    if (activity_claim_feedback[0]) {
+        label = lv_label_create(screen); lv_label_set_text(label, activity_claim_feedback);
+        lv_obj_set_width(label, 744); lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(strncmp(activity_claim_feedback, "Cobro completado", 15) == 0
+            ? GREEN : DANGER), 0); lv_obj_align(label, LV_ALIGN_TOP_MID, 0, 372);
+    }
+    if ((check == ActivityClaimCheck::READY || check == ActivityClaimCheck::ACCOUNT_MISSING) &&
+        activity_claim_feedback[0] == '\0')
+        create_activity_control_button(screen, 536, 416, 240, 48,
+            check == ActivityClaimCheck::ACCOUNT_MISSING ? "Registrar aviso local" : "Confirmar cobro",
+            activity_claim_commit_event, 0, ButtonVariant::PRIMARY);
+    create_action_back_button(screen, master_back_event);
+}
+
+void create_activity_claims_screen(lv_obj_t *screen)
+{
+    create_student_topbar(screen, "Cobros de actividad", false, false);
+    char title[72];
+    snprintf(title, sizeof(title), "Actividad ID %llu", static_cast<unsigned long long>(activity_claims_view_activity_id));
+    lv_obj_t *heading = lv_label_create(screen); lv_label_set_text(heading, title);
+    lv_obj_set_style_text_font(heading, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(heading, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, 102);
+    std::vector<ActivityClaim> claims;
+    const ActivityClaimStorageResult result = activity_claim_storage_manager.getClaimsForActivity(
+        activity_claims_view_activity_id, claims);
+    lv_obj_t *list = lv_obj_create(screen); lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, 752, 270); lv_obj_set_pos(list, 24, 132);
+    apply_student_surface_style(list, 14); lv_obj_set_style_pad_all(list, 8, 0);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
+    if (result != ActivityClaimStorageResult::OK || claims.empty()) {
+        lv_obj_t *empty = lv_label_create(list);
+        lv_label_set_text(empty, result == ActivityClaimStorageResult::OK
+            ? "Todavía no hay cobros para esta actividad."
+            : "No se pudo leer el historial de cobros; la edición permanece bloqueada.");
+        lv_obj_set_width(empty, 700); lv_label_set_long_mode(empty, LV_LABEL_LONG_WRAP);
+        lv_obj_set_style_text_font(empty, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(empty, lv_color_hex(result == ActivityClaimStorageResult::OK
+            ? theme_palette().secondary_text : DANGER), 0); lv_obj_center(empty);
+    }
+    std::sort(claims.begin(), claims.end(), [](const ActivityClaim &a, const ActivityClaim &b) {
+        return a.claimed_at != b.claimed_at ? a.claimed_at > b.claimed_at : a.id > b.id;
+    });
+    for (size_t i = 0; i < claims.size(); ++i) {
+        const ActivityClaim &claim = claims[i];
+        const Student *student = getStudentById(claim.student_id);
+        lv_obj_t *row = lv_obj_create(list); lv_obj_remove_style_all(row);
+        lv_obj_set_size(row, 720, 58); lv_obj_set_pos(row, 0, static_cast<lv_coord_t>(i * 62));
+        apply_student_surface_style(row, 10); lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
+        char line_text[192];
+        snprintf(line_text, sizeof(line_text), "%s · +%lu %s · %s · Movimiento ID %llu",
+                 student_short_name(student), static_cast<unsigned long>(claim.reward_amount), CURRENCY_NAME,
+                 activity_claim_status_text(claim.status), static_cast<unsigned long long>(claim.movement_id));
+        lv_obj_t *line = lv_label_create(row); lv_label_set_text(line, line_text);
+        lv_obj_set_width(line, 696); lv_label_set_long_mode(line, LV_LABEL_LONG_DOT);
+        lv_obj_set_style_text_font(line, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(line, lv_color_hex(theme_palette().primary_text), 0);
+        lv_obj_align(line, LV_ALIGN_TOP_LEFT, 10, 4);
+        time_t timestamp = static_cast<time_t>(claim.claimed_at); struct tm local = {}; char date_text[32];
+        if (localtime_r(&timestamp, &local)) strftime(date_text, sizeof(date_text), "%d/%m/%Y %H:%M", &local);
+        else snprintf(date_text, sizeof(date_text), "Hora no disponible");
+        line = lv_label_create(row); lv_label_set_text(line, date_text);
+        lv_obj_set_style_text_font(line, &lv_font_montserrat_14, 0);
+        lv_obj_set_style_text_color(line, lv_color_hex(theme_palette().secondary_text), 0);
+        lv_obj_align(line, LV_ALIGN_BOTTOM_LEFT, 10, -2);
+    }
+    create_action_back_button(screen, master_back_event);
 }
 
 void create_config_screen(lv_obj_t *screen)
@@ -5182,7 +6241,8 @@ bool is_back_navigation(Pantalla from, Pantalla to)
         return from == PANTALLA_TRANSFER_TECLADO || from == PANTALLA_ACCOUNT_ENTRY_CONFIRM;
     }
     if (to == PANTALLA_CONFIGURACION) return from == PANTALLA_MASTER_MENU;
-    if (to == PANTALLA_MASTER_MENU) return from == PANTALLA_ACTIVITY_SETUP || from == PANTALLA_ACTIVITY_READY;
+    if (to == PANTALLA_MASTER_MENU) return from == PANTALLA_ACTIVITY_SETUP ||
+        from == PANTALLA_ACTIVITY_READY || from == PANTALLA_ACTIVITY_SESSIONS;
     if (to == PANTALLA_ACTIVITY_SETUP) {
         return from == PANTALLA_ACTIVITY_STUDENTS || from == PANTALLA_ACTIVITY_KEYPAD ||
                from == PANTALLA_ACTIVITY_READY;
@@ -5193,6 +6253,11 @@ bool is_back_navigation(Pantalla from, Pantalla to)
 void mostrar_pantalla(Pantalla pantalla)
 {
     if (transition_in_progress) return;
+    if (activity_ui_timer != nullptr) {
+        lv_timer_del(activity_ui_timer);
+        activity_ui_timer = nullptr;
+    }
+    activity_time_labels.clear();
     const Pantalla previous_screen = pantalla_actual;
     lv_obj_t *const previous_screen_obj = lv_scr_act();
     transition_in_progress = true;
@@ -5245,7 +6310,14 @@ void mostrar_pantalla(Pantalla pantalla)
         case PANTALLA_ACTIVITY_STUDENTS: create_activity_students_screen(next_screen); break;
         case PANTALLA_ACTIVITY_KEYPAD: create_activity_keypad_screen(next_screen); break;
         case PANTALLA_ACTIVITY_READY: create_activity_ready_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_SESSIONS: create_activity_sessions_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_DETAIL: create_activity_detail_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_CLAIM: create_activity_claim_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_CLAIM_CONFIRM: create_activity_claim_confirm_screen(next_screen); break;
+        case PANTALLA_ACTIVITY_CLAIMS: create_activity_claims_screen(next_screen); break;
     }
+    if (pantalla == PANTALLA_ACTIVITY_SESSIONS || pantalla == PANTALLA_ACTIVITY_DETAIL)
+        activity_ui_timer = lv_timer_create(activity_ui_timer_cb, 1000, nullptr);
     create_performance_overlay(next_screen);
     performance_screen_create_ms = millis() - screen_create_started_ms;
     if (PERFORMANCE_TEST_ENABLED) {
@@ -5493,6 +6565,17 @@ void setup()
     sd_manager.begin(); // No GPIO, mount, or filesystem access until the physical SD is available.
     set_boot_progress(56, "MicroSD: comprobando disponibilidad");
     const bool storage_ready = storage_manager.begin(); // Storage errors are non-fatal; continue to the UI.
+    activity_claim_startup_result = storage_ready
+        ? activity_claim_storage_manager.begin() : ActivityClaimStorageResult::NOT_READY;
+    if (activity_claim_startup_result != ActivityClaimStorageResult::OK)
+        Serial.printf("[ActivityClaim] Storage unavailable or requires inspection (code=%u)\n",
+                      static_cast<unsigned>(activity_claim_startup_result));
+    activity_storage_startup_result = storage_ready
+        ? activity_storage_manager.begin() : ActivityStorageResult::NOT_READY;
+    if (activity_storage_startup_result != ActivityStorageResult::OK) {
+            Serial.printf("[Activities] Storage unavailable or requires inspection (code=%u)\n",
+                          static_cast<unsigned>(activity_storage_startup_result));
+    }
     set_boot_progress(storage_ready ? 68 : 64,
                       storage_ready ? "Almacenamiento local listo" : "Almacenamiento local no disponible");
     boot_setup_complete = true;

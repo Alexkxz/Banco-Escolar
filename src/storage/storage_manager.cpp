@@ -12,6 +12,8 @@
 #include <limits>
 
 #include "time/time_manager.h"
+#include "activity_claim_storage_manager.h"
+#include "activity_session.h"
 
 namespace {
 constexpr char STORAGE_MOUNT_PATH[] = "/littlefs";
@@ -35,6 +37,14 @@ constexpr bool validBalanceChange(int64_t balance, int64_t amount)
     return balance >= 0 && balance <= MAX_ACCOUNT_BALANCE && amount != 0 &&
            amount >= -balance && amount <= MAX_ACCOUNT_BALANCE - balance;
 }
+
+struct StorageOperationGuard {
+    explicit StorageOperationGuard(bool &active_flag) : flag(active_flag), acquired(!active_flag)
+    { if (acquired) flag = true; }
+    ~StorageOperationGuard() { if (acquired) flag = false; }
+    bool &flag;
+    bool acquired;
+};
 
 static_assert(validBalanceChange(125, -5) && 125 + (-5) == 120, "125 - 5 validation");
 static_assert(validBalanceChange(125, -125) && 125 + (-125) == 0, "125 - 125 validation");
@@ -130,10 +140,10 @@ bool writePendingTransaction(uint16_t student_id, uint64_t movement_id,
                              int64_t old_balance, int64_t new_balance,
                              int32_t amount, int64_t timestamp,
                              StoredMovementType type, const char *reason,
-                             StoredRecordOrigin origin)
+                             StoredRecordOrigin origin, const ActivityClaim *claim = nullptr)
 {
     StaticJsonDocument<512> document;
-    document["schema_version"] = 1;
+    document["schema_version"] = claim == nullptr ? 1 : 2;
     document["student_id"] = student_id;
     document["movement_id"] = movement_id;
     document["old_balance"] = old_balance;
@@ -143,6 +153,18 @@ bool writePendingTransaction(uint16_t student_id, uint64_t movement_id,
     document["type"] = movementTypeName(type);
     document["reason"] = reason;
     document["origin"] = originName(origin);
+    if (claim != nullptr) {
+        JsonObject claim_document = document.createNestedObject("activity_claim");
+        claim_document["id"] = claim->id;
+        claim_document["activity_id"] = claim->activity_id;
+        claim_document["student_id"] = claim->student_id;
+        claim_document["reward_amount"] = claim->reward_amount;
+        claim_document["claimed_at"] = claim->claimed_at;
+        claim_document["movement_id"] = movement_id;
+        claim_document["status"] = "paid";
+        claim_document["void_movement_id"] = 0;
+    }
+    if (document.overflowed()) return false;
     File file = LittleFS.open(ACCOUNT_TXN_FILE, FILE_WRITE);
     if (!file) return false;
     const size_t expected = measureJson(document);
@@ -492,7 +514,7 @@ StorageState StorageManager::state() const
 
 bool StorageManager::isReady() const
 {
-    return state_ == StorageState::STORAGE_READY;
+    return state_ == StorageState::STORAGE_READY && !recovery_required_ && !transaction_in_progress_;
 }
 
 size_t StorageManager::totalBytes() const
@@ -645,7 +667,9 @@ StorageResult StorageManager::appendMovement(uint16_t student_id, int32_t amount
                                               StoredMovementType type, const char *reason,
                                               StoredRecordOrigin origin, uint64_t *created_id)
 {
-    if (state_ != StorageState::STORAGE_READY) return StorageResult::STORAGE_NOT_READY;
+    if (!isReady()) return StorageResult::STORAGE_NOT_READY;
+    StorageOperationGuard operation(transaction_in_progress_);
+    if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
     if (student_id == 0 || (type != StoredMovementType::ENTRY && type != StoredMovementType::EXIT) ||
         (origin != StoredRecordOrigin::TERMINAL && origin != StoredRecordOrigin::PANEL)) {
         return StorageResult::STORAGE_INVALID_ARGUMENT;
@@ -736,11 +760,21 @@ StorageResult StorageManager::appendReservedMovement(const MovementRecord &recor
 
 StorageResult StorageManager::getStudentAccount(uint16_t student_id, StudentAccount &out) const
 {
-    if (state_ != StorageState::STORAGE_READY) return StorageResult::STORAGE_NOT_READY;
+    if (state_ != StorageState::STORAGE_READY || recovery_required_) return StorageResult::STORAGE_NOT_READY;
     if (student_id == 0) return StorageResult::STORAGE_INVALID_ARGUMENT;
     bool found = false;
     if (!readLatestAccount(student_id, out, found)) return StorageResult::STORAGE_IO_ERROR;
     return found ? StorageResult::STORAGE_OK : StorageResult::STORAGE_NOT_FOUND;
+}
+
+StorageResult StorageManager::getMovementById(uint64_t id, MovementRecord &out) const
+{
+    if (state_ != StorageState::STORAGE_READY || recovery_required_) return StorageResult::STORAGE_NOT_READY;
+    if (!id) return StorageResult::STORAGE_INVALID_ARGUMENT;
+    size_t matches = 0;
+    if (!findMovementById(id, out, matches)) return StorageResult::STORAGE_IO_ERROR;
+    if (matches == 0) return StorageResult::STORAGE_NOT_FOUND;
+    return matches == 1 ? StorageResult::STORAGE_OK : StorageResult::STORAGE_IO_ERROR;
 }
 
 StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &account)
@@ -783,7 +817,9 @@ StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &accoun
 StorageResult StorageManager::createAccountIfMissing(uint16_t student_id, int64_t initial_balance,
                                                       StudentAccount &out)
 {
-    if (state_ != StorageState::STORAGE_READY || recovery_required_) return StorageResult::STORAGE_NOT_READY;
+    if (!isReady()) return StorageResult::STORAGE_NOT_READY;
+    StorageOperationGuard operation(transaction_in_progress_);
+    if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
     if (!student_id || initial_balance < 0 || initial_balance > MAX_ACCOUNT_BALANCE) return StorageResult::STORAGE_INVALID_ARGUMENT;
     StorageResult result = getStudentAccount(student_id, out);
     if (result == StorageResult::STORAGE_OK) return result;
@@ -799,7 +835,9 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
                                                             StoredRecordOrigin origin,
                                                             StudentAccount &updated, uint64_t *created_id)
 {
-    if (state_ != StorageState::STORAGE_READY || recovery_required_) return AccountMovementResult::RECOVERY_REQUIRED;
+    if (!isReady()) return AccountMovementResult::RECOVERY_REQUIRED;
+    StorageOperationGuard operation(transaction_in_progress_);
+    if (!operation.acquired) return AccountMovementResult::RECOVERY_REQUIRED;
     if (type != StoredMovementType::ENTRY && type != StoredMovementType::EXIT) return AccountMovementResult::INVALID_AMOUNT;
     StudentAccount current = {};
     const StorageResult account_result = getStudentAccount(student_id, current);
@@ -844,6 +882,90 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
     return AccountMovementResult::OK;
 }
 
+AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
+                                                          StudentAccount &updated)
+{
+    if (!isReady()) return AccountMovementResult::RECOVERY_REQUIRED;
+    if (!claim.id || !claim.activity_id || !claim.student_id || claim.reward_amount == 0 ||
+        claim.reward_amount > MAX_ACTIVITY_REWARD || claim.claimed_at < MIN_VALID_EPOCH ||
+        claim.status != ActivityClaimStatus::PAID || claim.void_movement_id != 0)
+        return AccountMovementResult::INVALID_AMOUNT;
+
+    bool prior_claim = false;
+    if (activity_claim_storage_manager.hasClaimForPair(claim.activity_id, claim.student_id,
+                                                       prior_claim) != ActivityClaimStorageResult::OK ||
+        prior_claim) return AccountMovementResult::RECOVERY_REQUIRED;
+    StorageOperationGuard operation(transaction_in_progress_);
+    if (!operation.acquired) return AccountMovementResult::RECOVERY_REQUIRED;
+    StudentAccount current = {};
+    const StorageResult account_result = getStudentAccount(claim.student_id, current);
+    if (account_result == StorageResult::STORAGE_NOT_FOUND) return AccountMovementResult::ACCOUNT_NOT_FOUND;
+    if (account_result != StorageResult::STORAGE_OK) return AccountMovementResult::RECOVERY_REQUIRED;
+    const int64_t amount = static_cast<int64_t>(claim.reward_amount);
+    if (!validBalanceChange(current.balance, amount)) return AccountMovementResult::INVALID_AMOUNT;
+    const int64_t next_balance = current.balance + amount;
+    struct tm local_time = {};
+    if (!time_manager.isSynchronized() || !time_manager.getLocalTime(local_time))
+        return AccountMovementResult::INVALID_TIME;
+    time_t now = 0;
+    time(&now);
+    if (now < MIN_VALID_EPOCH || claim.claimed_at > static_cast<int64_t>(now))
+        return AccountMovementResult::INVALID_TIME;
+    if (LittleFS.exists(ACCOUNT_TXN_FILE) || next_movement_id_ == 0 ||
+        next_movement_id_ == std::numeric_limits<uint64_t>::max())
+        return AccountMovementResult::RECOVERY_REQUIRED;
+
+    const uint64_t movement_id = next_movement_id_;
+    if (!persistNextMovementId(movement_id + 1)) return AccountMovementResult::MOVEMENT_WRITE_FAILED;
+    ++next_movement_id_;
+    char reason[MOVEMENT_REASON_MAX_LENGTH + 1] = {};
+    snprintf(reason, sizeof(reason), "Actividad %llu", static_cast<unsigned long long>(claim.activity_id));
+    MovementRecord movement = {};
+    movement.id = movement_id;
+    movement.student_id = claim.student_id;
+    movement.amount = static_cast<int32_t>(amount);
+    movement.type = StoredMovementType::ENTRY;
+    memcpy(movement.reason, reason, strlen(reason) + 1);
+    movement.timestamp = claim.claimed_at;
+    movement.origin = StoredRecordOrigin::TERMINAL;
+    movement.synced = false;
+    movement.schema_version = STORAGE_SCHEMA_VERSION;
+    if (!writePendingTransaction(claim.student_id, movement_id, current.balance, next_balance,
+                                 movement.amount, claim.claimed_at, StoredMovementType::ENTRY,
+                                 reason, StoredRecordOrigin::TERMINAL, &claim)) {
+        recovery_required_ = LittleFS.exists(ACCOUNT_TXN_FILE);
+        return AccountMovementResult::RECOVERY_REQUIRED;
+    }
+    const StorageResult movement_result = appendReservedMovement(movement);
+    if (movement_result != StorageResult::STORAGE_OK) {
+        recovery_required_ = true;
+        return AccountMovementResult::MOVEMENT_WRITE_FAILED;
+    }
+    const StudentAccount next = {claim.student_id, next_balance, 1};
+    if (appendAccountSnapshot(next) != StorageResult::STORAGE_OK) {
+        recovery_required_ = true;
+        return AccountMovementResult::ACCOUNT_WRITE_FAILED;
+    }
+    claim.movement_id = movement_id;
+    const ActivityClaimStorageResult claim_result = activity_claim_storage_manager.ensureClaimPersisted(claim);
+    if (claim_result != ActivityClaimStorageResult::OK) {
+        recovery_required_ = true;
+        return AccountMovementResult::RECOVERY_REQUIRED;
+    }
+    if (!LittleFS.remove(ACCOUNT_TXN_FILE)) {
+        recovery_required_ = true;
+        return AccountMovementResult::RECOVERY_REQUIRED;
+    }
+    updated = next;
+    used_bytes_ = LittleFS.usedBytes();
+    Serial.printf("[ActivityClaim] claim_id=%llu activity_id=%llu student_id=%u movement_id=%llu\n",
+                  static_cast<unsigned long long>(claim.id),
+                  static_cast<unsigned long long>(claim.activity_id),
+                  static_cast<unsigned>(claim.student_id),
+                  static_cast<unsigned long long>(claim.movement_id));
+    return AccountMovementResult::OK;
+}
+
 bool StorageManager::recoverPendingAccountMovement()
 {
     if (!LittleFS.exists(ACCOUNT_TXN_FILE)) return true;
@@ -851,7 +973,9 @@ bool StorageManager::recoverPendingAccountMovement()
     if (!file || file.size() > 512) { if (file) file.close(); return false; }
     char json[513]; const size_t size = file.readBytes(json, sizeof(json) - 1); file.close(); json[size] = '\0';
     StaticJsonDocument<512> document;
-    if (deserializeJson(document, json) != DeserializationError::Ok || (document["schema_version"] | 0) != 1) return false;
+    if (deserializeJson(document, json) != DeserializationError::Ok) return false;
+    const uint8_t journal_version = document["schema_version"] | 0;
+    if (journal_version != 1 && journal_version != 2) return false;
     const uint16_t student_id = document["student_id"] | 0;
     const uint64_t movement_id = document["movement_id"] | static_cast<uint64_t>(0);
     const int64_t old_balance = document["old_balance"] | static_cast<int64_t>(-1);
@@ -871,6 +995,34 @@ bool StorageManager::recoverPendingAccountMovement()
         (expected.type == StoredMovementType::ENTRY && (amount <= 0 || amount > MAX_SINGLE_CREDIT)) ||
         (expected.type == StoredMovementType::EXIT && amount >= 0) ||
         !validBalanceChange(old_balance, amount) || new_balance != old_balance + amount) return false;
+    ActivityClaim pending_claim;
+    const bool has_activity_claim = journal_version == 2;
+    if (has_activity_claim) {
+        JsonObjectConst claim_document = document["activity_claim"].as<JsonObjectConst>();
+        if (claim_document.isNull() || !claim_document["id"].is<uint64_t>() ||
+            !claim_document["activity_id"].is<uint64_t>() ||
+            !claim_document["student_id"].is<uint16_t>() ||
+            !claim_document["reward_amount"].is<uint32_t>() ||
+            !claim_document["claimed_at"].is<int64_t>() ||
+            !claim_document["movement_id"].is<uint64_t>() ||
+            strcmp(claim_document["status"] | "", "paid") != 0 ||
+            (claim_document["void_movement_id"] | static_cast<uint64_t>(0)) != 0) return false;
+        pending_claim.id = claim_document["id"].as<uint64_t>();
+        pending_claim.activity_id = claim_document["activity_id"].as<uint64_t>();
+        pending_claim.student_id = claim_document["student_id"].as<uint16_t>();
+        pending_claim.reward_amount = claim_document["reward_amount"].as<uint32_t>();
+        pending_claim.claimed_at = claim_document["claimed_at"].as<int64_t>();
+        pending_claim.movement_id = claim_document["movement_id"].as<uint64_t>();
+        pending_claim.status = ActivityClaimStatus::PAID;
+        char expected_reason[MOVEMENT_REASON_MAX_LENGTH + 1] = {};
+        snprintf(expected_reason, sizeof(expected_reason), "Actividad %llu",
+                 static_cast<unsigned long long>(pending_claim.activity_id));
+        if (expected.type != StoredMovementType::ENTRY || expected.origin != StoredRecordOrigin::TERMINAL || pending_claim.id == 0 ||
+            pending_claim.activity_id == 0 || pending_claim.student_id != student_id ||
+            pending_claim.reward_amount == 0 || pending_claim.reward_amount != static_cast<uint32_t>(amount) ||
+            pending_claim.claimed_at != timestamp || pending_claim.movement_id != movement_id ||
+            strcmp(reason, expected_reason) != 0) return false;
+    }
     StudentAccount current = {}; bool found = false;
     if (!readLatestAccount(student_id, current, found) || !found || (current.balance != old_balance && current.balance != new_balance)) return false;
     MovementRecord existing = {}; size_t matches = 0;
@@ -884,6 +1036,8 @@ bool StorageManager::recoverPendingAccountMovement()
         const StudentAccount next = {student_id, new_balance, 1};
         if (appendAccountSnapshot(next) != StorageResult::STORAGE_OK) return false;
     }
+    if (has_activity_claim &&
+        activity_claim_storage_manager.ensureClaimPersisted(pending_claim) != ActivityClaimStorageResult::OK) return false;
     if (!LittleFS.remove(ACCOUNT_TXN_FILE)) return false;
     Serial.printf("[Account] Transaccion recuperada student_id=%u movement_id=%llu\n", static_cast<unsigned>(student_id), static_cast<unsigned long long>(movement_id));
     used_bytes_ = LittleFS.usedBytes();
@@ -923,10 +1077,12 @@ StorageResult StorageManager::markMovementSynced(uint64_t id)
 
 StorageResult StorageManager::clearLocalData()
 {
-    if (state_ != StorageState::STORAGE_READY) {
+    if (!isReady()) {
         Serial.println("[Storage] Borrado cancelado: almacenamiento no disponible");
         return StorageResult::STORAGE_NOT_READY;
     }
+    StorageOperationGuard operation(transaction_in_progress_);
+    if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
 
     // This list is intentionally explicit. Never format or recursively delete.
     if (LittleFS.exists(MOVEMENTS_FILE) && !LittleFS.remove(MOVEMENTS_FILE)) {
