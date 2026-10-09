@@ -21,7 +21,7 @@ function readPrefix(file: File, length: number): Promise<Uint8Array> {
   })
 }
 
-export async function validateStudentImage(file: File, decoder: ImageDecoder = decodeImage): Promise<void> {
+export async function validateStudentImage(file: File, decoder: ImageDecoder = decodeImage): Promise<{ width: number; height: number }> {
   const signatures = expectedSignatures[file.type]
   if (!signatures) throw new Error('Elige un archivo PNG o JPEG.')
   if (file.size <= 0 || file.size > MAX_STUDENT_IMAGE_BYTES) throw new Error('La imagen debe pesar entre 1 byte y 5 MiB.')
@@ -31,6 +31,7 @@ export async function validateStudentImage(file: File, decoder: ImageDecoder = d
   try {
     decoded = await decoder(file)
     if (!decoded.width || !decoded.height || decoded.width * decoded.height > MAX_STUDENT_IMAGE_PIXELS) throw new Error('La imagen no tiene dimensiones válidas o es demasiado grande para previsualizarse.')
+    return { width: decoded.width, height: decoded.height }
   } catch (error) {
     if (error instanceof Error && error.message.startsWith('La imagen')) throw error
     throw new Error('No se pudo decodificar la imagen seleccionada.')

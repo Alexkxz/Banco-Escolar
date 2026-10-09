@@ -69,7 +69,7 @@ export function ActivityDetailPage({ service = demoPanelService, now = realClock
     try {
       const updated = await service.closeActiveActivity(detail.activity.id, closeIntent)
       setState({ status: 'ready', detail: { ...detail, activity: updated } })
-      setNotice(closeIntent === 'FINISHED' ? 'La actividad se finalizó en memoria.' : 'La actividad se canceló en memoria.')
+      setNotice(closeIntent === 'FINISHED' ? 'La actividad se finalizó y se guardó localmente en modo demostración.' : 'La actividad se canceló y se guardó localmente en modo demostración.')
       setCloseIntent(null)
     } catch (error) {
       setOperationError(error instanceof Error ? error.message : 'No se pudo cerrar la actividad. Intenta de nuevo.')
@@ -78,7 +78,7 @@ export function ActivityDetailPage({ service = demoPanelService, now = realClock
 
   return <>
     <PageHeader eyebrow="GESTIÓN · DEMOSTRACIÓN" title="Detalle de actividad" description={`Consulta de sesión y reclamos existentes · ${ACTIVITY_TIME_ZONE}.`} />
-    <div className="dashboard-demo-note" role="note">Las actividades creadas, editadas o cerradas solo permanecen en memoria, se pierden al recargar y no se envían a la terminal. Cobros sigue en preparación; aquí solo se consultan registros existentes.</div>
+    <div className="dashboard-demo-note" role="note">Las actividades creadas, editadas o cerradas se guardan localmente en este navegador y no se envían a la terminal. Cobros sigue en preparación; aquí solo se consultan registros existentes.</div>
     {state.status === 'loading' && <Card className="directory-state" role="status"><span className="status-dot" />Cargando detalle de actividad…</Card>}
     {state.status === 'error' && <Card className="directory-state directory-error" role="alert"><div><strong>No se pudo consultar la actividad.</strong><p>El error no se interpreta como actividad inexistente.</p></div><Button variant="primary" onClick={() => setAttempt((value) => value + 1)}>Reintentar</Button></Card>}
     {state.status === 'ready' && !detail && <Card><EmptyState title="Actividad inexistente" description="No se encontró una actividad con ese ID en la demostración." action={<Link className="button button-secondary" to="/actividades">Regresar a actividades</Link>} /></Card>}
@@ -95,7 +95,7 @@ export function ActivityDetailPage({ service = demoPanelService, now = realClock
         <div className="activity-detail-actions">{editable && <Button onClick={() => navigate(`/actividades/${detail.activity.id}/editar`)}><Pencil size={15} />Editar actividad</Button>}{detail.activity.status === 'ACTIVE' && <><Button onClick={() => { setCloseIntent('FINISHED'); setOperationError('') }}><CheckCircle2 size={15} />Finalizar</Button><Button onClick={() => { setCloseIntent('CANCELLED'); setOperationError('') }}><XCircle size={15} />Cancelar actividad</Button></>}</div>
       </Card>
 
-      {closeIntent && <Card className="activity-close-confirm" role="region" aria-label="Confirmar cierre de actividad"><strong>{closeIntent === 'FINISHED' ? '¿Finalizar esta actividad?' : '¿Cancelar esta actividad?'}</strong><p>Se registrará el estado y la hora actual en la memoria de demostración. Los reclamos y movimientos existentes no cambian.</p><div><Button variant="primary" onClick={closeActivity} disabled={closing}>{closing ? 'Procesando…' : `Confirmar ${closeIntent === 'FINISHED' ? 'finalización' : 'cancelación'}`}</Button><Button onClick={() => setCloseIntent(null)} disabled={closing}>Volver</Button></div></Card>}
+      {closeIntent && <Card className="activity-close-confirm" role="region" aria-label="Confirmar cierre de actividad"><strong>{closeIntent === 'FINISHED' ? '¿Finalizar esta actividad?' : '¿Cancelar esta actividad?'}</strong><p>Se guardará localmente el estado y la hora actual. Los reclamos y movimientos existentes no cambian.</p><div><Button variant="primary" onClick={closeActivity} disabled={closing}>{closing ? 'Procesando…' : `Confirmar ${closeIntent === 'FINISHED' ? 'finalización' : 'cancelación'}`}</Button><Button onClick={() => setCloseIntent(null)} disabled={closing}>Volver</Button></div></Card>}
 
       <Card className="activity-participant-card"><div className="section-header"><div><h2>{detail.participantRosterAvailable ? 'Participantes y cobros existentes' : 'Cobros registrados'}</h2><p>{detail.participantRosterAvailable ? 'La lista refleja la selección guardada al iniciar. Cuenta y cobro son situaciones independientes.' : 'Sin filtro previo no hay una lista de elegibilidad guardada; solo se presentan reclamos existentes.'}</p></div></div>
         {!detail.participantRosterAvailable && detail.participants.length === 0 && <EmptyState title="Sin reclamos registrados" description="La consulta de reclamos terminó correctamente sin registros para esta actividad." />}

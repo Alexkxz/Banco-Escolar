@@ -79,6 +79,11 @@ uint32_t esp_lv_adapter_read_frame_intervals(uint32_t *sequence_cursor,
                                              uint32_t *intervals_us,
                                              uint32_t capacity,
                                              uint32_t *dropped_count);
+// Call only while holding the LVGL adapter lock. Captures a forced full redraw
+// through the existing flush path; it does not replace or resize display buffers.
+esp_err_t esp_lv_adapter_capture_begin(lv_color_t *rgb565_buffer, uint32_t pixel_capacity);
+bool esp_lv_adapter_capture_is_complete(void);
+void esp_lv_adapter_capture_cancel(void);
 
 #ifdef __cplusplus
 }

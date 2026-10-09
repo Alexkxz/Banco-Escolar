@@ -82,7 +82,7 @@ export function ActivityFormPage({ mode, service = demoPanelService }: { mode: '
       const saved = editing
         ? await service.updateActiveActivity(activityId, configuration)
         : await service.createActivity(configuration)
-      navigate(`/actividades/${saved.id}`, { state: { activityNotice: editing ? 'Los cambios de la actividad se guardaron en memoria.' : 'La actividad se inició en memoria con la hora de la computadora.' } })
+      navigate(`/actividades/${saved.id}`, { state: { activityNotice: editing ? 'Los cambios de la actividad se guardaron localmente en modo demostración.' : 'La actividad se inició con la hora de la computadora y se guardó localmente en modo demostración.' } })
     } catch (error) {
       setOperationError(error instanceof ActivityOperationError ? error.message : error instanceof Error ? error.message : 'No se pudo completar la operación. El borrador se conserva.')
     } finally { setSaving(false) }
@@ -90,7 +90,7 @@ export function ActivityFormPage({ mode, service = demoPanelService }: { mode: '
 
   return <>
     <PageHeader eyebrow="GESTIÓN · DEMOSTRACIÓN" title={editing ? 'Editar actividad' : 'Crear actividad'} description={editing ? `Editar ${activity ? activityDisplayName(activity) : 'actividad activa'}.` : 'Configura e inicia una sesión temporal de demostración.'} />
-    <div className="dashboard-demo-note" role="note">El borrador no se guarda. La confirmación actualiza el servicio demo en memoria; se pierde al recargar y no se envía a la terminal.</div>
+    <div className="dashboard-demo-note" role="note">El borrador del formulario no se conserva hasta confirmar. La actividad confirmada se guarda en este navegador y no se envía a la terminal.</div>
     {loadState.status === 'loading' && <Card className="directory-state" role="status"><span className="status-dot" />{editing ? 'Cargando actividad…' : 'Cargando alumnos…'}</Card>}
     {loadState.status === 'error' && <Card className="directory-state directory-error" role="alert"><div><strong>No se pudo cargar la información del formulario.</strong><p>El borrador no se guarda automáticamente.</p></div><Button variant="primary" onClick={() => setAttempt((value) => value + 1)}>Reintentar</Button></Card>}
     {loadState.status === 'ready' && editing && !activity && <Card><EmptyState title="Actividad inexistente" description="No se encontró una actividad con ese ID." action={<Link className="button button-secondary" to="/actividades">Regresar a actividades</Link>} /></Card>}

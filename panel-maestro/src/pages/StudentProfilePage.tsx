@@ -16,11 +16,11 @@ type LoadState = { status: 'loading' } | { status: 'error' } | { status: 'ready'
 type BalanceState = { status: 'loading' } | { status: 'error' } | { status: 'ready'; account: StudentAccount | null }
 type Draft = { operation: 'ADD' | 'WITHDRAW'; amount: string; reason: string }
 type Preview = { expectedBalance: number; resultBalance: number; confirmationId: string }
-type Props = { dataService?: PanelDataService; decoder?: ImageDecoder; makePreviewUrl?: (file: File) => string }
+type Props = { dataService?: PanelDataService; decoder?: ImageDecoder }
 
 function newConfirmationId() { return `${Date.now()}-${Math.random().toString(36).slice(2)}` }
 
-export function StudentProfilePage({ dataService = demoPanelService, decoder, makePreviewUrl = (file) => URL.createObjectURL(file) }: Props) {
+export function StudentProfilePage({ dataService = demoPanelService, decoder }: Props) {
   const { studentId } = useParams()
   const [searchParams] = useSearchParams()
   const schoolRecordReference = /^\d+$/.test(searchParams.get('schoolRecord') ?? '') ? Number(searchParams.get('schoolRecord')) : undefined
@@ -37,7 +37,7 @@ export function StudentProfilePage({ dataService = demoPanelService, decoder, ma
   const [operationError, setOperationError] = useState('')
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
-  const { photos, setPhoto, removePhoto } = useStudentPhotos()
+  const { photos, setPhoto, removePhoto, status: photosStatus } = useStudentPhotos()
   const photo = Number.isFinite(id) ? photos.get(id) : undefined
   useEffect(() => {
     let current = true
@@ -57,7 +57,7 @@ export function StudentProfilePage({ dataService = demoPanelService, decoder, ma
     event.target.value = ''
     if (!file) return
     setImageError(''); setValidating(true)
-    try { await validateStudentImage(file, decoder); setPhoto(id, { url: makePreviewUrl(file), fileName: file.name }) }
+    try { const dimensions = await validateStudentImage(file, decoder); await setPhoto(id, file, file.name, dimensions) }
     catch (error) { setImageError(error instanceof Error ? error.message : 'No se pudo validar la imagen.') }
     finally { setValidating(false) }
   }
@@ -106,8 +106,8 @@ export function StudentProfilePage({ dataService = demoPanelService, decoder, ma
       <Card className="student-profile-card"><div className="profile-identity"><StudentAvatar student={state.entry.student} size="large" /><div><span className="eyebrow">ID de demostración {state.entry.student.student_id}</span><h2>{state.entry.student.name}</h2><p>{state.entry.student.grade}° grado · Grupo {state.entry.student.group}</p><span className={`student-status ${state.entry.student.status === 'ACTIVE' ? 'is-active' : 'is-inactive'}`}>{state.entry.student.status === 'ACTIVE' ? 'Activo' : 'Inactivo'}</span></div></div><div className="profile-details"><div><span>Situación de cuenta</span><strong>{state.entry.hasAccount ? 'Cuenta asignada' : 'Sin cuenta'}</strong></div><div><span>Fuente de datos</span><strong>Modo demostración</strong></div></div></Card>
       <div className="profile-sidecards-grid">
         <Card className="profile-image-card"><div className="section-header"><div><h2>Imagen del perfil</h2><p>La selección se asocia al ID del alumno, no al nombre ni a una tarjeta.</p></div><ImagePlus size={19} aria-hidden="true" /></div>
-          <p className="image-memory-note">Prueba limitada al modo de demostración: la imagen permanece solo en memoria mientras navegas por el panel, se pierde al recargar y no se envía a la terminal.</p>
-          <div className="image-controls"><label className="button button-primary image-picker"><ImagePlus size={16} />Cargar imagen<input type="file" accept="image/png,image/jpeg" onChange={chooseImage} disabled={validating} /></label>{photo && <Button onClick={() => { removePhoto(id); setImageError('') }}><Trash2 size={15} />Quitar imagen</Button>}{validating && <span role="status">Validando imagen…</span>}</div>
+          <p className="image-memory-note">Imagen guardada localmente en este navegador y vinculada al ID del alumno. No se sincroniza con otras computadoras ni se envía a la terminal.</p>
+          <div className="image-controls"><label className="button button-primary image-picker"><ImagePlus size={16} />Cargar imagen<input type="file" accept="image/png,image/jpeg" onChange={chooseImage} disabled={validating || photosStatus !== 'ready'} /></label>{photo && <Button onClick={() => { void removePhoto(id).then(() => setImageError('')).catch((error: unknown) => setImageError(error instanceof Error ? error.message : 'No se pudo quitar la imagen.')) }} disabled={photosStatus !== 'ready'}><Trash2 size={15} />Quitar imagen</Button>}{validating && <span role="status">Validando imagen…</span>}{photosStatus === 'loading' && <span role="status">Cargando imagen guardada…</span>}{photosStatus === 'error' && <span role="alert">No se pudieron cargar las imágenes locales; no se permiten cambios.</span>}</div>
           {photo && <p className="image-file-name">Vista previa local: {photo.fileName} · no sincronizada</p>}{imageError && <p className="image-error" role="alert">{imageError}</p>}
         </Card>
         <Card className="profile-balance-card"><div className="section-header"><div><h2>Saldo de la cuenta</h2><p>Consulta y ajustes manuales de demostración</p></div><Wallet size={19} aria-hidden="true" /></div>
@@ -116,7 +116,7 @@ export function StudentProfilePage({ dataService = demoPanelService, decoder, ma
           {balance.status === 'ready' && !balance.account && <div className="profile-no-account"><strong>Sin cuenta</strong><p>No se creó una cuenta. Los ajustes no están disponibles.</p></div>}
           {balance.status === 'ready' && balance.account && <><div className="profile-balance-value"><span>Saldo actual</span><strong>{balance.account.balance.toLocaleString('es-MX')} <small>Áureos</small></strong></div>
             <div className="profile-balance-actions"><Button variant="primary" onClick={() => openAdjustment('ADD')}>Agregar Áureos</Button><Button onClick={() => openAdjustment('WITHDRAW')}>Retirar Áureos</Button><Link className="button button-secondary" to={`/cuentas/${id}`}>Ver cuenta</Link></div>
-            <p className="balance-memory-note">Los ajustes se conservan en memoria mientras navegas; se pierden al recargar y no se envían a la terminal.</p>
+            <p className="balance-memory-note">Los ajustes demo se guardan localmente en este navegador. No se sincronizan con otras computadoras ni se envían a la terminal.</p>
             {schoolRecordReference && <p className="balance-memory-note">Este ajuste manual quedará vinculado al registro escolar demo {schoolRecordReference}.</p>}
             {notice && <p className="adjustment-success" role="status">{notice}</p>}
             {draft && <form className="balance-adjustment-form" onSubmit={(event) => { event.preventDefault(); reviewAdjustment() }}>

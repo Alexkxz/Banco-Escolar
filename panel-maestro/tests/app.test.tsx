@@ -1,4 +1,4 @@
-﻿import { cleanup, fireEvent, render, screen, within } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
 import { AppRoutes } from '../src/app/App'
@@ -11,6 +11,7 @@ import { StudentPhotoProvider } from '../src/students/StudentPhotoContext'
 import { useStudentPhotos } from '../src/students/StudentPhotoContext'
 import { Route, Routes } from 'react-router-dom'
 import type { PanelDataService } from '../src/services/PanelDataService'
+import type { StoredStudentImage } from '../src/services/demoPersistence'
 
 afterEach(cleanup)
 function renderAt(path: string) { return render(<MemoryRouter initialEntries={[path]}><AppRoutes /></MemoryRouter>) }
@@ -86,25 +87,45 @@ describe('Panel Maestro PM.2', () => {
 
   it('keeps the old preview when an invalid image is selected and removes it on request', async () => {
     const decoder = async () => ({ width: 16, height: 16, close: () => undefined })
-    function ProfileAt({ path }: { path: string }) { return <MemoryRouter initialEntries={[path]}><StudentPhotoProvider><Routes><Route path="/alumnos/:studentId" element={<StudentProfilePage decoder={decoder} makePreviewUrl={() => 'blob:demo-valid'} />} /></Routes></StudentPhotoProvider></MemoryRouter> }
+    const saved = new Map<number, StoredStudentImage>()
+    const storage = { load: async () => [...saved.values()], save: async (student_id: number, blob: Blob, mimeType: string, fileName: string, dimensions: { width: number; height: number }) => { saved.set(student_id, { student_id, blob, mimeType: mimeType as 'image/png' | 'image/jpeg', fileName, byteLength: blob.size, ...dimensions, updatedAt: 1 }) }, remove: async (studentId: number) => { saved.delete(studentId) } }
+    const createUrl = () => 'blob:demo-valid'
+    const revoke = () => undefined
+    function ProfileAt({ path }: { path: string }) { return <MemoryRouter initialEntries={[path]}><StudentPhotoProvider storage={storage} createUrl={createUrl} revoke={revoke}><Routes><Route path="/alumnos/:studentId" element={<StudentProfilePage decoder={decoder} />} /></Routes></StudentPhotoProvider></MemoryRouter> }
     const { rerender } = render(<ProfileAt path="/alumnos/201" />)
     await screen.findByRole('heading', { name: 'Ximena Sol' })
     const valid = new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'demo.png', { type: 'image/png' })
     fireEvent.change(screen.getByLabelText('Cargar imagen'), { target: { files: [valid] } })
     expect(await screen.findByText(/Vista previa local: demo.png/)).toBeInTheDocument()
+    expect(saved.get(201)).toMatchObject({ mimeType: 'image/png', width: 16, height: 16 })
     const invalid = new File(['bad'], 'bad.png', { type: 'image/png' })
     fireEvent.change(screen.getByLabelText('Cargar imagen'), { target: { files: [invalid] } })
     expect(await screen.findByRole('alert')).toHaveTextContent('El contenido no coincide')
     expect(screen.getByText(/Vista previa local: demo.png/)).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Quitar imagen' }))
+    await waitFor(() => expect(saved.has(201)).toBe(false))
     expect(screen.queryByText(/Vista previa local/)).not.toBeInTheDocument()
     rerender(<ProfileAt path="/alumnos/201" />)
   })
 
+  it('keeps the saved photo and preview when replacing it fails to persist', async () => {
+    const savedBlob = new Blob(['saved'], { type: 'image/png' })
+    const storage = { load: async (): Promise<StoredStudentImage[]> => [{ student_id: 201, blob: savedBlob, mimeType: 'image/png', fileName: 'saved.png', byteLength: savedBlob.size, width: 2, height: 2, updatedAt: 1 }], save: async () => { throw new Error('quota') }, remove: async () => undefined }
+    const createUrl = (blob: Blob) => `blob:${blob.size}`
+    function Controls() {
+      const { photos, setPhoto } = useStudentPhotos()
+      return <><span>{photos.get(201)?.fileName}</span><button onClick={() => { void setPhoto(201, new Blob(['replacement'], { type: 'image/png' }), 'replacement.png', { width: 3, height: 3 }).catch(() => undefined) }}>Reemplazar</button></>
+    }
+    render(<StudentPhotoProvider storage={storage} createUrl={createUrl}><Controls /></StudentPhotoProvider>)
+    expect(await screen.findByText('saved.png')).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: 'Reemplazar' }))
+    await waitFor(() => expect(screen.getByText('saved.png')).toBeInTheDocument())
+    expect(screen.queryByText('replacement.png')).not.toBeInTheDocument()
+  })
   it('validates PNG/JPEG signatures, size, and decoded dimensions', async () => {
     const decoder = async () => ({ width: 20, height: 10, close: () => undefined })
-    await expect(validateStudentImage(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'ok.png', { type: 'image/png' }), decoder)).resolves.toBeUndefined()
-    await expect(validateStudentImage(new File([new Uint8Array([0xff, 0xd8, 0xff, 0x00])], 'ok.jpg', { type: 'image/jpeg' }), decoder)).resolves.toBeUndefined()
+    await expect(validateStudentImage(new File([new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])], 'ok.png', { type: 'image/png' }), decoder)).resolves.toMatchObject({ width: 20, height: 10 })
+    await expect(validateStudentImage(new File([new Uint8Array([0xff, 0xd8, 0xff, 0x00])], 'ok.jpg', { type: 'image/jpeg' }), decoder)).resolves.toMatchObject({ width: 20, height: 10 })
     await expect(validateStudentImage(new File(['text'], 'wrong.jpg', { type: 'image/jpeg' }), decoder)).rejects.toThrow(/contenido no coincide/)
     const large = new File([new Uint8Array(MAX_STUDENT_IMAGE_BYTES + 1)], 'large.png', { type: 'image/png' })
     await expect(validateStudentImage(large, decoder)).rejects.toThrow(/5 MiB/)
@@ -119,20 +140,24 @@ describe('Panel Maestro PM.2', () => {
     await expect(loadStudentDirectory(failed)).rejects.toThrow('offline')
   })
 
-  it('revokes temporary preview URLs when replacing and removing them', () => {
+  it('revokes temporary preview URLs when replacing and removing them', async () => {
     const revoked: string[] = []
+    const storage = { load: async () => [], save: async () => undefined, remove: async () => undefined }
+    const createUrl = (blob: Blob) => `blob:${blob.size}`
+    const first = new Blob(['a'], { type: 'image/png' })
+    const second = new Blob(['bb'], { type: 'image/png' })
     function Controls() {
       const { setPhoto, removePhoto } = useStudentPhotos()
-      return <><button onClick={() => setPhoto(201, { url: 'blob:first', fileName: 'first.png' })}>Primera</button><button onClick={() => setPhoto(201, { url: 'blob:second', fileName: 'second.png' })}>Reemplazar</button><button onClick={() => removePhoto(201)}>Retirar</button></>
+      return <><button onClick={() => { void setPhoto(201, first, 'first.png', { width: 1, height: 1 }) }}>Primera</button><button onClick={() => { void setPhoto(201, second, 'second.png', { width: 1, height: 1 }) }}>Reemplazar</button><button onClick={() => { void removePhoto(201) }}>Retirar</button></>
     }
-    render(<StudentPhotoProvider revoke={(url) => revoked.push(url)}><Controls /></StudentPhotoProvider>)
+    render(<StudentPhotoProvider storage={storage} createUrl={createUrl} revoke={(url) => revoked.push(url)}><Controls /></StudentPhotoProvider>)
     fireEvent.click(screen.getByRole('button', { name: 'Primera' }))
+    await waitFor(() => expect(revoked).toEqual([]))
     fireEvent.click(screen.getByRole('button', { name: 'Reemplazar' }))
-    expect(revoked).toEqual(['blob:first'])
+    await waitFor(() => expect(revoked).toEqual(['blob:1']))
     fireEvent.click(screen.getByRole('button', { name: 'Retirar' }))
-    expect(revoked).toEqual(['blob:first', 'blob:second'])
+    await waitFor(() => expect(revoked).toEqual(['blob:1', 'blob:2']))
   })
-
   it('serves fictitious read-only data with unique activity payouts', async () => {
     const demo = new DemoPanelDataService()
     const [students, accounts, movements, activities, claims] = await Promise.all([demo.getStudents(), demo.getAccounts(), demo.getMovements(), demo.getActivities(), demo.getClaims()])

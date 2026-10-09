@@ -38,6 +38,63 @@ static volatile uint32_t s_frame_interval_sequence = 0;
 static volatile uint32_t s_frame_intervals_us[FRAME_INTERVAL_HISTORY_SIZE] = {};
 static bool s_frame_timing_enabled = false;
 static int64_t s_previous_frame_timestamp_us = 0;
+static lv_color_t *s_capture_buffer = nullptr;
+static uint32_t s_capture_pixel_capacity = 0;
+static uint32_t s_capture_pixels_seen = 0;
+static uint16_t s_capture_height = 0;
+static uint16_t s_capture_width = 0;
+// One bit per output pixel lets the capture assemble arbitrary LVGL flush
+// rectangles rather than assuming every flush spans the complete row width.
+static constexpr uint32_t CAPTURE_COVERAGE_BYTES = (800U * 480U + 7U) / 8U;
+static uint8_t *s_capture_coverage = nullptr;
+static bool s_capture_complete = false;
+
+static void log_memory_snapshot(const char *stage)
+{
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    Serial.printf("[MEM] %s: interna libre=%u max=%u; PSRAM total=%u libre=%u max=%u\n",
+                  stage, static_cast<unsigned>(internal_free), static_cast<unsigned>(internal_largest),
+                  static_cast<unsigned>(psram_total), static_cast<unsigned>(psram_free),
+                  static_cast<unsigned>(psram_largest));
+}
+
+static void capture_flush_area(const lv_area_t *area, const lv_color_t *color_map)
+{
+    if (s_capture_buffer == nullptr || s_capture_coverage == nullptr || area == nullptr ||
+        color_map == nullptr || s_capture_complete) return;
+
+    const int32_t width = static_cast<int32_t>(area->x2) - area->x1 + 1;
+    const int32_t height = static_cast<int32_t>(area->y2) - area->y1 + 1;
+    if (width <= 0 || height <= 0 || area->x1 < 0 || area->y1 < 0 ||
+        area->x2 >= s_capture_width || area->y2 >= s_capture_height) return;
+
+    for (int32_t row = 0; row < height; ++row) {
+        const uint32_t destination = static_cast<uint32_t>(area->y1 + row) * s_capture_width + area->x1;
+        const uint32_t source = static_cast<uint32_t>(row) * static_cast<uint32_t>(width);
+        if (destination + static_cast<uint32_t>(width) > s_capture_pixel_capacity) return;
+        memcpy(s_capture_buffer + destination, color_map + source,
+               static_cast<size_t>(width) * sizeof(lv_color_t));
+    }
+
+    for (int32_t row = 0; row < height; ++row) {
+        const uint32_t y = static_cast<uint32_t>(area->y1 + row);
+        for (int32_t column = 0; column < width; ++column) {
+            const uint32_t pixel = y * s_capture_width + static_cast<uint32_t>(area->x1 + column);
+            const uint32_t byte_index = pixel >> 3U;
+            const uint8_t mask = static_cast<uint8_t>(1U << (pixel & 7U));
+            if ((s_capture_coverage[byte_index] & mask) == 0) {
+                s_capture_coverage[byte_index] |= mask;
+                ++s_capture_pixels_seen;
+            }
+        }
+    }
+    s_capture_complete = s_capture_pixels_seen ==
+        static_cast<uint32_t>(s_capture_width) * s_capture_height;
+}
 
 static void display_monitor_cb(lv_disp_drv_t *disp_drv, uint32_t render_time, uint32_t refreshed_pixels)
 {
@@ -102,6 +159,7 @@ IRAM_ATTR static bool draw_bitmap_finish_cb(void *user_data)
 static void flush_cb(lv_disp_drv_t *disp_drv, const lv_area_t *area, lv_color_t *color_map)
 {
     LCD *lcd = static_cast<LCD *>(disp_drv->user_data);
+    capture_flush_area(area, color_map);
     if (lcd == nullptr) {
         lv_disp_flush_ready(disp_drv);
         return;
@@ -197,9 +255,14 @@ lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_confi
     const auto bus_type = s_ctx.lcd->getBus()->getBasicAttributes().type;
     uint32_t buffer_bytes = width * 40 * sizeof(lv_color_t);
 
+    log_memory_snapshot("antes del registro del display");
+
     if (bus_type == ESP_PANEL_BUS_TYPE_RGB) {
         s_ctx.buf1 = s_ctx.lcd->getFrameBufferByIndex(0);
         s_ctx.buf2 = s_ctx.lcd->getFrameBufferByIndex(1);
+        Serial.printf("[MEM] Framebuffers RGB del panel: buffer1=%s buffer2=%s\n",
+                      s_ctx.buf1 != nullptr ? "disponible" : "no disponible",
+                      s_ctx.buf2 != nullptr ? "disponible" : "no disponible");
         if ((s_ctx.buf1 != nullptr) && (s_ctx.buf2 != nullptr)) {
             buffer_bytes = width * height * sizeof(lv_color_t);
             s_ctx.rgb_full_refresh = true;
@@ -207,9 +270,23 @@ lv_display_t *esp_lv_adapter_register_display(const esp_lv_adapter_display_confi
     }
 
     if ((s_ctx.buf1 == nullptr) || (s_ctx.buf2 == nullptr)) {
+        Serial.printf("[MEM] Reservando buffers LVGL internos: %u bytes cada uno\n",
+                      static_cast<unsigned>(buffer_bytes));
+        log_memory_snapshot("antes de reservar buffers LVGL");
         s_ctx.buf1 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-        s_ctx.buf2 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        Serial.printf("[MEM] Reserva buffer LVGL 1: %s (%p)\n",
+                      s_ctx.buf1 != nullptr ? "OK" : "FALLO", s_ctx.buf1);
+        if (s_ctx.buf1 != nullptr) {
+            s_ctx.buf2 = heap_caps_malloc(buffer_bytes, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+            Serial.printf("[MEM] Reserva buffer LVGL 2: %s (%p)\n",
+                          s_ctx.buf2 != nullptr ? "OK" : "FALLO", s_ctx.buf2);
+        } else {
+            s_ctx.buf2 = nullptr;
+            Serial.println("[MEM] Reserva buffer LVGL 2: no intentada porque falló la primera");
+        }
+        log_memory_snapshot("después de reservar buffers LVGL");
         if ((s_ctx.buf1 == nullptr) || (s_ctx.buf2 == nullptr)) {
+            Serial.println("[MEM] Registro de display cancelado: no se pudieron reservar ambos buffers LVGL");
             if (s_ctx.buf1 != nullptr) {
                 free(s_ctx.buf1);
             }
@@ -294,6 +371,69 @@ uint32_t esp_lv_adapter_read_frame_intervals(uint32_t *sequence_cursor,
     *sequence_cursor += available;
     if (dropped_count) *dropped_count = dropped;
     return available;
+}
+
+esp_err_t esp_lv_adapter_capture_begin(lv_color_t *rgb565_buffer, uint32_t pixel_capacity)
+{
+    if (s_ctx.display == nullptr || rgb565_buffer == nullptr || s_capture_buffer != nullptr ||
+        s_capture_coverage != nullptr) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    const uint16_t width = static_cast<uint16_t>(lv_disp_get_hor_res(s_ctx.display));
+    const uint16_t height = static_cast<uint16_t>(lv_disp_get_ver_res(s_ctx.display));
+    if (width == 0 || height == 0 || width > 800 || height > 480 ||
+        static_cast<uint64_t>(width) * height > pixel_capacity) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    log_memory_snapshot("antes de reservar mapa de cobertura DIAG.1");
+    const size_t psram_total = heap_caps_get_total_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (psram_total == 0 || psram_largest < CAPTURE_COVERAGE_BYTES) {
+        Serial.printf("[DIAG1][MEM] Reserva mapa de cobertura: FALLO (total PSRAM=%u, bloque máximo=%u, solicitado=%u bytes)\n",
+                      static_cast<unsigned>(psram_total), static_cast<unsigned>(psram_largest),
+                      static_cast<unsigned>(CAPTURE_COVERAGE_BYTES));
+        return ESP_ERR_NO_MEM;
+    }
+
+    s_capture_coverage = static_cast<uint8_t *>(
+        heap_caps_malloc(CAPTURE_COVERAGE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    Serial.printf("[DIAG1][MEM] Reserva mapa de cobertura (%u bytes): %s (%p)\n",
+                  static_cast<unsigned>(CAPTURE_COVERAGE_BYTES),
+                  s_capture_coverage != nullptr ? "OK" : "FALLO", s_capture_coverage);
+    if (s_capture_coverage == nullptr) {
+        log_memory_snapshot("después de fallar mapa de cobertura DIAG.1");
+        return ESP_ERR_NO_MEM;
+    }
+
+    memset(s_capture_coverage, 0, CAPTURE_COVERAGE_BYTES);
+    s_capture_width = width;
+    s_capture_height = height;
+    s_capture_pixel_capacity = pixel_capacity;
+    s_capture_pixels_seen = 0;
+    s_capture_complete = false;
+    s_capture_buffer = rgb565_buffer;
+    log_memory_snapshot("después de reservar mapa de cobertura DIAG.1");
+    return ESP_OK;
+}
+
+bool esp_lv_adapter_capture_is_complete(void)
+{
+    return s_capture_complete;
+}
+
+void esp_lv_adapter_capture_cancel(void)
+{
+    s_capture_buffer = nullptr;
+    if (s_capture_coverage != nullptr) {
+        heap_caps_free(s_capture_coverage);
+        s_capture_coverage = nullptr;
+    }
+    s_capture_pixel_capacity = 0;
+    s_capture_pixels_seen = 0;
+    s_capture_width = 0;
+    s_capture_height = 0;
+    s_capture_complete = false;
 }
 
 lv_indev_t *esp_lv_adapter_register_touch(const esp_lv_adapter_touch_config_t *config)

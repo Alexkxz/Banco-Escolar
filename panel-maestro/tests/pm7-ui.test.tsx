@@ -50,7 +50,7 @@ describe('PM.7 vistas de Cobros', () => {
     expect(screen.getByText('El saldo quedará negativo; esta operación se permite en la demostración.')).toBeInTheDocument()
     expect(screen.getByText('-5 Áureos')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Confirmar anulación' }))
-    expect(await screen.findByText(/Anulación registrada en memoria/)).toBeInTheDocument()
+    expect(await screen.findByText(/Anulación guardada localmente en modo demostración/)).toBeInTheDocument()
     expect(await screen.findByText('Sin motivo')).toBeInTheDocument()
     expect(screen.getAllByText(/Panel Maestro · modo demostración/).length).toBeGreaterThan(0)
     expect((await service.getAccounts()).find(({ student_id }) => student_id === 202)?.balance).toBe(-5)

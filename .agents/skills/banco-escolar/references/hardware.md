@@ -22,7 +22,13 @@ No cambies estas opciones solo para que coincidan con la etiqueta de la board. L
 
 ## microSD
 
-Asignación Waveshare reportada: MOSI GPIO11, SCK GPIO12, MISO GPIO13, CS por EXIO4. El usuario reporta una microSD de 64 GB instalada; `SDManager` no accede a GPIO ni intenta montar, por lo que el firmware no la detecta. Se decidió omitir microSD en las fases inmediatas. No formatear ni cambiar conexión en este cierre; no declares un límite oficial de capacidad no verificado.
+La ranura TF integrada usa SPI: MOSI GPIO11, SCK GPIO12, MISO GPIO13 y CS desde EXIO4 del CH422G, activo en bajo. La [guía oficial de Waveshare](https://docs.waveshare.com/docs/ESP32/ESP32-S3/ESP32-S3-Touch-LCD-7/Arduino/Arduino-SDCard-Demo) indica FAT32 para el demo de tarjeta. El firmware reutiliza el CH422G que `Board::begin()` ya inicializó; no crea otra instancia I2C. El controlador SPI SD local (`src/storage/sd_diskio_external_cs.cpp`) acciona EXIO4 por callback en cada selección y deselección. No asigna un GPIO a CS ni pasa un valor de pin sentinel a Arduino SD.
+
+`SDManager` hace una comprobación de solo lectura: deja EXIO4 alto entre transacciones, inicializa SPI, intenta montar con `format_if_empty=false`, informa tipo y capacidad, lista las entradas de raíz y desmonta. El callback del controlador baja EXIO4 antes de esperar y transmitir, y lo sube al terminar; fallos de selección/deselección marcan el dispositivo como no listo. No crea, escribe, renombra, borra ni formatea archivos. `CARD_UNKNOWN` se informa como tarjeta no detectada/sin respuesta; si el controlador reconoce tipo pero FAT no monta, se informa fallo de montaje sin reparar. La pantalla de almacenamiento describe el resultado del último sondeo; `Disponible` significa que el montaje y la lectura de raíz funcionaron y luego se desmontó.
+
+La ruta anterior pasaba `-1` a `sdcard_init(uint8_t)`, que se convertía en GPIO 255 y producía avisos de pin inválido. El controlador local sustituye esa ruta y no llama `pinMode`, `digitalWrite` ni `digitalPinToGPIONumber` para el CS. Tras cargar este controlador, el registro de arranque a 115200 no mostró `Invalid pin: 255`; el sondeo físico leyó la tarjeta SDHC y desmontó correctamente. La validación corresponde a esta carga y tarjeta.
+
+El usuario reportó una tarjeta de 64 GB; la prueba física más reciente leyó una tarjeta SDHC y desmontó correctamente. No se concluye un límite oficial de capacidad. BUILD no comprueba el lector, la tarjeta ni su formato real. No se debe formatear ni cambiar conexiones para resolver un error.
 
 ## Fuente de estos datos
 

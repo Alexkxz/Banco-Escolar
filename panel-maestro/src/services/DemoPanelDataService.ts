@@ -1,5 +1,6 @@
 import type { ActivityClaim, ActivitySession, DemoClaimAuthorization, DemoClaimEvent, MovementRecord, Student, StudentAccount } from '../models/domain'
 import type { PanelDataService } from './PanelDataService'
+import type { DemoPanelSnapshot } from './demoPersistence'
 import { academicResult, type AcademicRecord, type AcademicDraft, type AcademicRules, type AttendanceRecord, type AttendanceRules, type SchoolApplication, aspectLevel, academicLevelLabels, aspectLabels, schoolDateAt, schoolClockSeconds, validateAcademicDraft, validateAcademicRules, validateAttendanceRules, validateSchoolDate, createDefaultAcademicRules, createDefaultAttendanceRules, cloneAcademicRules, cloneAttendanceRules, attendanceAmount, type AcademicIndicator, type ComprehensionAspect } from './schoolDomain'
 
 /**
@@ -118,7 +119,7 @@ export class DemoClaimOperationError extends Error {
   }
 }
 
-export type DemoMutationName = 'VOID_CLAIM' | 'AUTHORIZE_REPEAT' | 'SIMULATE_CLAIM' | 'MANUAL_ACCOUNT_ADJUSTMENT' | 'SAVE_ACADEMIC_RECORD' | 'SAVE_ATTENDANCE' | 'UPDATE_SCHOOL_RULES' | 'APPLY_SCHOOL_AUREOS'
+export type DemoMutationName = 'VOID_CLAIM' | 'AUTHORIZE_REPEAT' | 'SIMULATE_CLAIM' | 'MANUAL_ACCOUNT_ADJUSTMENT' | 'SAVE_ACADEMIC_RECORD' | 'SAVE_ATTENDANCE' | 'UPDATE_SCHOOL_RULES' | 'APPLY_SCHOOL_AUREOS' | 'CREATE_ACTIVITY' | 'UPDATE_ACTIVITY' | 'CLOSE_ACTIVITY'
 
 export type DemoAccountAdjustment = { studentId: number; operation: 'ADD' | 'WITHDRAW'; amount: number; reason: string; expectedBalance: number; confirmationId: string; relatedSchoolRecordId?: number }
 export class DemoAccountAdjustmentError extends Error {
@@ -141,6 +142,7 @@ export type SchoolApplicationRequest = { recordType: 'ACADEMIC' | 'ATTENDANCE'; 
 export type SchoolApplicationPreview = { record: AcademicRecord | AttendanceRecord; student: Student; account: StudentAccount | null; resultingBalance: number | null; indicator: AcademicIndicator | 'ATTENDANCE'; amount: number; resultLabel: string; signature: string; recordType: 'ACADEMIC' | 'ATTENDANCE'; academicRulesVersion: number; attendanceRulesVersion: number }
 
 export class DemoPanelDataService implements PanelDataService, DemoActivityOperations, DemoClaimOperations {
+  private students: Student[] = demoStudents.map((student) => ({ ...student }))
   private activities = demoActivities.map(cloneActivity)
   private accounts = demoAccounts.map((account) => ({ ...account }))
   private movements = demoMovements.map((movement) => ({ ...movement }))
@@ -153,6 +155,8 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
   private readonly usedAdjustmentConfirmations = new Set<string>()
   private academicRules: AcademicRules = createDefaultAcademicRules()
   private attendanceRules: AttendanceRules = createDefaultAttendanceRules()
+  private academicRuleVersions: AcademicRules[] = [createDefaultAcademicRules()]
+  private attendanceRuleVersions: AttendanceRules[] = [createDefaultAttendanceRules()]
   private academicRecords: AcademicRecord[] = []
   private attendanceRecords: AttendanceRecord[] = []
   private schoolApplications: SchoolApplication[] = []
@@ -161,10 +165,37 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
 
   constructor(
     private readonly clock: () => number = () => Date.now(),
-    private readonly beforeCommit: (operation: DemoMutationName) => void = () => undefined,
+    private readonly beforeCommit: (operation: DemoMutationName, snapshot?: DemoPanelSnapshot) => void | Promise<void> = () => undefined,
   ) {}
 
-  async getStudents() { return demoStudents }
+  snapshot(patch: Partial<DemoPanelSnapshot> = {}): DemoPanelSnapshot {
+    return {
+      students: this.students.map((entry) => ({ ...entry })), accounts: this.accounts.map((entry) => ({ ...entry })), movements: this.movements.map((entry) => ({ ...entry })),
+      activities: this.activities.map(cloneActivity), claims: this.claims.map((entry) => ({ ...entry })), authorizations: this.authorizations.map((entry) => ({ ...entry })),
+      claimEvents: this.claimEvents.map((entry) => ({ ...entry })), academicRecords: this.academicRecords.map((entry) => structuredClone(entry)), attendanceRecords: this.attendanceRecords.map((entry) => ({ ...entry })),
+      schoolApplications: this.schoolApplications.map((entry) => ({ ...entry })), academicRules: cloneAcademicRules(this.academicRules), attendanceRules: cloneAttendanceRules(this.attendanceRules),
+      academicRuleVersions: this.academicRuleVersions.map(cloneAcademicRules), attendanceRuleVersions: this.attendanceRuleVersions.map(cloneAttendanceRules),
+      usedAdjustmentConfirmations: [...this.usedAdjustmentConfirmations],
+      counters: { activity: this.nextActivityId, authorization: this.nextAuthorizationId, claimEvent: this.nextClaimEventId, schoolRecord: this.nextSchoolRecordId, schoolApplication: this.nextSchoolApplicationId, movement: Math.max(0, ...this.movements.map(({ id }) => id)) + 1, claim: Math.max(0, ...this.claims.map(({ id }) => id)) + 1 },
+      ...patch,
+    }
+  }
+
+  restore(snapshot: DemoPanelSnapshot) {
+    this.students = snapshot.students.map((entry) => ({ ...entry }))
+    this.accounts = snapshot.accounts.map((entry) => ({ ...entry })); this.movements = snapshot.movements.map((entry) => ({ ...entry }));
+    this.activities = snapshot.activities.map(cloneActivity); this.claims = snapshot.claims.map((entry) => ({ ...entry }));
+    this.authorizations = snapshot.authorizations.map((entry) => ({ ...entry })); this.claimEvents = snapshot.claimEvents.map((entry) => ({ ...entry }));
+    this.academicRecords = snapshot.academicRecords.map((entry) => structuredClone(entry)); this.attendanceRecords = snapshot.attendanceRecords.map((entry) => ({ ...entry }));
+    this.schoolApplications = snapshot.schoolApplications.map((entry) => ({ ...entry })); this.academicRules = cloneAcademicRules(snapshot.academicRules); this.attendanceRules = cloneAttendanceRules(snapshot.attendanceRules);
+    this.academicRuleVersions = snapshot.academicRuleVersions.map(cloneAcademicRules); this.attendanceRuleVersions = snapshot.attendanceRuleVersions.map(cloneAttendanceRules);
+    this.usedAdjustmentConfirmations.clear(); for (const id of snapshot.usedAdjustmentConfirmations) this.usedAdjustmentConfirmations.add(id)
+    this.nextActivityId = snapshot.counters.activity; this.nextAuthorizationId = snapshot.counters.authorization; this.nextClaimEventId = snapshot.counters.claimEvent; this.nextSchoolRecordId = snapshot.counters.schoolRecord; this.nextSchoolApplicationId = snapshot.counters.schoolApplication
+  }
+
+  private async commit(operation: DemoMutationName, patch: Partial<DemoPanelSnapshot> = {}) { await this.beforeCommit(operation, this.snapshot(patch)) }
+
+  async getStudents() { return this.students.map((student) => ({ ...student })) }
   async getAccounts() { return this.accounts.map((account) => ({ ...account })) }
   async getMovements() { return this.movements.map((movement) => ({ ...movement })) }
   async getActivities() { return this.activities.map(cloneActivity) }
@@ -177,37 +208,37 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
   async getSchoolRules() { return { academic: cloneAcademicRules(this.academicRules), attendance: cloneAttendanceRules(this.attendanceRules) } }
 
   async saveAcademicRecord(draft: AcademicDraft) {
-    const error = validateAcademicDraft(draft, demoStudents, this.academicRules)
+    const error = validateAcademicDraft(draft, this.students, this.academicRules)
     if (error) throw new DemoSchoolError(error, 'INVALID')
     const now = Math.floor(this.clock() / 1000)
     const existingIndex = this.academicRecords.findIndex((record) => record.student_id === draft.student_id && record.school_date === draft.school_date && record.kind === draft.kind)
     const existing = existingIndex >= 0 ? this.academicRecords[existingIndex] : null
     const common = { id: existing?.id ?? this.nextSchoolRecordId, student_id: draft.student_id, school_date: draft.school_date, kind: draft.kind, version: (existing?.version ?? 0) + 1, recorded_at: now }
-    const student = demoStudents.find(({ student_id }) => student_id === draft.student_id)!
+    const student = this.students.find(({ student_id }) => student_id === draft.student_id)!
     const record: AcademicRecord = draft.kind === 'READING' ? { ...common, kind: 'READING', grade: student.grade, ppm: draft.ppm! }
       : draft.kind === 'DICTATION' ? { ...common, kind: 'DICTATION', total_words: draft.total_words!, correct_words: draft.correct_words! }
         : { ...common, kind: 'COMPREHENSION', scores: { ...draft.scores! }, denominators: { ...this.academicRules.comprehension.denominators } }
-    try { this.beforeCommit('SAVE_ACADEMIC_RECORD') } catch { throw new DemoSchoolError('No se guardó el registro; conserva el formulario e inténtalo de nuevo.', 'OPERATION_FAILED') }
+    try { await this.commit('SAVE_ACADEMIC_RECORD', { academicRecords: existingIndex >= 0 ? this.academicRecords.map((entry, index) => index === existingIndex ? record : entry) : [...this.academicRecords, record], counters: { ...this.snapshot().counters, schoolRecord: existingIndex >= 0 ? this.nextSchoolRecordId : this.nextSchoolRecordId + 1 } }) } catch { throw new DemoSchoolError('No se guardó el registro; conserva el formulario e inténtalo de nuevo. Revisa el almacenamiento local.', 'OPERATION_FAILED') }
     if (existingIndex >= 0) this.academicRecords = this.academicRecords.map((entry, index) => index === existingIndex ? record : entry)
     else { this.academicRecords = [...this.academicRecords, record]; this.nextSchoolRecordId += 1 }
     return structuredClone(record)
   }
 
   async markDemoArrival(studentId: number) {
-    if (!demoStudents.some((student) => student.student_id === studentId)) throw new DemoSchoolError('No se encontró el alumno.', 'NOT_FOUND')
+    if (!this.students.some((student) => student.student_id === studentId)) throw new DemoSchoolError('No se encontró el alumno.', 'NOT_FOUND')
     const nowMs = this.clock(); const date = schoolDateAt(nowMs); const now = Math.floor(nowMs / 1000)
     const existing = this.attendanceRecords.find((record) => record.student_id === studentId && record.school_date === date)
     if (existing?.arrival_at !== null && existing?.arrival_at !== undefined) throw new DemoSchoolError('La llegada ya está registrada y no se puede sobrescribir.', 'ALREADY_MARKED')
     const seconds = schoolClockSeconds(nowMs); const punctualSeconds = Number(this.attendanceRules.punctual_until.slice(0, 2)) * 3600 + Number(this.attendanceRules.punctual_until.slice(3)) * 60
     const record: AttendanceRecord = { id: existing?.id ?? this.nextSchoolRecordId, student_id: studentId, school_date: date, status: seconds <= punctualSeconds ? 'PRESENT' : 'LATE', arrival_at: now, justification: '', version: (existing?.version ?? 0) + 1, recorded_at: now }
-    try { this.beforeCommit('SAVE_ATTENDANCE') } catch { throw new DemoSchoolError('No se registró la llegada; inténtalo de nuevo.', 'OPERATION_FAILED') }
+    try { await this.commit('SAVE_ATTENDANCE', { attendanceRecords: existing ? this.attendanceRecords.map((entry) => entry.id === existing.id ? record : entry) : [...this.attendanceRecords, record], counters: { ...this.snapshot().counters, schoolRecord: existing ? this.nextSchoolRecordId : this.nextSchoolRecordId + 1 } }) } catch { throw new DemoSchoolError('No se registró la llegada; inténtalo de nuevo. Revisa el almacenamiento local.', 'OPERATION_FAILED') }
     if (existing) this.attendanceRecords = this.attendanceRecords.map((entry) => entry.id === existing.id ? record : entry)
     else { this.attendanceRecords = [...this.attendanceRecords, record]; this.nextSchoolRecordId += 1 }
     return { ...record }
   }
 
   async saveAttendanceStatus(studentId: number, schoolDate: string, status: AttendanceRecord['status'], justification = '') {
-    if (!demoStudents.some((student) => student.student_id === studentId)) throw new DemoSchoolError('No se encontró el alumno.', 'NOT_FOUND')
+    if (!this.students.some((student) => student.student_id === studentId)) throw new DemoSchoolError('No se encontró el alumno.', 'NOT_FOUND')
     if (!validateSchoolDate(schoolDate)) throw new DemoSchoolError('La fecha escolar no es válida.', 'INVALID')
     if ((status === 'PRESENT' || status === 'LATE') && !this.attendanceRecords.some((record) => record.student_id === studentId && record.school_date === schoolDate && record.arrival_at !== null)) throw new DemoSchoolError('No se puede crear una hora de llegada para una fecha manualmente; registra la llegada en el día actual.', 'NOT_TODAY')
     const existingIndex = this.attendanceRecords.findIndex((record) => record.student_id === studentId && record.school_date === schoolDate)
@@ -217,7 +248,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const punctualSeconds = Number(this.attendanceRules.punctual_until.slice(0, 2)) * 3600 + Number(this.attendanceRules.punctual_until.slice(3)) * 60
     const resolvedStatus = status === 'PRESENT' || status === 'LATE' ? (arrivalSeconds! <= punctualSeconds ? 'PRESENT' : 'LATE') : status
     const record: AttendanceRecord = { id: existing?.id ?? this.nextSchoolRecordId, student_id: studentId, school_date: schoolDate, status: resolvedStatus, arrival_at: existing?.arrival_at ?? null, justification: resolvedStatus === 'ABSENT_JUSTIFIED' ? justification.trim() : '', version: (existing?.version ?? 0) + 1, recorded_at: now }
-    try { this.beforeCommit('SAVE_ATTENDANCE') } catch { throw new DemoSchoolError('No se guardó la asistencia; conserva la selección e inténtalo de nuevo.', 'OPERATION_FAILED') }
+    try { await this.commit('SAVE_ATTENDANCE', { attendanceRecords: existingIndex >= 0 ? this.attendanceRecords.map((entry, index) => index === existingIndex ? record : entry) : [...this.attendanceRecords, record], counters: { ...this.snapshot().counters, schoolRecord: existingIndex >= 0 ? this.nextSchoolRecordId : this.nextSchoolRecordId + 1 } }) } catch { throw new DemoSchoolError('No se guardó la asistencia; conserva la selección e inténtalo de nuevo. Revisa el almacenamiento local.', 'OPERATION_FAILED') }
     if (existingIndex >= 0) this.attendanceRecords = this.attendanceRecords.map((entry, index) => index === existingIndex ? record : entry)
     else { this.attendanceRecords = [...this.attendanceRecords, record]; this.nextSchoolRecordId += 1 }
     return { ...record }
@@ -229,15 +260,16 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     if (academicError || attendanceError) throw new DemoSchoolError(academicError || attendanceError, 'INVALID')
     const nextAcademic = { ...cloneAcademicRules(academic), version: this.academicRules.version + 1 }
     const nextAttendance = { ...cloneAttendanceRules(attendance), version: this.attendanceRules.version + 1 }
-    try { this.beforeCommit('UPDATE_SCHOOL_RULES') } catch { throw new DemoSchoolError('No se guardó la configuración; el borrador se conservó.', 'OPERATION_FAILED') }
+    try { await this.commit('UPDATE_SCHOOL_RULES', { academicRules: nextAcademic, attendanceRules: nextAttendance, academicRuleVersions: [...this.academicRuleVersions, nextAcademic], attendanceRuleVersions: [...this.attendanceRuleVersions, nextAttendance] }) } catch { throw new DemoSchoolError('No se guardó la configuración; el borrador se conservó. Revisa el almacenamiento local.', 'OPERATION_FAILED') }
     this.academicRules = nextAcademic; this.attendanceRules = nextAttendance
+    this.academicRuleVersions = [...this.academicRuleVersions, nextAcademic]; this.attendanceRuleVersions = [...this.attendanceRuleVersions, nextAttendance]
     return { academic: cloneAcademicRules(nextAcademic), attendance: cloneAttendanceRules(nextAttendance) }
   }
 
   async previewSchoolApplication(recordType: 'ACADEMIC' | 'ATTENDANCE', recordId: number, indicator: AcademicIndicator | 'ATTENDANCE'): Promise<SchoolApplicationPreview> {
     const record = recordType === 'ACADEMIC' ? this.academicRecords.find((entry) => entry.id === recordId) : this.attendanceRecords.find((entry) => entry.id === recordId)
     if (!record) throw new DemoSchoolError('No se encontró el registro que se desea aplicar.', 'NOT_FOUND')
-    const student = demoStudents.find(({ student_id }) => student_id === record.student_id)
+    const student = this.students.find(({ student_id }) => student_id === record.student_id)
     if (!student) throw new DemoSchoolError('El registro no tiene un alumno válido.', 'NOT_FOUND')
     if (this.schoolApplications.some((application) => application.record_type === recordType && application.record_id === recordId && application.indicator === indicator)) throw new DemoSchoolError('Este registro e indicador ya tienen una aplicación; no se puede duplicar.', 'DUPLICATE')
     let amount: number; let resultLabel: string; let signature: string
@@ -295,7 +327,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const movement: MovementRecord | null = movementId === null ? null : { id: movementId, student_id: record.student_id, amount: preview.amount, type: preview.amount > 0 ? 'ENTRY' : 'EXIT', reason: `Aplicación académica demo · ${preview.resultLabel}`, timestamp, origin: 'DEMO', synced: false, schema_version: 1 }
     const application: SchoolApplication = { id: this.nextSchoolApplicationId, student_id: record.student_id, record_type: request.recordType, record_id: record.id, indicator: request.indicator, record_version: record.version, academic_rules_version: this.academicRules.version, attendance_rules_version: this.attendanceRules.version, result_label: preview.resultLabel, signature: preview.signature, amount: preview.amount, balance_before: preview.account.balance, balance_after: balanceAfter, movement_id: movementId, created_at: timestamp }
     const updatedAccount = { ...preview.account, balance: balanceAfter }
-    try { this.beforeCommit('APPLY_SCHOOL_AUREOS') } catch { throw new DemoSchoolError('No se aplicó el ajuste; saldo e historial siguen sin cambios.', 'OPERATION_FAILED') }
+    try { await this.commit('APPLY_SCHOOL_AUREOS', { accounts: preview.amount !== 0 ? this.accounts.map((entry) => entry.student_id === record.student_id ? updatedAccount : entry) : this.accounts, movements: movement ? [...this.movements, movement] : this.movements, schoolApplications: [...this.schoolApplications, application], counters: { ...this.snapshot().counters, schoolApplication: this.nextSchoolApplicationId + 1 } }) } catch { throw new DemoSchoolError('No se aplicó el ajuste; saldo e historial siguen sin cambios. Revisa el almacenamiento local.', 'OPERATION_FAILED') }
     if (preview.amount !== 0) { this.accounts = this.accounts.map((entry) => entry.student_id === record.student_id ? updatedAccount : entry); this.movements = [...this.movements, movement!] }
     this.schoolApplications = [...this.schoolApplications, application]; this.nextSchoolApplicationId += 1
     return { application: { ...application }, account: { ...updatedAccount }, movement: movement ? { ...movement } : null }
@@ -324,7 +356,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
       ...(input.relatedSchoolRecordId ? { related_school_record_id: input.relatedSchoolRecordId } : {}),
     }
     const updatedAccount = { ...account, balance: nextBalance }
-    try { this.beforeCommit('MANUAL_ACCOUNT_ADJUSTMENT') }
+    try { await this.commit('MANUAL_ACCOUNT_ADJUSTMENT', { accounts: this.accounts.map((entry) => entry.student_id === input.studentId ? updatedAccount : entry), movements: [...this.movements, movement], usedAdjustmentConfirmations: [...this.usedAdjustmentConfirmations, input.confirmationId] }) }
     catch { throw new DemoAccountAdjustmentError('No se aplicó el ajuste. Revisa el formulario e inténtalo de nuevo.', 'OPERATION_FAILED') }
     // Staged values are committed together only after all validation and the hook succeed.
     this.accounts = this.accounts.map((entry) => entry.student_id === input.studentId ? updatedAccount : entry)
@@ -342,7 +374,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
   private requireOperationalEligibility(activityId: number, studentId: number, now: number) {
     const activity = this.activities.find((entry) => entry.id === activityId)
     if (!activity) throw new DemoClaimOperationError('La actividad relacionada no existe; la operación quedó bloqueada.', 'INCONSISTENT')
-    if (!demoStudents.some((student) => student.student_id === studentId)) throw new DemoClaimOperationError('El alumno relacionado no existe; la operación quedó bloqueada.', 'INCONSISTENT')
+    if (!this.students.some((student) => student.student_id === studentId)) throw new DemoClaimOperationError('El alumno relacionado no existe; la operación quedó bloqueada.', 'INCONSISTENT')
     if (!this.accounts.some((account) => account.student_id === studentId)) throw new DemoClaimOperationError('El alumno no tiene cuenta; no se puede autorizar ni registrar el cobro.', 'INELIGIBLE')
     if (activity.status !== 'ACTIVE') throw new DemoClaimOperationError('La actividad no está activa.', 'INELIGIBLE')
     if (activity.duration_seconds > 0 && now < activity.started_at) throw new DemoClaimOperationError('La actividad todavía no ha iniciado; no se puede verificar la elegibilidad.', 'INELIGIBLE')
@@ -369,7 +401,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const activity = this.activities.find((entry) => entry.id === current.activity_id)
     const originalMovement = this.movements.find((movement) => movement.id === current.movement_id)
     const account = this.accounts.find((entry) => entry.student_id === current.student_id)
-    if (!activity || !demoStudents.some((student) => student.student_id === current.student_id) || !account || !originalMovement
+    if (!activity || !this.students.some((student) => student.student_id === current.student_id) || !account || !originalMovement
       || originalMovement.student_id !== current.student_id || originalMovement.type !== 'ENTRY'
       || originalMovement.amount !== current.reward_amount || originalMovement.timestamp !== current.claimed_at) {
       throw new DemoClaimOperationError('Falta una cuenta o referencia coherente del cobro original; la operación quedó bloqueada.', 'INCONSISTENT')
@@ -391,7 +423,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const nextMovements = [...this.movements, voidMovement]
     const nextClaims = this.claims.map((claim) => claim.id === current.id ? updatedClaim : claim)
     const nextEvent: DemoClaimEvent = { id: this.nextClaimEventId, claim_id: current.id, activity_id: current.activity_id, student_id: current.student_id, type: 'VOIDED', occurred_at: occurredAt, actor: 'PANEL_MAESTRO_DEMO', reason: reasonText }
-    this.beforeCommit('VOID_CLAIM')
+    await this.commit('VOID_CLAIM', { accounts: nextAccounts, movements: nextMovements, claims: nextClaims, claimEvents: [...this.claimEvents, nextEvent], counters: { ...this.snapshot().counters, claimEvent: this.nextClaimEventId + 1 } })
     this.accounts = nextAccounts; this.movements = nextMovements; this.claims = nextClaims; this.claimEvents = [...this.claimEvents, nextEvent]; this.nextClaimEventId += 1
     return { claim: { ...updatedClaim }, voidMovement: { ...voidMovement }, balance }
   }
@@ -408,7 +440,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     this.requireOperationalEligibility(source.activity_id, source.student_id, authorizedAt)
     const authorization: DemoClaimAuthorization = { id: this.nextAuthorizationId, activity_id: source.activity_id, student_id: source.student_id, source_claim_id: source.id, authorized_at: authorizedAt, status: 'AUTHORIZED' }
     const event: DemoClaimEvent = { id: this.nextClaimEventId, claim_id: source.id, activity_id: source.activity_id, student_id: source.student_id, type: 'REAUTHORIZED', occurred_at: authorizedAt, actor: 'PANEL_MAESTRO_DEMO', authorization_id: authorization.id }
-    this.beforeCommit('AUTHORIZE_REPEAT')
+    await this.commit('AUTHORIZE_REPEAT', { authorizations: [...this.authorizations, authorization], claimEvents: [...this.claimEvents, event], counters: { ...this.snapshot().counters, authorization: this.nextAuthorizationId + 1, claimEvent: this.nextClaimEventId + 1 } })
     this.authorizations = [...this.authorizations, authorization]; this.claimEvents = [...this.claimEvents, event]; this.nextAuthorizationId += 1; this.nextClaimEventId += 1
     return { ...authorization }
   }
@@ -437,13 +469,13 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const consumed: DemoClaimAuthorization = { ...authorization, status: 'CONSUMED', consumed_at: claimedAt, consumed_claim_id: claim.id }
     const event: DemoClaimEvent = { id: this.nextClaimEventId, claim_id: claim.id, activity_id: activity.id, student_id: authorization.student_id, type: 'NEW_CLAIM', occurred_at: claimedAt, actor: 'PANEL_MAESTRO_DEMO', authorization_id: authorization.id, related_claim_id: source.id }
     const nextAccounts = this.accounts.map((entry) => entry.student_id === authorization.student_id ? { ...entry, balance: nextBalance } : entry)
-    this.beforeCommit('SIMULATE_CLAIM')
+    await this.commit('SIMULATE_CLAIM', { accounts: nextAccounts, movements: [...this.movements, movement], claims: [...this.claims, claim], authorizations: this.authorizations.map((entry) => entry.id === authorization.id ? consumed : entry), claimEvents: [...this.claimEvents, event], counters: { ...this.snapshot().counters, claimEvent: this.nextClaimEventId + 1 } })
     this.accounts = nextAccounts; this.movements = [...this.movements, movement]; this.claims = [...this.claims, claim]; this.authorizations = this.authorizations.map((entry) => entry.id === authorization.id ? consumed : entry); this.claimEvents = [...this.claimEvents, event]; this.nextClaimEventId += 1
     return { claim: { ...claim }, movement: { ...movement }, balance: nextBalance }
   }
 
   async createActivity(configuration: ActivityConfiguration) {
-    const registeredIds = demoStudents.map(({ student_id }) => student_id)
+    const registeredIds = this.students.map(({ student_id }) => student_id)
     const validationError = validateDemoActivityConfiguration(configuration, registeredIds)
     if (validationError) throw new ActivityOperationError(validationError, 'INVALID_CONFIGURATION')
     const startedAt = Math.floor(this.clock() / 1000)
@@ -459,6 +491,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
       participant_mode: configuration.participant_mode, participant_student_ids: participantIds,
       started_at: startedAt, status: 'ACTIVE', closed_at: 0,
     }
+    await this.commit('CREATE_ACTIVITY' as DemoMutationName, { activities: [...this.activities, created], counters: { ...this.snapshot().counters, activity: id + 1 } })
     this.activities = [...this.activities, created]
     this.nextActivityId += 1
     return cloneActivity(created)
@@ -469,7 +502,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     if (!current) throw new ActivityOperationError('No se encontró la actividad.', 'NOT_FOUND')
     if (current.status !== 'ACTIVE') throw new ActivityOperationError('Solo se pueden editar actividades activas.', 'INVALID_STATE')
     if (!canEditDemoActivity(current, this.claims)) throw new ActivityOperationError('La actividad ya tiene reclamos; no se puede editar.', 'HAS_CLAIMS')
-    const registeredIds = demoStudents.map(({ student_id }) => student_id)
+    const registeredIds = this.students.map(({ student_id }) => student_id)
     const validationError = validateDemoActivityConfiguration(configuration, registeredIds)
     if (validationError) throw new ActivityOperationError(validationError, 'INVALID_CONFIGURATION')
     const updated: ActivitySession = {
@@ -482,6 +515,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
       participant_student_ids: configuration.participant_mode === 'ALL' ? registeredIds
         : configuration.participant_mode === 'SELECTED' ? [...configuration.selected_student_ids] : [],
     }
+    await this.commit('UPDATE_ACTIVITY' as DemoMutationName, { activities: this.activities.map((activity) => activity.id === id ? updated : activity) })
     this.activities = this.activities.map((activity) => activity.id === id ? updated : activity)
     return cloneActivity(updated)
   }
@@ -494,6 +528,7 @@ export class DemoPanelDataService implements PanelDataService, DemoActivityOpera
     const closedAt = Math.floor(this.clock() / 1000)
     if (!Number.isSafeInteger(closedAt) || closedAt < MIN_VALID_ACTIVITY_EPOCH || closedAt < current.started_at) throw new ActivityOperationError('La hora de cierre no es válida.', 'INVALID_TIME')
     const updated = { ...current, status, closed_at: closedAt }
+    await this.commit('CLOSE_ACTIVITY' as DemoMutationName, { activities: this.activities.map((activity) => activity.id === id ? updated : activity) })
     this.activities = this.activities.map((activity) => activity.id === id ? updated : activity)
     return cloneActivity(updated)
   }

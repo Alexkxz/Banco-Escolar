@@ -25,9 +25,11 @@ LV_IMG_DECLARE(logo_y_nombre);
 #include "network/wifi_manager.h"
 #include "time/time_manager.h"
 #include "storage/storage_manager.h"
+#include "storage/storage_metrics.h"
 #include "storage/activity_storage_manager.h"
 #include "storage/activity_claim_storage_manager.h"
 #include "storage/sd_manager.h"
+#include "diagnostics/terminal_capture.h"
 
 using namespace esp_panel::board;
 
@@ -411,6 +413,15 @@ Pantalla pantalla_actual = PANTALLA_ESPERA;
 Pantalla performance_transition_from = PANTALLA_ESPERA;
 Pantalla performance_transition_to = PANTALLA_ESPERA;
 lv_timer_t *demo_detection_timer = nullptr;
+lv_timer_t *terminal_capture_ui_timer = nullptr;
+lv_obj_t *terminal_capture_previous_screen = nullptr;
+lv_obj_t *terminal_capture_transfer_screen = nullptr;
+lv_obj_t *terminal_capture_status_label = nullptr;
+lv_obj_t *terminal_capture_detail_label = nullptr;
+lv_obj_t *terminal_capture_blocks_label = nullptr;
+lv_obj_t *terminal_capture_percent_label = nullptr;
+lv_obj_t *terminal_capture_progress_bar = nullptr;
+lv_obj_t *terminal_capture_return_button = nullptr;
 uint32_t last_student_activity_ms = 0;
 
 const Student *selected_student = getDemoStudent();
@@ -527,6 +538,8 @@ void wifi_password_cancel_event(lv_event_t *event);
 void wifi_connect_event(lv_event_t *event);
 void wifi_textarea_focus_event(lv_event_t *event);
 void startup_progress_timer_cb(lv_timer_t *timer);
+void terminal_capture_ui_timer_cb(lv_timer_t *timer);
+void terminal_capture_return_event(lv_event_t *event);
 
 #define WIFI_KB_POPOVER(width) (LV_BTNMATRIX_CTRL_POPOVER | (width))
 #define WIFI_KB_ACTION(width) (LV_KEYBOARD_CTRL_BTN_FLAGS | (width))
@@ -806,6 +819,16 @@ void create_boot_splash()
     boot_splash_started_ms = millis();
 }
 
+const char *sd_boot_status_text()
+{
+    switch (sd_boot_status(sd_manager.state())) {
+        case SdBootStatus::CHECKING: return "MicroSD: comprobando";
+        case SdBootStatus::AVAILABLE: return "MicroSD: disponible";
+        case SdBootStatus::UNAVAILABLE: return "MicroSD: no disponible";
+    }
+    return "MicroSD: no disponible";
+}
+
 void update_boot_detail()
 {
     const char *wifi_text = "Wi-Fi: sin conexión";
@@ -819,8 +842,7 @@ void update_boot_detail()
     const char *time_text = time_manager.isSynchronized() ? "Hora: sincronizada" :
                             (wifi_connected && !boot_ntp_fallback_elapsed ?
                                  "Hora: sincronizando" : "Hora: pendiente");
-    const char *sd_text = sd_manager.state() == SdState::SD_NOT_PRESENT ?
-                          "MicroSD: no instalada" : "MicroSD: no disponible";
+    const char *sd_text = sd_boot_status_text();
     const char *nfc_text = PN532_ENABLED ? "NFC: iniciando" : "NFC: deshabilitado";
     char next_text[sizeof(boot_detail_text)];
     snprintf(next_text, sizeof(next_text), "%s       %s\n%s       %s",
@@ -2607,6 +2629,197 @@ void open_activity_claim_event(lv_event_t *event)
     mostrar_pantalla(PANTALLA_ACTIVITY_CLAIM);
 }
 
+void create_terminal_capture_transfer_screen()
+{
+    if (terminal_capture_transfer_screen != nullptr) return;
+
+    terminal_capture_transfer_screen = lv_obj_create(nullptr);
+    if (terminal_capture_transfer_screen == nullptr) return;
+    lv_obj_remove_style_all(terminal_capture_transfer_screen);
+    lv_obj_set_size(terminal_capture_transfer_screen, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(terminal_capture_transfer_screen,
+                              theme_color_hex(theme_palette().background), 0);
+    lv_obj_set_style_bg_opa(terminal_capture_transfer_screen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(terminal_capture_transfer_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *header = lv_obj_create(terminal_capture_transfer_screen);
+    lv_obj_remove_style_all(header);
+    lv_obj_set_size(header, SCREEN_WIDTH, HEADER_HEIGHT);
+    lv_obj_set_style_bg_color(header, lv_color_hex(NAVY), 0);
+    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+    lv_obj_t *title = lv_label_create(header);
+    lv_label_set_text(title, "Capturar por USB");
+    lv_obj_set_style_text_font(title, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(HEADER_TEXT), 0);
+    lv_obj_align(title, LV_ALIGN_LEFT_MID, APP_SPACE_24, 0);
+    lv_obj_t *accent = lv_obj_create(header);
+    lv_obj_remove_style_all(accent);
+    lv_obj_set_size(accent, 5, 44);
+    lv_obj_set_style_bg_color(accent, lv_color_hex(CYAN), 0);
+    lv_obj_set_style_bg_opa(accent, LV_OPA_COVER, 0);
+    lv_obj_align(accent, LV_ALIGN_LEFT_MID, 0, 0);
+
+    lv_obj_t *card = lv_obj_create(terminal_capture_transfer_screen);
+    lv_obj_remove_style_all(card);
+    lv_obj_set_size(card, 700, 270);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, 120);
+    set_panel_style(card, lv_color_hex(theme_palette().surface), 20);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(theme_palette().border), 0);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+
+    terminal_capture_status_label = lv_label_create(card);
+    lv_obj_set_style_text_font(terminal_capture_status_label, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(terminal_capture_status_label,
+                                lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(terminal_capture_status_label, 640);
+    lv_obj_set_style_text_align(terminal_capture_status_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(terminal_capture_status_label, LV_ALIGN_TOP_MID, 0, 24);
+
+    terminal_capture_progress_bar = lv_bar_create(card);
+    lv_obj_set_size(terminal_capture_progress_bar, 600, 28);
+    lv_obj_align(terminal_capture_progress_bar, LV_ALIGN_TOP_MID, 0, 86);
+    lv_bar_set_range(terminal_capture_progress_bar, 0, terminal_capture_ui::TOTAL_BLOCKS);
+    lv_bar_set_value(terminal_capture_progress_bar, 0, LV_ANIM_OFF);
+    lv_obj_set_style_bg_color(terminal_capture_progress_bar,
+                              lv_color_hex(theme_palette().border), LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(terminal_capture_progress_bar, LV_OPA_COVER, LV_PART_MAIN);
+    lv_obj_set_style_radius(terminal_capture_progress_bar, 14, LV_PART_MAIN);
+    lv_obj_set_style_bg_color(terminal_capture_progress_bar, lv_color_hex(BLUE), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_opa(terminal_capture_progress_bar, LV_OPA_COVER, LV_PART_INDICATOR);
+    lv_obj_set_style_radius(terminal_capture_progress_bar, 14, LV_PART_INDICATOR);
+
+    terminal_capture_percent_label = lv_label_create(card);
+    lv_obj_set_style_text_font(terminal_capture_percent_label, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(terminal_capture_percent_label,
+                                lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(terminal_capture_percent_label, LV_ALIGN_TOP_MID, 0, 126);
+
+    terminal_capture_blocks_label = lv_label_create(card);
+    lv_obj_set_style_text_font(terminal_capture_blocks_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(terminal_capture_blocks_label,
+                                lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_align(terminal_capture_blocks_label, LV_ALIGN_TOP_MID, 0, 158);
+
+    terminal_capture_detail_label = lv_label_create(card);
+    lv_obj_set_width(terminal_capture_detail_label, 640);
+    lv_obj_set_style_text_font(terminal_capture_detail_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(terminal_capture_detail_label,
+                                lv_color_hex(theme_palette().secondary_text), 0);
+    lv_obj_set_style_text_align(terminal_capture_detail_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_long_mode(terminal_capture_detail_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(terminal_capture_detail_label, LV_ALIGN_TOP_MID, 0, 198);
+
+    lv_scr_load(terminal_capture_transfer_screen);
+}
+
+void terminal_capture_return_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_CLICKED || terminal_capture_previous_screen == nullptr ||
+        terminal_capture_transfer_screen == nullptr) return;
+    lv_scr_load(terminal_capture_previous_screen);
+    lv_obj_del_async(terminal_capture_transfer_screen);
+    terminal_capture_transfer_screen = nullptr;
+    terminal_capture_previous_screen = nullptr;
+    terminal_capture_status_label = nullptr;
+    terminal_capture_detail_label = nullptr;
+    terminal_capture_blocks_label = nullptr;
+    terminal_capture_percent_label = nullptr;
+    terminal_capture_progress_bar = nullptr;
+    terminal_capture_return_button = nullptr;
+    terminal_capture_ui_dismiss();
+}
+
+void terminal_capture_ui_timer_cb(lv_timer_t *timer)
+{
+    LV_UNUSED(timer);
+    terminal_capture_ui::Snapshot snapshot;
+    if (!terminal_capture_get_ui_snapshot(&snapshot)) return;
+
+    if (terminal_capture_transfer_screen == nullptr) {
+        create_terminal_capture_transfer_screen();
+        if (terminal_capture_transfer_screen == nullptr) return;
+        terminal_capture_ui_view_ready();
+    }
+
+    if (terminal_capture_status_label == nullptr || terminal_capture_progress_bar == nullptr) return;
+    const uint8_t percent = terminal_capture_ui::percent(snapshot.confirmed_blocks);
+    lv_bar_set_value(terminal_capture_progress_bar, snapshot.confirmed_blocks, LV_ANIM_OFF);
+    char text[64];
+    snprintf(text, sizeof(text), "%u%%", static_cast<unsigned>(percent));
+    lv_label_set_text(terminal_capture_percent_label, text);
+    snprintf(text, sizeof(text), "%u de %u bloques confirmados",
+             static_cast<unsigned>(snapshot.confirmed_blocks),
+             static_cast<unsigned>(terminal_capture_ui::TOTAL_BLOCKS));
+    lv_label_set_text(terminal_capture_blocks_label, text);
+
+    const char *status = "Preparando captura";
+    const char *detail = "La imagen de la pantalla está lista.";
+    uint32_t status_color = theme_palette().primary_text;
+    switch (snapshot.state) {
+        case terminal_capture_ui::State::IDLE:
+        case terminal_capture_ui::State::PREPARING:
+            break;
+        case terminal_capture_ui::State::SENDING:
+            status = "Enviando";
+            detail = "El avance cambia cuando la computadora confirma cada bloque.";
+            break;
+        case terminal_capture_ui::State::RETRYING:
+            status = "Reintentando";
+            snprintf(text, sizeof(text), "Reintentando bloque %u de %u (intento %u de %u).",
+                     static_cast<unsigned>(snapshot.expected_sequence + 1U),
+                     static_cast<unsigned>(terminal_capture_ui::TOTAL_BLOCKS),
+                     static_cast<unsigned>(snapshot.retries + 1U),
+                     static_cast<unsigned>(terminal_capture_ui::MAX_RETRIES + 1U));
+            detail = text;
+            status_color = ORANGE;
+            break;
+        case terminal_capture_ui::State::VERIFYING:
+            status = "Verificando";
+            detail = "La computadora comprueba y guarda la imagen recibida.";
+            break;
+        case terminal_capture_ui::State::RECEIVED:
+            status = "Captura recibida";
+            detail = "La imagen fue verificada y guardada en la computadora.";
+            status_color = GREEN;
+            break;
+        case terminal_capture_ui::State::ERROR:
+            status = "Error al enviar";
+            status_color = DANGER;
+            switch (snapshot.error_code) {
+                case 1:
+                case 8:
+                case 9: detail = "No se pudo reservar memoria para preparar la captura."; break;
+                case 3: detail = "La captura de pantalla no terminó a tiempo."; break;
+                case 6: detail = "La computadora no confirmó el bloque esperado."; break;
+                case 10: detail = "No llegó la confirmación de la imagen verificada."; break;
+                default: detail = "La transferencia USB no pudo completarse."; break;
+            }
+            break;
+    }
+    lv_label_set_text(terminal_capture_status_label, status);
+    lv_obj_set_style_text_color(terminal_capture_status_label, lv_color_hex(status_color), 0);
+    lv_label_set_text(terminal_capture_detail_label, detail);
+
+    const bool finished = snapshot.state == terminal_capture_ui::State::RECEIVED ||
+                          snapshot.state == terminal_capture_ui::State::ERROR;
+    if (finished && terminal_capture_return_button == nullptr) {
+        const uint32_t first_new_child = lv_obj_get_child_cnt(terminal_capture_transfer_screen);
+        create_action_back_button(terminal_capture_transfer_screen,
+                                  terminal_capture_return_event, "Volver");
+        terminal_capture_return_button = lv_obj_get_child(terminal_capture_transfer_screen, first_new_child);
+    }
+}
+
+void terminal_capture_button_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) == LV_EVENT_CLICKED) {
+        // Capture is queued; the current display is copied before any status UI changes.
+        lv_obj_t *const current_screen = lv_scr_act();
+        if (terminal_capture_request(true)) terminal_capture_previous_screen = current_screen;
+    }
+}
+
 void master_back_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
@@ -2675,6 +2888,9 @@ void create_master_menu_screen(lv_obj_t *screen)
     lv_obj_set_style_text_font(dev, &banco_escolar_font_16, 0);
     lv_obj_set_style_text_color(dev, lv_color_hex(ORANGE), 0);
     lv_obj_align(dev, LV_ALIGN_RIGHT_MID, -20, 0);
+    create_activity_control_button(status, 400, 14, 170, 44, "Capturar por USB",
+                                   terminal_capture_button_event, 0,
+                                   ButtonVariant::SECONDARY, true);
 
     lv_obj_t *action = lv_obj_create(screen);
     lv_obj_remove_style_all(action);
@@ -4376,29 +4592,21 @@ void create_config_screen(lv_obj_t *screen)
     update_wifi_ui();
 }
 
-void format_storage_size(size_t bytes, char *buffer, size_t buffer_size)
+void format_storage_size(uint64_t bytes, char *buffer, size_t buffer_size)
 {
-    if (bytes < 1024) {
-        snprintf(buffer, buffer_size, "%u bytes", static_cast<unsigned>(bytes));
+    const StorageSizeFormat formatted = storage_size_format(bytes);
+    if (formatted.unit == StorageSizeUnit::BYTES) {
+        snprintf(buffer, buffer_size, "%llu B", static_cast<unsigned long long>(formatted.value));
         return;
     }
 
-    const uint64_t scaled_bytes = static_cast<uint64_t>(bytes);
-    if (bytes < 1024 * 1024) {
-        const uint64_t tenths_kb = (scaled_bytes * 10 + 512) / 1024;
-        snprintf(buffer, buffer_size, "%llu.%llu KB",
-                 static_cast<unsigned long long>(tenths_kb / 10),
-                 static_cast<unsigned long long>(tenths_kb % 10));
-        return;
-    }
-
-    const uint64_t tenths_mb = (scaled_bytes * 10 + (1024 * 1024) / 2) / (1024 * 1024);
-    snprintf(buffer, buffer_size, "%llu.%llu MB",
-             static_cast<unsigned long long>(tenths_mb / 10),
-             static_cast<unsigned long long>(tenths_mb % 10));
+    const char *unit = storage_size_unit_label(formatted.unit);
+    snprintf(buffer, buffer_size, "%llu.%llu %s",
+             static_cast<unsigned long long>(formatted.value / 10ULL),
+             static_cast<unsigned long long>(formatted.value % 10ULL), unit);
 }
 
-uint8_t storage_usage_percent(size_t total, size_t used)
+uint8_t storage_usage_percent(uint64_t total, uint64_t used)
 {
     if (total == 0) return 0;
     const uint64_t safe_used = used > total ? total : used;
@@ -4477,8 +4685,8 @@ lv_obj_t *create_storage_action_button(lv_obj_t *parent, lv_coord_t x, lv_coord_
 
 void create_storage_metric_block(lv_obj_t *screen, lv_coord_t y, const char *title,
                                  const char *state_text, uint32_t state_color,
-                                 bool ready, size_t total, size_t used, size_t free,
-                                 uint32_t accent)
+                                 bool metrics_available, uint64_t total, uint64_t used,
+                                 uint64_t free, const char *const captions[3], uint32_t accent)
 {
     lv_obj_t *card = make_content_panel(screen, 24, y, 752, 124, 0xE8F7FF);
     lv_obj_t *heading = lv_label_create(card);
@@ -4496,8 +4704,7 @@ void create_storage_metric_block(lv_obj_t *screen, lv_coord_t y, const char *tit
     lv_obj_align(state, LV_ALIGN_TOP_RIGHT, -14, 8);
 
     const lv_coord_t columns[] = {16, 260, 504};
-    const char *captions[] = {"TOTAL", "USADO", "LIBRE"};
-    const size_t values[] = {total, used, free};
+    const uint64_t values[] = {total, used, free};
     for (size_t i = 0; i < 3; ++i) {
         lv_obj_t *caption = lv_label_create(card);
         lv_label_set_text(caption, captions[i]);
@@ -4506,8 +4713,8 @@ void create_storage_metric_block(lv_obj_t *screen, lv_coord_t y, const char *tit
         lv_obj_align(caption, LV_ALIGN_TOP_LEFT, columns[i], 34);
 
         char size_text[24];
-        if (ready) format_storage_size(values[i], size_text, sizeof(size_text));
-        else snprintf(size_text, sizeof(size_text), "--");
+        if (metrics_available) format_storage_size(values[i], size_text, sizeof(size_text));
+        else snprintf(size_text, sizeof(size_text), "No disponible");
         lv_obj_t *value = lv_label_create(card);
         lv_label_set_text(value, size_text);
         lv_obj_set_style_text_font(value, &banco_escolar_font_16, 0);
@@ -4517,10 +4724,10 @@ void create_storage_metric_block(lv_obj_t *screen, lv_coord_t y, const char *tit
         lv_obj_align(value, LV_ALIGN_TOP_LEFT, columns[i], 53);
     }
 
-    const uint8_t percent = ready ? storage_usage_percent(total, used) : 0;
-    char percent_text[16];
-    if (ready) snprintf(percent_text, sizeof(percent_text), "%u%%", static_cast<unsigned>(percent));
-    else snprintf(percent_text, sizeof(percent_text), "--");
+    const uint8_t percent = metrics_available ? storage_usage_percent(total, used) : 0;
+    char percent_text[32];
+    if (metrics_available) snprintf(percent_text, sizeof(percent_text), "%u%%", static_cast<unsigned>(percent));
+    else snprintf(percent_text, sizeof(percent_text), "No disponible");
     lv_obj_t *percent_label = lv_label_create(card);
     lv_label_set_text(percent_label, percent_text);
     lv_obj_set_style_text_font(percent_label, &banco_escolar_font_16, 0);
@@ -4537,16 +4744,16 @@ void create_storage_metric_block(lv_obj_t *screen, lv_coord_t y, const char *tit
     lv_obj_set_style_radius(bar, 9, LV_PART_MAIN);
     lv_obj_set_style_radius(bar, 9, LV_PART_INDICATOR);
     lv_obj_align(bar, LV_ALIGN_TOP_LEFT, 16, 91);
-    if (!ready || total == 0) lv_obj_add_state(bar, LV_STATE_DISABLED);
+    if (!metrics_available || total == 0) lv_obj_add_state(bar, LV_STATE_DISABLED);
 }
 
 const char *sd_state_label(SdState state)
 {
     switch (state) {
-        case SdState::SD_NOT_PRESENT: return "Estado: No instalada";
+        case SdState::SD_NOT_PRESENT: return "Estado: No detectada";
         case SdState::SD_MOUNTING: return "Estado: Preparando";
         case SdState::SD_READY: return "Estado: Disponible";
-        case SdState::SD_ERROR: return "Estado: No disponible";
+        case SdState::SD_ERROR: return "Estado: Error de montaje/lectura";
     }
     return "Estado: No disponible";
 }
@@ -4564,6 +4771,7 @@ void create_storage_screen(lv_obj_t *screen)
     create_wifi_page_header(screen, "ALMACENAMIENTO LOCAL");
 
     const bool internal_ready = storage_manager.isReady();
+    const char *internal_captions[] = {"TOTAL", "USADO", "LIBRE"};
     create_storage_metric_block(screen, 94, "MEMORIA INTERNA",
         internal_ready ? "Estado: Disponible" : "Estado: No disponible",
         internal_ready ? GREEN : ORANGE,
@@ -4571,20 +4779,43 @@ void create_storage_screen(lv_obj_t *screen)
         internal_ready ? storage_manager.getTotalBytes() : 0,
         internal_ready ? storage_manager.getUsedBytes() : 0,
         internal_ready ? storage_manager.getFreeBytes() : 0,
-        BLUE);
+        internal_captions, BLUE);
 
     const SdState sd_state = sd_manager.state();
     const bool sd_ready = sd_manager.isReady();
+    char sd_status[96];
+    if (sd_state == SdState::SD_ERROR || sd_state == SdState::SD_NOT_PRESENT) {
+        snprintf(sd_status, sizeof(sd_status), "%s: %s", sd_state_label(sd_state), sd_manager.errorName());
+    } else {
+        snprintf(sd_status, sizeof(sd_status), "%s", sd_state_label(sd_state));
+    }
+    const bool sd_stats_available = sd_ready && sd_manager.filesystemStatsAvailable();
+    const char *sd_captions[] = {"FS TOTAL", "FS USADO", "FS LIBRE"};
     create_storage_metric_block(screen, 226, "TARJETA MICROSD",
-        sd_state_label(sd_state), sd_state_color(sd_state), sd_ready,
-        sd_ready ? sd_manager.totalBytes() : 0,
-        sd_ready ? sd_manager.usedBytes() : 0,
-        sd_ready ? sd_manager.freeBytes() : 0,
-        PURPLE);
+        sd_status, sd_state_color(sd_state), sd_stats_available,
+        sd_manager.totalBytes(), sd_manager.usedBytes(), sd_manager.freeBytes(),
+        sd_captions, PURPLE);
+
+    const uint64_t capacity_bytes = sd_manager.cardCapacityBytes();
+    char sd_capacity[32] = "No disponible";
+    if (capacity_bytes > 0) format_storage_size(capacity_bytes, sd_capacity, sizeof(sd_capacity));
+    char root_entries[32] = "No disponible";
+    if (sd_ready) snprintf(root_entries, sizeof(root_entries), "%u",
+                           static_cast<unsigned>(sd_manager.rootEntryCount()));
+    char sd_details[128];
+    snprintf(sd_details, sizeof(sd_details), "Tarjeta: %s | Capacidad tarjeta: %s | Elementos en raíz: %s",
+             sd_manager.cardTypeName(), sd_capacity, root_entries);
+    lv_obj_t *sd_details_label = lv_label_create(screen);
+    lv_label_set_text(sd_details_label, sd_details);
+    lv_obj_set_style_text_font(sd_details_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(sd_details_label, lv_color_hex(MUTED), 0);
+    lv_obj_set_width(sd_details_label, 752);
+    lv_label_set_long_mode(sd_details_label, LV_LABEL_LONG_DOT);
+    lv_obj_align(sd_details_label, LV_ALIGN_TOP_LEFT, 24, 355);
 
     lv_obj_t *description = lv_label_create(screen);
     lv_label_set_text(description, storage_status_message != nullptr ? storage_status_message :
-        (internal_ready ? "El almacenamiento local conserva datos aunque el equipo se reinicie." :
+        (internal_ready ? "MicroSD comprobada en solo lectura y desmontada; LittleFS conserva los datos locales." :
                           "Almacenamiento interno no disponible"));
     lv_obj_set_style_text_font(description, &lv_font_montserrat_14, 0);
     const uint32_t description_color = storage_status_message != nullptr ?
@@ -4592,7 +4823,7 @@ void create_storage_screen(lv_obj_t *screen)
     lv_obj_set_style_text_color(description, lv_color_hex(description_color), 0);
     lv_obj_set_width(description, 752);
     lv_label_set_long_mode(description, LV_LABEL_LONG_DOT);
-    lv_obj_align(description, LV_ALIGN_TOP_LEFT, 24, 357);
+    lv_obj_align(description, LV_ALIGN_TOP_LEFT, 24, 377);
 
     create_storage_action_button(screen, 620, 416, 156, 48, "ELIMINAR DATOS",
                                  storage_delete_event, 0xFBEAF2, DANGER, internal_ready,
@@ -6413,14 +6644,12 @@ void startup_progress_timer_cb(lv_timer_t *timer)
             set_boot_progress(76, "Wi-Fi conectado");
             if (time_manager.isSynchronized()) {
                 set_boot_progress(82, "Hora sincronizada");
-                set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
-                                      "MicroSD: No instalada" : "MicroSD no disponible");
+                set_boot_progress(85, sd_boot_status_text());
                 boot_wifi_resolved = true;
             } else if (now - boot_wifi_connected_ms >= BOOT_NTP_WAIT_MS) {
                 boot_ntp_fallback_elapsed = true;
                 set_boot_progress(82, "Hora: pendiente; continuando");
-                set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
-                                      "MicroSD: No instalada" : "MicroSD no disponible");
+                set_boot_progress(85, sd_boot_status_text());
                 boot_wifi_resolved = true;
             } else {
                 set_boot_progress(82, "Sincronizando hora...");
@@ -6429,8 +6658,7 @@ void startup_progress_timer_cb(lv_timer_t *timer)
                    connection_timeout) {
             set_boot_progress(76, "Wi-Fi no disponible; continuando");
             set_boot_progress(82, "Hora: pendiente; continuando");
-            set_boot_progress(85, sd_manager.state() == SdState::SD_NOT_PRESENT ?
-                                  "MicroSD: No instalada" : "MicroSD no disponible");
+            set_boot_progress(85, sd_boot_status_text());
             boot_wifi_resolved = true;
         }
     }
@@ -6555,6 +6783,13 @@ void setup()
     esp_lv_adapter_unlock();
     if (boot_progress_timer == nullptr) halt_on_error();
 
+    if (esp_lv_adapter_lock(-1) != ESP_OK) halt_on_error();
+    const bool capture_timer_ready = terminal_capture_init();
+    terminal_capture_ui_timer = lv_timer_create(terminal_capture_ui_timer_cb, 100, nullptr);
+    esp_lv_adapter_unlock();
+    if (!capture_timer_ready || terminal_capture_ui_timer == nullptr)
+        Serial.println("[DIAG1] No se pudieron crear los temporizadores de captura");
+
     if (!PN532_ENABLED) {
         nfc_set_state(NFC_NO_DEVICE);
         Serial.println("[PN532] Deshabilitado temporalmente");
@@ -6562,8 +6797,11 @@ void setup()
     wifi_manager.begin();
     boot_wifi_started_ms = millis();
     set_boot_progress(50, "Servicio Wi-Fi iniciado");
-    sd_manager.begin(); // No GPIO, mount, or filesystem access until the physical SD is available.
-    set_boot_progress(56, "MicroSD: comprobando disponibilidad");
+    auto *io_expander = board != nullptr && board->getIO_Expander() != nullptr
+        ? board->getIO_Expander()->getBase() : nullptr;
+    set_boot_progress(56, "MicroSD: comprobando");
+    sd_manager.begin(io_expander); // Reuses the CH422G initialized by Board::begin().
+    set_boot_progress(56, sd_boot_status_text());
     const bool storage_ready = storage_manager.begin(); // Storage errors are non-fatal; continue to the UI.
     activity_claim_startup_result = storage_ready
         ? activity_claim_storage_manager.begin() : ActivityClaimStorageResult::NOT_READY;
@@ -6584,6 +6822,7 @@ void setup()
 
 void loop()
 {
+    terminal_capture_poll();
     wifi_manager.update();
     time_manager.update(wifi_manager.isConnected());
     const bool synchronized = time_manager.isSynchronized();

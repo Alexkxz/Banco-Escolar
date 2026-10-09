@@ -31,7 +31,7 @@ export function ActivitiesPage({ service = demoPanelService }: { service?: DemoS
 
   return <>
     <PageHeader eyebrow="GESTIÓN · DEMOSTRACIÓN" title="Actividades" description="Consulta y administra sesiones temporales de demostración." />
-    <div className="dashboard-demo-note" role="note">Los cambios se conservan solo en memoria durante esta navegación, se pierden al recargar y no se envían a la terminal.</div>
+    <div className="dashboard-demo-note" role="note">Los cambios demo se guardan localmente en este navegador; no se sincronizan con otras computadoras ni se envían a la terminal.</div>
     {state.status === 'loading' && <Card className="directory-state" role="status"><span className="status-dot" />Cargando actividades…</Card>}
     {state.status === 'error' && <Card className="directory-state directory-error" role="alert"><div><strong>No se pudieron consultar las actividades.</strong><p>El error de consulta no se presenta como una colección vacía.</p></div><button className="button button-primary" onClick={() => setAttempt((value) => value + 1)}>Reintentar</button></Card>}
     {state.status === 'ready' && state.activities.length === 0 && <Card><EmptyState title="No hay actividades de demostración" description="La consulta terminó correctamente y no devolvió actividades." icon={Activity} /></Card>}

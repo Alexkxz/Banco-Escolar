@@ -1,10 +1,14 @@
-﻿# Banco Escolar · Panel Maestro
+# Banco Escolar · Panel Maestro
 
 Aplicación web independiente del firmware. PM.1 estableció la base React, TypeScript, Vite, React Router y el proveedor demo. PM.2 desarrolla el layout administrativo, navegación visual y páginas preparadas sin conectar API ni datos reales.
 
-PM.7A agrega ajustes de saldo solo en memoria y en el servicio de demostración. Consulta [alcance, límites y verificaciones de PM.7A](../docs/PANEL_MAESTRO_PM7A.md). La revisión visual con navegador y capturas nuevas sigue pendiente; las pruebas automatizadas no equivalen a validación visual.
+PM.7A agrega ajustes de saldo al servicio demo; desde PM.9B sus cambios se conservan localmente por IndexedDB. Consulta [alcance, límites y verificaciones de PM.7A](../docs/PANEL_MAESTRO_PM7A.md). La revisión visual con navegador y capturas nuevas sigue pendiente; las pruebas automatizadas no equivalen a validación visual.
 
-PM.8 activa consultas y capturas/correcciones demo de progreso académico y asistencia, reglas escolares versionadas y aplicaciones separadas de Áureos. Progreso incluye subpestañas de resumen, fluidez lectora, dictado y comprensión con filtros compartidos, gráficas y tablas accesibles. Las operaciones se pierden al recargar y no se sincronizan. Consulta [PANEL_MAESTRO_PM8.md](../docs/PANEL_MAESTRO_PM8.md). Se comprobó responsive con Chrome headless; queda pendiente la inspección visual de las gráficas con evaluaciones registradas y la revisión de teclado.
+PM.8 activa consultas y capturas/correcciones demo de progreso académico y asistencia, reglas escolares versionadas y aplicaciones separadas de Áureos. Progreso incluye subpestañas de resumen, fluidez lectora, dictado y comprensión con filtros compartidos, gráficas y tablas accesibles. Desde PM.9B las operaciones se conservan en IndexedDB local; no se sincronizan. Consulta [PANEL_MAESTRO_PM8.md](../docs/PANEL_MAESTRO_PM8.md). Se comprobó responsive con Chrome headless; queda pendiente la inspección visual de las gráficas con evaluaciones registradas y la revisión de teclado.
+
+PM.9A define el diseño y PM.9B implementa IndexedDB solo para la demostración, con seed único, guardado de operaciones e imágenes Blob. El espacio real no se abre. Consulta [PM.9A](../docs/PANEL_MAESTRO_PM9A.md) y el estado/verificaciones de [PM.9B](../docs/PANEL_MAESTRO_PM9B.md). La validación nativa de IndexedDB de PM.9B está aprobada; detalle en [PM.9B](../docs/PANEL_MAESTRO_PM9B.md).
+
+PM.9C agrega descarga y restauración de respaldos versionados con datos y fotos, validación completa previa, confirmación de copia de seguridad reciente y reemplazo atómico solo del espacio demo seleccionado. La prueba Chromium/IndexedDB nativo, resultados, límites y pendientes están en [PANEL_MAESTRO_PM9C.md](../docs/PANEL_MAESTRO_PM9C.md).
 
 ## Tecnologías
 
@@ -27,9 +31,9 @@ src/
   models/      tipos de cliente orientativos; no son contratos de API
   pages/       Dashboard visual y módulos preparados
   services/    frontera de lectura, consultas y proveedor demo
-  students/    imágenes temporales en memoria para perfiles demo
+  students/    fotos demo cargadas como Blob; previews con URL temporal
   styles/      tokens de tema y estilos responsive
- tests/         navegación, tema, estados y aislamiento demo
+ tests/         navegación, tema, estados, fotos e aislamiento demo
 ```
 
 ## Desarrollo y validación
@@ -49,12 +53,12 @@ El layout conserva sidebar, encabezado y contenido al navegar. En escritorio el 
 
 El Dashboard consume `PanelDataService`. El proveedor local presenta un conjunto determinista de datos ficticios y solo lectura; calcula alumnos, suma de saldos de cuentas, actividades activas y movimientos totales, y lista los cinco movimientos más recientes. Alumnos añade un directorio filtrable y perfiles por ID con la misma colección. Cuentas presenta saldos directos, alumnos sin cuenta y un historial disponible por cuenta sin reconstruir su saldo. Movimientos permite consulta, filtros y detalle, y mantiene relaciones solo cuando existen en los claims demo. Dashboard, cuentas y movimientos presentan fechas con `America/Mexico_City`; los timestamps almacenados permanecen intactos. Se separan carga, colección vacía, error y filtros sin coincidencias. Ningún módulo realiza operaciones monetarias o sincroniza datos. Los otros módulos conservan preparación y estado vacío. Las rutas inexistentes presentan una vista 404.
 
-Los perfiles usan iniciales y color determinista. El control excepcional de imagen acepta PNG/JPEG hasta 5 MiB después de revisar MIME, firma y decodificación. Las imágenes elegidas solo viven en memoria, asociadas a `student_id`; desaparecen al recargar y no se envían a la terminal. Las URLs temporales se liberan al reemplazarlas, quitarlas o desmontar el proveedor.
+Los perfiles usan iniciales y color determinista. El control excepcional de imagen acepta PNG/JPEG hasta 5 MiB después de revisar MIME, firma y decodificación. Las imágenes se guardan como Blob en IndexedDB, asociadas a `student_id`; las URLs de preview son temporales y no se envían a la terminal. Las URLs temporales se liberan al reemplazarlas, quitarlas o desmontar el proveedor.
 
 La marca usa el logo original de `Imagenes/Logo y nombre.png`; el recurso se importa sin alterar el original. Los iconos SVG proceden de una biblioteca pequeña única.
 
 ## Límites y fases futuras
 
-El proveedor `DemoPanelDataService` sirve colecciones ficticias y no lee ni escribe datos del firmware. No existe API, base central, autenticación, operaciones escolares, movimiento monetario, sincronización, Service Worker ni funcionamiento offline garantizado. Los tipos del directorio `models/` tampoco definen contratos de servidor. El estado ACTIVE/INACTIVE de los estudiantes es solo de la demo; no existe en el modelo actual del firmware.
+El proveedor `DemoPanelDataService` sirve colecciones ficticias y no lee ni escribe datos del firmware. PM.9B persiste en IndexedDB solo los datos demo. No existe API, base central, autenticación ni sincronización. No hay Service Worker ni funcionamiento offline garantizado. Los tipos de `models/` tampoco definen contratos de servidor. El estado ACTIVE/INACTIVE de estudiantes es solo de la demo; no existe en el modelo actual del firmware.
 
-PM.2 documenta el diseño base en [PANEL_MAESTRO_PM2.md](../docs/PANEL_MAESTRO_PM2.md); PM.3 documenta el Dashboard demo en [PANEL_MAESTRO_PM3.md](../docs/PANEL_MAESTRO_PM3.md); PM.4 documenta directorio, perfiles e imagen temporal en [PANEL_MAESTRO_PM4.md](../docs/PANEL_MAESTRO_PM4.md); PM.5 documenta consultas de cuenta y movimiento en [PANEL_MAESTRO_PM5.md](../docs/PANEL_MAESTRO_PM5.md); PM.6 documenta actividades de demostración en [PANEL_MAESTRO_PM6.md](../docs/PANEL_MAESTRO_PM6.md). Las actividades se mutan solo en memoria, usan la hora de la computadora y no se sincronizan con la terminal.
+PM.2 documenta el diseño base en [PANEL_MAESTRO_PM2.md](../docs/PANEL_MAESTRO_PM2.md); PM.3 documenta el Dashboard demo en [PANEL_MAESTRO_PM3.md](../docs/PANEL_MAESTRO_PM3.md); PM.4 documenta directorio, perfiles e imagen temporal en [PANEL_MAESTRO_PM4.md](../docs/PANEL_MAESTRO_PM4.md); PM.5 documenta consultas de cuenta y movimiento en [PANEL_MAESTRO_PM5.md](../docs/PANEL_MAESTRO_PM5.md); PM.6 documenta actividades de demostración en [PANEL_MAESTRO_PM6.md](../docs/PANEL_MAESTRO_PM6.md). Las actividades se guardan localmente en IndexedDB, usan la hora de la computadora y no se sincronizan con la terminal.

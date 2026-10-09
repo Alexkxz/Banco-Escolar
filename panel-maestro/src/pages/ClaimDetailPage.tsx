@@ -60,7 +60,7 @@ export function ClaimDetailPage({ service = demoPanelService as DetailService, n
     try {
       if (intent === 'void') {
         const result = await service.voidPaidClaim(entry.claim.id, reason)
-        setNotice(`Anulación registrada en memoria. Saldo actual: ${result.balance.toLocaleString('es-MX')} Áureos.`)
+        setNotice(`Anulación guardada localmente en modo demostración. Saldo actual: ${result.balance.toLocaleString('es-MX')} Áureos.`)
         setReason(''); setIntent(null); setAttempt((value) => value + 1)
       } else if (intent === 'authorize') {
         await service.authorizeRepeatClaim(entry.claim.id)
@@ -78,7 +78,7 @@ export function ClaimDetailPage({ service = demoPanelService as DetailService, n
 
   return <>
     <PageHeader eyebrow="GESTIÓN · DEMOSTRACIÓN" title="Detalle de cobro" description={`Reclamo, referencias y operaciones ficticias · ${PANEL_TIME_ZONE}.`} />
-    <div className="dashboard-demo-note" role="note">Las anulaciones, autorizaciones y nuevos cobros viven solo en memoria y se pierden al recargar. No se envían a la terminal ni representan acciones de un usuario autenticado.</div>
+    <div className="dashboard-demo-note" role="note">Las anulaciones, autorizaciones y nuevos cobros se guardan localmente en este navegador. No se sincronizan con otras computadoras ni se envían a la terminal; tampoco representan acciones de un usuario autenticado.</div>
     {state.status === 'loading' && <Card className="directory-state" role="status"><span className="status-dot" />Cargando cobro…</Card>}
     {state.status === 'error' && <Card className="directory-state directory-error" role="alert"><div><strong>No se pudo consultar el cobro.</strong><p>El error no se interpreta como un registro inexistente.</p></div><button className="button button-primary" onClick={() => setAttempt((value) => value + 1)}>Reintentar</button></Card>}
     {state.status === 'ready' && !entry && <Card><EmptyState title="Cobro inexistente" description="No se encontró un cobro con ese ID en la demostración." icon={TicketCheck} action={<Link className="button button-secondary" to="/cobros">Regresar a cobros</Link>} /></Card>}

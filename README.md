@@ -2,10 +2,9 @@
 
 Banco Escolar es una terminal educativa para primaria basada en la pantalla
 Waveshare ESP32-S3-Touch-LCD-7. El firmware ofrece interfaz LVGL, datos
-académicos provisionales y conectividad local; el Panel del Maestro y la
-sincronización siguen en el roadmap. El Panel Maestro futuro será una PWA
-multiplataforma y offline-first, con arranque sin Internet después de una carga
-previa y sincronización posterior mediante API.
+académicos provisionales, cuentas/movimientos locales y gestión local de
+actividades/cobros. El Panel Maestro implementa PM.9C: persistencia IndexedDB y respaldo/restauración versionados solo para el espacio demo.
+Backend, autenticación y sincronización continúan pendientes. La validación con Chromium e IndexedDB nativo está aprobada; consulta [resultados de PM.9C](docs/PANEL_MAESTRO_PM9C.md).
 
 ## Hardware y estado
 
@@ -17,14 +16,15 @@ previa y sincronización posterior mediante API.
 - PN532 está deshabilitado (`PN532_ENABLED=false`) y desconectado. No conectar
   hasta verificar pines, alimentación y niveles lógicos de la placa lectora.
 
-El saldo físico conocido de prueba para Darío (`student_id=7`) es 130 Áureos,
-con cinco movimientos persistidos tras probar una entrada de +10 (movimiento
-ID 5). No hardcodees ese saldo: es estado del dispositivo, no valor inicial.
+Una prueba física histórica validó movimientos y persistencia tras reinicio.
+Los nombres, IDs y saldos de esa sesión no se incluyen aquí ni deben
+hardcodearse; el firmware debe tomar los valores del almacenamiento vigente.
 
-La entrada `MENÚ MAESTRO DEV` y el borrador de actividad son temporales. `5E.1`
-no persiste ni inicia actividades; `5E.2` sigue futura. Consulta
-[`docs/CHAT_HANDOFF.md`](docs/CHAT_HANDOFF.md) para el estado completo y el orden
-de continuación. No se ha validado físicamente el pulido 5E.1B.
+La entrada `MENÚ MAESTRO DEV` es de desarrollo. ActivitySession y
+ActivityClaim están implementadas; su validación física sigue pendiente.
+DIAG.1 se probó con comando USB y botón; el receptor validó ambos BMP.
+La ranura microSD se sondea en solo lectura. Consulta
+[`docs/CHAT_HANDOFF.md`](docs/CHAT_HANDOFF.md) para resultados y límites.
 
 ## Compilar
 
@@ -40,6 +40,7 @@ sustituye una prueba física. No cargar firmware sin autorización explícita.
 ## Documentación
 
 - Arquitectura y estado: [`docs/FUTURE_ARCHITECTURE.md`](docs/FUTURE_ARCHITECTURE.md)
+- Persistencia local del Panel (diseño PM.9A, no implementado): [`docs/PANEL_MAESTRO_PM9A.md`](docs/PANEL_MAESTRO_PM9A.md)
 - Skill del proyecto: [`.agents/skills/banco-escolar/SKILL.md`](.agents/skills/banco-escolar/SKILL.md)
 - Reglas persistentes para Codex: [`AGENTS.md`](AGENTS.md)
 

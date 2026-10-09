@@ -24,7 +24,7 @@ export function ClaimsPage({ service = demoPanelService }: { service?: ClaimQuer
 
   return <>
     <PageHeader eyebrow="GESTIÓN · DEMOSTRACIÓN" title="Cobros" description="Consulta de reclamos y acciones temporales de demostración." />
-    <div className="dashboard-demo-note" role="note">Datos ficticios. Anulaciones, autorizaciones y nuevos cobros se conservan solo en memoria, se pierden al recargar y no se envían a la terminal. Fechas en {PANEL_TIME_ZONE}.</div>
+    <div className="dashboard-demo-note" role="note">Datos ficticios. Las anulaciones, autorizaciones y nuevos cobros se guardan en este navegador; no se sincronizan ni se envían a la terminal. Fechas en {PANEL_TIME_ZONE}.</div>
     {state.status === 'loading' && <Card className="directory-state" role="status"><span className="status-dot" />Cargando cobros…</Card>}
     {state.status === 'error' && <Card className="directory-state directory-error" role="alert"><div><strong>No se pudieron consultar los cobros.</strong><p>El error de consulta no se interpreta como una colección vacía.</p></div><button className="button button-primary" onClick={() => setAttempt((value) => value + 1)}>Reintentar</button></Card>}
     {state.status === 'ready' && state.entries.length === 0 && <Card><EmptyState title="Sin cobros registrados" description="La consulta terminó correctamente y no devolvió reclamos." icon={TicketCheck} /></Card>}

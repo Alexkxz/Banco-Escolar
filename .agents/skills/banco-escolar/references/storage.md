@@ -39,7 +39,13 @@ La Fase 5D reutiliza `applyAccountMovement()` y `/data/pending_transaction.json`
 
 ## microSD
 
-`SDManager` es un placeholder. El usuario reporta una microSD de 64 GB instalada, pero el firmware no intenta detectar ni montar la tarjeta; se decidió omitir microSD por ahora y no incluirla en las siguientes fases inmediatas.
+`SDManager` diagnostica la ranura TF integrada de Waveshare con acceso de solo lectura. Reutiliza el `esp_expander::Base` inicializado por `Board::begin()` y usa SPI MOSI 11, SCK 12 y MISO 13. El controlador local `sd_diskio_external_cs.cpp` recibe un callback con esa instancia y selecciona EXIO4 en bajo durante cada operación SD; no usa un GPIO ficticio. Deja EXIO4 alto entre transacciones y lo baja antes de esperar/responder. Intenta montar `/sdcard` con `format_if_empty=false` explícito. Un montaje correcto permite informar tipo/capacidad, enumerar la raíz y desmontar antes de retornar. No se abren archivos para escritura ni se ejecutan operaciones de reparación o formato.
+
+La copia local conserva la implementación Arduino-ESP32 3.1.1, cambiando el almacenamiento y las operaciones del CS. La selección/deselección usa `SdExternalChipSelect`; fallo al activar, liberar o esperar respuesta deja el dispositivo marcado con error. La operación de escritura del controlador local devuelve `RES_WRPRT` para mantener este sondeo en solo lectura incluso si se solicita escribir desde FAT. `tools/storage/check_sd_external_cs.py` verifica la secuencia de callback, su limpieza ante timeout, la ausencia de llamadas GPIO para CS, escritura bloqueada y montaje sin formato. La validación física de esta versión registró arranque completo, ausencia de `Invalid pin: 255` y montaje/listado/desmontaje de una SDHC; este resultado no sustituye una nueva validación si el controlador vuelve a cambiar.
+
+El código distingue un tipo de tarjeta no reconocido/sin respuesta (`SD_NOT_PRESENT`) de tarjeta reconocida cuyo montaje FAT falla (`SD_ERROR`, `FILESYSTEM_MOUNT_FAILED`). `SD_READY` significa que el montaje de diagnóstico, la lectura de la raíz y el desmontaje terminaron bien; no significa que la tarjeta permanezca montada. La interfaz muestra estado, error, tipo, capacidad física y cantidad de entradas de la raíz. `totalBytes()/usedBytes()/freeBytes()` describen el volumen FAT cuando `f_getfree` da datos.
+
+Requisito de formato documentado por el demo oficial de Waveshare: FAT32. No se valida físicamente la tarjeta ni se concluye que toda tarjeta de 64 GB necesite reformateo. Si falla el montaje, se informa el error y se deja intacta. La validación de BUILD y las pruebas sintéticas no sustituyen una prueba con tarjeta real.
 
 ## Almacenamiento offline futuro
 

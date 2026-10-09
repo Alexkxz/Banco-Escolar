@@ -32,7 +32,7 @@ export function AttendancePage({ service = demoPanelService as DemoPanelDataServ
     {state.status === 'loading' && <Card role="status">Cargando asistencia…</Card>}
     {state.status === 'error' && <Card role="alert"><strong>No se pudo consultar asistencia.</strong><p>El error no se considera una colección vacía.</p><Button variant="primary" onClick={reload}>Reintentar</Button></Card>}
     {state.status === 'ready' && <>
-      <Card className="school-demo-note"><strong>Modo demostración · {PANEL_TIME_ZONE}</strong><span>Registros, reglas y aplicaciones permanecen en memoria, se pierden al recargar y no se envían a la terminal. “Sin registrar” no se convierte automáticamente en falta. La llegada registra la hora local actual del computador, no una lectura NFC.</span></Card>
+      <Card className="school-demo-note"><strong>Modo demostración · {PANEL_TIME_ZONE}</strong><span>Registros, reglas y aplicaciones se guardan en este navegador; no se sincronizan con la terminal. “Sin registrar” no se convierte automáticamente en falta. La llegada registra la hora local actual del computador, no una lectura NFC.</span></Card>
       <Card className="school-filter-card"><div className="section-header"><div><h2>Lista del día escolar</h2><p>{recordsForDate.length} de {state.students.length} alumnos con registro</p></div><label className="school-date-filter">Fecha escolar<input type="date" value={date} onChange={(event) => setDate(event.target.value)} /></label></div>
         {notice && <p className="school-success" role="status">{notice}</p>}
         <div className="attendance-list">{state.students.map((student) => {
