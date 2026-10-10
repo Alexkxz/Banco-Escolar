@@ -638,11 +638,24 @@ DRESULT ff_sd_read(uint8_t pdrv, uint8_t *buffer, DWORD sector, UINT count) {
 }
 
 DRESULT ff_sd_write(uint8_t pdrv, const uint8_t *buffer, DWORD sector, UINT count) {
-  (void)pdrv;
-  (void)buffer;
-  (void)sector;
-  (void)count;
-  return RES_WRPRT;
+  if (pdrv >= FF_VOLUMES || s_cards[pdrv] == NULL) {
+    return RES_NOTRDY;
+  }
+  ardu_sdcard_t *card = s_cards[pdrv];
+  if (card->status & STA_NOINIT) {
+    return RES_NOTRDY;
+  }
+  DRESULT res = RES_OK;
+  AcquireSPI lock(card);
+  if (count > 1) {
+    res = sdWriteSectors(pdrv, (const char *)buffer, sector, count) ? RES_OK : RES_ERROR;
+  } else if (count == 1) {
+    res = sdWriteSector(pdrv, (const char *)buffer, sector) ? RES_OK : RES_ERROR;
+  } else {
+    return RES_PARERR;
+  }
+  if (card->cs_error) res = RES_ERROR;
+  return res;
 }
 
 DRESULT ff_sd_ioctl(uint8_t pdrv, uint8_t cmd, void *buff) {

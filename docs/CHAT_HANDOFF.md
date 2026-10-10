@@ -1,11 +1,39 @@
 # Banco Escolar — Handoff
 
+## Paquete local del Panel para microSD (2026-10-10)
+
+- El build `panel-maestro` tiene una variante `npm run build:sd` que usa base `/panel-test/maestro/` y `HashRouter`; el build habitual no cambia y conserva `BrowserRouter`. La navegación por fragmento evita depender de fallback de rutas en el servidor HTTP de archivos.
+- `py ..\tools\web\prepare_panel_sd_package.py` (desde `panel-maestro/`) valida las dependencias Vite y referencias locales HTML/CSS y prepara `panel-maestro/package-sd/`. `manifest.json` lista cada archivo con ruta, bytes y SHA-256. La salida intermedia está en `dist-sd/`.
+- Cuando el usuario confirme que ESP32 y pantalla están disponibles y se autorice la prueba física, apagar la terminal y copiar solo `package-sd/panel-test/` al FAT de prueba para que quede `panel-test/maestro/`. Conservar intactos los archivos de muestra en `panel-test/`; no copiar el manifiesto como contenido de aplicación. URL prevista con IP actual: `/panel-test/maestro/index.html#/dashboard`.
+- Preparar el paquete no lo escribe a la tarjeta ni prueba que la ESP32 sirva los archivos. El servidor sigue siendo solo lectura y sin API escolar. Panel usa IndexedDB/proveedor demo del navegador; no se conectaron datos reales ni se añadieron login, PIN, saldos, movimientos, sincronización o actualización Wi-Fi. Las instrucciones están en `tools/web/README.md`.
+
+## Servidor HTTP de archivos de prueba (2026-10-09)
+
+- `src/network/panel_http_server.*` implementa un servidor HTTP integrado de solo lectura en puerto 80; su atención corre en el ciclo principal y no usa acciones de pantalla/touch. `GET /` sirve `/sdcard/panel-test/index.html`, `/status` devuelve `sd_mounted` y la versión de `panel-test/version.txt`. `GET`/`HEAD` de recursos admitidos se transmiten por bloques de 1 KiB.
+- Las rutas de archivo quedan bajo `panel-test/`; faltante responde 404, ruta no válida 400, microSD no montada 503 y otros métodos 405. No hay endpoint de escritura, borrado, login, PIN, movimientos, saldos, sincronización ni instalación de Panel. Los archivos de ejemplo para preparar una tarjeta en otra fase están bajo `tools/web/sample_sd/panel-test/`; no se escribió la tarjeta durante la implementación.
+- `SDManager::streamFile()` añade lectura callback por bloques con búfer fijo de 1 KiB y no llama recuperación de temporales, que puede cambiar FAT; la API previa `readFile()` sigue limitada a un buffer completo máximo 256 KiB y no se usa para servir páginas. Pasaron 6 pruebas locales de contrato en `tools/web/test_panel_http_contract.py`, `tools/storage/check_sd_external_cs.py` y BUILD final de `esp32-s3-devkitc-1`: SUCCESS, RAM 132,036/327,680 (40.3 %), Flash 2,048,800/6,553,600 (31.3 %), sin warnings observados. Las pruebas de contrato verifican el mapeo de errores y restricciones por inspección de fuente; el build no confirma lectura FAT ni tráfico HTTP en dispositivo.
+- Riesgo/límite: esta prueba usa HTTP en claro y no autentica; mantenerla solo en LAN confiable durante validación. Falta probar físicamente conexión al router, `/`, `/status`, HTML/CSS/JS/SVG, 404/400/503/405, tarjeta retirada y tamaños grandes. No sirve el Panel real ni crea la API escolar PM.10A.
+- Preparada `tools/web/test_panel_http_live.py`: exige la IP explícita, valida `/`, `/status`, descarga byte por byte un SVG, archivo faltante 404, ruta inválida 400 y POST vacío 405; no usa credenciales ni escribe SD. `tools/web/README.md` explica cómo copiar `sample_sd/panel-test/` a la raíz FAT, consultar la IP actual y ejecutar desde la misma LAN. Pasaron 7 pruebas locales: seis regresiones estáticas del contrato de firmware y la prueba del cliente HTTP contra un fixture loopback temporal. No equivalen a validar la ESP32.
+- No se usó ni cerró ningún proceso de servidor externo y no se creó sesión de automatización; no se cargó firmware ni se escribió la microSD.
+
+## Actualización microSD (2026-10-09)
+
+- `SDManager::begin()` monta FAT en `/sdcard` con formato automático desactivado y mantiene el volumen montado hasta `unmount()`. El controlador externo EXIO4 ahora permite escritura de sectores por el mismo callback SPI.
+- API local: existencia, tamaño, lectura binaria (máximo 256 KiB), listado (máximo 128 entradas), creación de directorio, escritura/reemplazo y eliminación. Las rutas son relativas ASCII y rechazan traversal, caracteres de control y sufijos `.tmp`/`.bak` internos.
+- Escrituras usan temporal, `fflush`/`fsync`/`fclose`, respaldo `.bak` y renombrado. En la siguiente operación de existencia/tamaño/lectura/escritura/eliminación sobre esa ruta, el gestor restaura el respaldo si falta el destino o limpia el respaldo si el destino nuevo ya está instalado. El formateo sigue cerrado.
+- Alcance limitado al controlador y almacenamiento local. No se agregó servidor web, API de red ni actualización del Panel por Wi-Fi. No se escribieron archivos en la microSD física ni se ejecutó Upload.
+- Verificación local: `tools/storage/check_sd_external_cs.py` pasó; pruebas existentes de DIAG.1, 23/23; BUILD `esp32-s3-devkitc-1` SUCCESS, RAM 131,668/327,680 (40.2 %), Flash 2,002,920/6,553,600 (30.6 %), sin warnings de compilación observados. La validación física de escritura, reemplazo, interrupción, falta de espacio, lectura y desmontaje sigue pendiente.
+- Rama `main`; al iniciar la tarea había cambios locales de DIAG.1, documentación y artefactos sin seguimiento. Se conservaron.
+
 ## Estado actual comprobado (2026-10-08)
 
-- Firmware implementa 5E.2–5E.4, DIAG.1 y diagnóstico de solo lectura de microSD. El BUILD no sustituye validaciones físicas; las capturas por comando y botón, el arranque y el sondeo SD quedaron verificados en las entradas fechadas correspondientes.
+- Firmware implementa 5E.2–5E.4, DIAG.1 y API local de archivos microSD. El BUILD no sustituye validaciones físicas; las capturas DIAG.1 y el sondeo SD histórico quedaron verificados en las entradas fechadas correspondientes. La nueva escritura FAT aún no tiene validación física.
 - Panel Maestro PM.9B conserva datos e imágenes ficticios en IndexedDB. PM.9C agrega respaldo/restauración JSON versionada, validación previa completa y reemplazo transaccional. El 08/10/2026 pasaron Vitest (13 archivos/83 pruebas), Chromium Playwright con IndexedDB nativo (incluye abort transaccional, cancelación, doble confirmación, invalidación por revisión, integridad de fotos y cierre/reapertura de un perfil aislado), build y `git diff --check`. La inspección visual de Configuración en escritorio y 390/320 px, ambos temas y foco por teclado quedó aprobada. Las capturas permanecen locales porque muestran valores de configuración escolar. Pendientes PM.9C: cuota/límite máximo, cierre abrupto/energía y confirmar que el usuario conserve el archivo descargado. Detalle: [PANEL_MAESTRO_PM9C.md](PANEL_MAESTRO_PM9C.md).
 - PM.9A documenta el diseño; PM.9B y PM.9C están implementadas en la demo local. El espacio real no se abre ni se crea. Los avisos de chunk y pendientes del navegador se detallan en PM.9C.
 - DIAG.1 está implementada y probada físicamente por comando y por el botón; el BMP recibido cumplió dimensiones, formato y checksum BED1. Ver [TERMINAL_DIAG1_CAPTURAS.md](TERMINAL_DIAG1_CAPTURAS.md). Los archivos de imagen físicos no se incluyen en este documento.
+- Actualización DIAG.1 (2026-10-09): receptor corregido para re-ACK del duplicado final, NAK de ID incorrecto a la captura activa y emitir métricas monotónicas JSON con `--metrics`; 17/17 pruebas y BUILD `esp32-s3-devkitc-1` SUCCESS (RAM 102,988; Flash 1,998,952). Medición física por comando a 115,200 en CH343 COM3: 694.672 s META→END, 698.969 s total y 1,105.558 bytes/s efectivos; BMP/CRC/VERIFIED validados. Artefactos solo en `%LOCALAPPDATA%\BancoEscolar-DIAG1-Baseline`. Sin Upload, Commit ni Push. Siguiente ensayo pendiente: 460,800 baudios, bloques de 1,024 y ACK por bloque.
+- Ensayo 460800 autorizado (2026-10-09): Upload normal SUCCESS con hashes verificados. Tres capturas por el mismo CH343, todas END/CRC/BMP/VERIFIED correctas: META→END 692.297, 693.860 y 692.656 s; caudales 1,109.350, 1,106.852 y 1,108.775 B/s. 750 bloques, 768,000 bytes y 750 ACK escritos en cada una; 0 NAK/duplicados/fallos. Artefactos preservados en `%LOCALAPPDATA%\BancoEscolar-DIAG1-460800`. BUILD SUCCESS (RAM 102,988; Flash 1,998,984), pruebas 18/18. Detalle: [TERMINAL_DIAG1_CAPTURAS.md](TERMINAL_DIAG1_CAPTURAS.md).
+- DIAG.1 4 KiB a 460800 cargado y medido en tres capturas por CH343 COM3. META→END: 550.609, 549.671 y 550.703 s; media 550.328 s. Las tres verificaron 188 bloques/768,000 bytes, BMP 800×480, END/CRC y VERIFIED. El intento 1 tuvo 1 NAK/reintento recuperado; los otros dos, ninguno. Comparado con la media previa 1 KiB (692.938 s), el tiempo medido fue 20.580 % menor y el caudal medio por intento 1,395.533 B/s frente a 1,108.326 B/s. BUILD previo SUCCESS (RAM 107,588; Flash 1,999,884), suite 23/23. Artefactos JSON/BMP fuera del repositorio. Detalle por intento y ACK host/firmware en [TERMINAL_DIAG1_CAPTURAS.md](TERMINAL_DIAG1_CAPTURAS.md).
 
 Los apartados posteriores que describen fases parciales son antecedentes históricos; el estado vigente es esta sección y los cierres fechados más recientes.
 ## Objetivo del proyecto
@@ -16,7 +44,7 @@ Terminal educativa local para primaria sobre Waveshare ESP32-S3-Touch-LCD-7. El 
 
 - Waveshare ESP32-S3-Touch-LCD-7 Rev 1.2; LCD RGB ST7262 800×480, touch GT911, expansor CH422G.
 - Flash física reportada: 16 MB; PSRAM física reportada: 8 MB. No cambies RGB, PSRAM, GT911/I²C0 o buffers por warnings sin una fase de diagnóstico.
-- La ranura microSD integrada se sondea en solo lectura mediante SPI GPIO11/MOSI, GPIO12/SCK, GPIO13/MISO y EXIO4 del CH422G. El montaje tiene formato automático desactivado; el arranque físico confirmó detección, lectura de tipo/capacidad, listado de raíz y desmontaje. No se escriben ni reparan archivos.
+- La ranura microSD integrada usa SPI GPIO11/MOSI, GPIO12/SCK, GPIO13/MISO y EXIO4 del CH422G. El montaje persistente tiene formato automático desactivado. El sondeo de solo lectura anterior se validó físicamente; las operaciones de escritura recién habilitadas no se han probado en tarjeta.
 - PN532 está desconectado y `PN532_ENABLED=false`. El uso futuro por I²C1 GPIO43/44 requiere una fase explícita y confirmar cableado, alimentación y niveles.
 
 ## Software
@@ -24,7 +52,7 @@ Terminal educativa local para primaria sobre Waveshare ESP32-S3-Touch-LCD-7. El 
 - PlatformIO, C++17, Arduino-ESP32 3.1.1, LVGL 8.4.0 y ESP32 Display Panel.
 - `src/main.cpp`: UI, callbacks, temporizadores y flujo principal.
 - `src/storage/storage_manager.*`: LittleFS, movimientos, cuentas y recuperación transaccional.
-- `src/storage/sd_manager.*`: diagnóstico de solo lectura de microSD; ver el cierre fechado más reciente abajo.
+- `src/storage/sd_manager.*`: montaje persistente y API local de archivos microSD; la validación de escritura física sigue pendiente.
 - `src/data/provisional_data.*`: datos provisionales de alumnos y registros académicos.
 - `lib/lvgl/src/draw/sw/lv_draw_sw_layer.c`: parche local para comprobar `lv_mem_alloc()` antes de inicializar la capa; revisarlo si se actualiza LVGL.
 
@@ -53,7 +81,7 @@ Validación física histórica: se revisaron movimientos de entrada/salida y rec
 - `/data/pending_transaction.json`: journal de recuperación para movimiento más saldo.
 - NVS namespace `bank_storage`; `next_mv_id` se reserva antes de escribir y los IDs no se reutilizan. `clearLocalData()` conserva NVS y el contador.
 - Prueba controlada de corte de energía aún pendiente. No ejecutar durante este cierre.
-- La microSD se sondea por separado y no forma parte del almacenamiento persistente de LittleFS. La prueba documentada monta solo para leer y desmonta al terminar.
+- La microSD se mantiene montada como volumen de archivos independiente de LittleFS. La escritura genérica FAT ya está habilitada; no implica API de red, sincronización, ni cambiar la fuente primaria de operaciones escolares de LittleFS.
 
 ## UI
 
@@ -110,7 +138,7 @@ Nota: las funciones PM implementadas en `panel-maestro/` son de demostración lo
 - **5E.1B:** pulido visual y glifos compilados; pendiente de validación física final en LIGHT/DARK. “Más logros próximamente” queda pendiente tipográfico fuera de la pantalla Logros que 5E.1B prohibió modificar.
 - **Wi-Fi:** se observaron reconexiones repetidas aunque la aplicación continuaba; diagnóstico separado pendiente, no bloqueante.
 - **Energía:** falta prueba controlada de corte durante una transacción.
-- **microSD:** la ranura integrada se detectó físicamente con CS externo EXIO4 y el sondeo de solo lectura terminó correctamente. No se ha validado la pantalla local de almacenamiento tras los últimos cambios de capacidad; no escribir, reparar ni formatear la tarjeta.
+- **microSD:** el sondeo con CS externo EXIO4 se detectó físicamente en la versión de solo lectura. El controlador actual monta persistentemente y habilita API FAT local sin formato; faltan pruebas físicas de sus operaciones de archivo. No probar sobre los datos existentes de la tarjeta.
 - Los datos académicos, Logros y varias vistas siguen siendo provisionales/demo; mantener `N/A` distinto de cero y respetar los umbrales actuales.
 
 ## Próximas fases
@@ -123,11 +151,11 @@ Orden recomendado, distinguiendo implementación de validación:
 4. 5E.3: validar físicamente múltiples actividades activas simultáneamente.
 5. 5E.4: validar físicamente ActivityClaim, deduplicación y motor monetario.
 6. 5E.5: integración NFC de alumno y tarjeta maestra, únicamente con autorización y cableado seguro.
-7. Después: backend/sincronización, asistencia y logros; el sondeo microSD queda limitado a lectura.
+7. Validar físicamente el servidor HTTP de archivos de prueba usando los recursos `tools/web/sample_sd/panel-test/`; luego continuar la API PM.10A, sincronización, asistencia y logros. El servidor actual no es la API escolar ni el actualizador del Panel.
 
 ## Reglas críticas de desarrollo
 
-- Mantener el sondeo microSD en solo lectura; no escribir, reparar ni formatear.
+- No formatear ni reparar automáticamente la microSD. Usar las funciones de escritura solo con autorización y archivos de prueba desechables durante validación física.
 - No activar PN532 sin hardware conectado y validación de alimentación/cableado.
 - No cambiar GT911/I²C0, RGB, PSRAM o buffers sin evidencia y fase de diagnóstico.
 - No cambiar casualmente el parche LVGL ni usar scale en tarjetas grandes.
@@ -294,3 +322,7 @@ Limitaciones observadas antes de corregir el splash: durante el acceso SPI apare
 - Tras el reset automatico se identifico de nuevo el mismo COM3. Registro serie unico a 115200 desde `POWERON` hasta `Sistema listo`. No aparecio `Invalid pin: 255` ni `IO 255`. El sondeo leyo SDHC de 62,568,529,920 bytes, enumero `System Volume Information` (1 entrada), desmontó y mostro `MicroSD: disponible`. No hubo operaciones de escritura sobre la tarjeta.
 - El arranque conserva los avisos conocidos `Unable to initialize the I2C address` de GT911 y `invalid frame buffer number` / `Get RGB buffer failed`; el touch configuro ID y version, y la interfaz completo el arranque. No se atribuyen ni modifican aqui esos avisos.
 - La lectura serie informo `SERIAL_CLOSED`; el proceso de PlatformIO finalizo. No se hizo otra captura ni se hizo Commit o Push.
+
+### PM.10A - vinculacion Panel-terminal (decisiones actualizadas)
+
+PM.10A propone que la propia ESP32-S3 aloje API y sirva Panel desde microSD a equipos del mismo router Wi-Fi; nube opcional para backup/remoto. Primera version: una terminal. Si pierde Wi-Fi conserva cola durable y reenvia mismos IDs con ACK idempotente. A futuro, varias terminales usaran coordinador local y transacciones; valorar PC/mini PC si capacidad lo requiere. Estado: existe HTTP solo lectura para archivos de prueba `panel-test/` y `/status`; aún no hay API escolar ni se sirve el Panel real. Escritura FAT está en código, pendiente de validación física; el servidor no tiene rutas de escritura. La actualización del Panel por Wi-Fi será independiente de cargar firmware desde computadora. Pendientes: validar HTTP/SD en equipo, seguridad LAN, capacidad/desgaste SD, rollback ante corte de energía y restauración. Ver [PANEL_MAESTRO_PM10A.md](PANEL_MAESTRO_PM10A.md).

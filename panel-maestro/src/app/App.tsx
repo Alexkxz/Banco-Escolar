@@ -1,5 +1,5 @@
 import { Suspense, lazy, useEffect, useState } from 'react'
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { BrowserRouter, HashRouter, Navigate, Route, Routes } from 'react-router-dom'
 import { AppLayout } from '../layouts/AppLayout'
 import { DevelopmentHome } from '../pages/DevelopmentHome'
 import { PlaceholderPage } from '../pages/PlaceholderPage'
@@ -22,6 +22,7 @@ import { PanelStorageError } from '../services/demoPersistence'
 import { StudentPhotoProvider } from '../students/StudentPhotoContext'
 
 const SchoolConfigurationPage = lazy(() => import('../pages/SchoolConfigurationPage').then(({ SchoolConfigurationPage: page }) => ({ default: page })))
+const PanelRouter = import.meta.env.MODE === 'sd' ? HashRouter : BrowserRouter
 
 export function App() {
   const [storage, setStorage] = useState<{ status: 'loading' } | { status: 'ready' } | { status: 'error'; error: PanelStorageError }>({ status: 'loading' })
@@ -43,7 +44,7 @@ export function App() {
   }, [])
   if (storage.status === 'loading') return <StorageStatus title="Abriendo almacenamiento local" detail="El Panel espera a IndexedDB antes de cargar o aceptar cambios." />
   if (storage.status === 'error') return <StorageFailure error={storage.error} retry={() => setAttempt((value) => value + 1)} />
-  return <>{backupRestoreNotice && <div className="backup-restore-global-notice" role="status">{backupRestoreNotice}</div>}<BrowserRouter key={backupRestoreKey}><StudentPhotoProvider><AppRoutes /></StudentPhotoProvider></BrowserRouter></>
+  return <>{backupRestoreNotice && <div className="backup-restore-global-notice" role="status">{backupRestoreNotice}</div>}<PanelRouter key={backupRestoreKey}><StudentPhotoProvider><AppRoutes /></StudentPhotoProvider></PanelRouter></>
 }
 
 function StorageStatus({ title, detail }: { title: string; detail: string }) { return <main className="storage-gate" role="status"><h1>{title}</h1><p>{detail}</p></main> }

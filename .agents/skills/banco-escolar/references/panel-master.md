@@ -19,14 +19,13 @@ La UI futura debe mostrar “Sin conexión” y número de cambios pendientes. A
 ## Capas y fuente de verdad
 
 ```text
-Terminal ESP32 ↔ API ↔ Servidor / Data Service ↔ Base de datos central
-                 ↕
-          Panel Maestro PWA
+Terminal ESP32 <-> API/servicio central <-> Panel Maestro PWA
+   autoridad           replica y cola          cache/vistas
 ```
 
-Hoy LittleFS es almacenamiento persistente de la terminal. Cuando exista servidor, la base central será fuente de verdad global; ambos clientes conservarán caché, cola y estado de sincronización. La PWA y el ESP32 no accederán directamente a la base central. La arquitectura puede crecer hacia nube/remoto sin fijar aún tecnologías.
+Decision PM.10A: primeras versiones con una ESP32-S3 como centro local; ella alojara la API y servira archivos del Panel desde microSD a maestros en el mismo router Wi-Fi. Nube es opcional para backup/acceso remoto. Terminal sigue como fuente primaria. LittleFS conserva cola durable si pierde Wi-Fi. Panel actualiza cache tras eventos confirmados. IndexedDB demo y sus IDs ficticios quedan aislados; se conserva `student_id` terminal. Esto sigue siendo futuro para la API y el Panel real: el servidor HTTP actual solo sirve archivos de prueba desde SD y /status, sin autenticacion ni escritura HTTP. Escritura FAT existe localmente en codigo, pero falta validacion fisica.
 
-La API futura será responsable de autenticación, autorización, recepción de movimientos, consultas, sincronización, control de duplicados, validaciones y resolución de conflictos. Inicialmente habrá acceso protegido para un administrador/docente principal; podrán añadirse maestros, roles, permisos, grupos y escuelas después.
+La API alojada inicialmente en la ESP32 autentica maestros/dispositivos, mantiene comandos pendientes y deduplica por `operation_id`. Terminal reintenta mismo ID/payload hasta ACK durable; ID/payload repetido devuelve ACK anterior y mismo ID con payload distinto se rechaza. Panel crea comandos autorizados; cambios se aplican cuando terminal confirma. Al crecer a varias terminales, un coordinador local (ESP32 designada o computadora/mini PC) ordena y valida en transacciones; saldos no se sobrescriben. El firmware aún no tiene esa API ni sirve la build real del Panel. Sí existe un servidor HTTP temporal de solo lectura para archivos de prueba en `panel-test/` y `/status`; todavía no hay escritura por HTTP. Clientes no acceden directamente a la base.
 
 ## Movimientos y sincronización
 
@@ -57,6 +56,10 @@ No se define todavía el diseño visual exacto ni se implementa login o pantalla
 ## Exportaciones y respaldos
 
 Se prevén CSV y Excel desde Panel/servidor; PDF después si se requiere. El ESP32 no leerá Excel. Respaldos futuros: datos locales de la terminal en LittleFS, base central con backups periódicos y microSD como respaldo local opcional. Estos mecanismos no se implementan en esta fase.
+
+## Paquete estático local para microSD
+
+`npm run build:sd` genera una variante estática bajo `/panel-test/maestro/` y usa `HashRouter` para que el servidor existente no necesite fallback de rutas. `tools/web/prepare_panel_sd_package.py` verifica el manifiesto Vite y rutas locales HTML/CSS, copia el árbol a `panel-maestro/package-sd/` y genera tamaños y SHA-256 por archivo. Sigue siendo el Panel demo con IndexedDB en el navegador. El paquete no está instalado en la tarjeta ni validado en la ESP32; no añade API, login, movimientos ni sincronización.
 
 ## Fases
 

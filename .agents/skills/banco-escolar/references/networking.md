@@ -21,3 +21,9 @@ Las constantes de `src/main.cpp` establecen duración mínima de splash de 6000 
 Panel Maestro PWA y ESP32 deberán conservar operación local válida cuando falte Internet y sincronizar mediante API al recuperar acceso. Distingue Internet, conexión Wi-Fi y disponibilidad de API: un servidor en LAN puede ser accesible sin Internet. La primera apertura de la PWA requiere descargar recursos; el arranque offline posterior se prevé mediante Service Worker. Nada de esto está implementado aún.
 
 La API futura intermedia consultas y movimientos de ambos clientes con el servidor/base de datos; asumirá autenticación, autorización, validación, deduplicación y resolución de conflictos. No se elige framework ni protocolo final. Consulta [panel-master.md](panel-master.md) para el flujo local → pendiente → envío → confirmación → sincronizado.
+
+### Servidor HTTP microSD de prueba
+
+`PanelHttpServer` en `src/network/` ya usa `WebServer` del core Arduino en el puerto 80 para lectura estática de `panel-test/` desde FAT. `GET /` abre la página de ejemplo; `/status` informa montaje SD y versión de la página. No requiere conectividad a Internet, pero sí que el dispositivo y el navegador compartan LAN Wi-Fi. El ciclo principal atiende HTTP sin usar la UI táctil. Las lecturas salen por bloques de 1 KiB y el flujo HTTP evita las funciones SD que recuperan/eliminan temporales. No hay rutas para modificar archivos.
+
+Este servidor es una prueba local sin autenticación ni TLS; no publicar en una red no confiable ni exponer al Internet. Todavía no es API del Panel Maestro, ni sirve su build real, ni permite subir/actualizar archivos. Requiere prueba física antes de considerarse verificado en hardware. Ver [PM.10A](../../../../docs/PANEL_MAESTRO_PM10A.md) y los recursos para tarjeta en `tools/web/sample_sd/`.

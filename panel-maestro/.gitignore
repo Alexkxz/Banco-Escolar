@@ -1,3 +1,5 @@
 node_modules/
 dist/
+dist-sd/
+package-sd/
 *.tsbuildinfo

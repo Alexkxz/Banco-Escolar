@@ -11,6 +11,7 @@ constexpr uint16_t TOTAL_BLOCKS = static_cast<uint16_t>(
     (diag_capture::IMAGE_BYTES + diag_capture::MAX_FRAME_PAYLOAD - 1U) /
     diag_capture::MAX_FRAME_PAYLOAD);
 constexpr uint8_t MAX_RETRIES = 3;
+static_assert(TOTAL_BLOCKS <= UINT16_MAX, "DIAG.1 sequence must fit in BED1 header");
 
 enum class State : uint8_t {
     IDLE,
@@ -80,16 +81,16 @@ constexpr State TEST_SUCCESS_SEQUENCE[] = {
 constexpr State TEST_ERROR_SEQUENCE[] = {
     State::IDLE, State::PREPARING, State::ERROR, State::IDLE,
 };
-static_assert(TOTAL_BLOCKS == 750, "DIAG.1 screen progress must cover 750 blocks");
+static_assert(TOTAL_BLOCKS == 188, "DIAG.1 screen progress must cover 188 blocks");
 static_assert(valid_sequence(TEST_SUCCESS_SEQUENCE), "DIAG.1 success states are out of order");
 static_assert(valid_sequence(TEST_ERROR_SEQUENCE), "DIAG.1 error states are out of order");
 static_assert(!transition_allowed(State::SENDING, State::RECEIVED),
               "DIAG.1 must verify before showing receipt success");
-static_assert(progress_is_monotonic(0, 1) && progress_is_monotonic(749, 750),
+static_assert(progress_is_monotonic(0, 1) && progress_is_monotonic(187, 188),
               "DIAG.1 acknowledged progress should be monotonic");
-static_assert(!progress_is_monotonic(10, 9) && !progress_is_monotonic(750, 751),
+static_assert(!progress_is_monotonic(10, 9) && !progress_is_monotonic(188, 189),
               "DIAG.1 progress must not decrease or exceed 750 blocks");
-static_assert(percent(0) == 0 && percent(375) == 50 && percent(749) == 99 && percent(750) == 100,
+static_assert(percent(0) == 0 && percent(94) == 50 && percent(187) == 99 && percent(188) == 100,
               "DIAG.1 percentage calculation is incorrect");
 
 } // namespace terminal_capture_ui

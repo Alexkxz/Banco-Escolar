@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "build:sd": "tsc -b && vite build --mode sd",
     "preview": "vite preview",
     "test": "vitest run",
     "test:browser": "node scripts/pm9b-browser-test.mjs",

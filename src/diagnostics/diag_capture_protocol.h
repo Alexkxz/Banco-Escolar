@@ -6,8 +6,9 @@
 namespace diag_capture {
 
 constexpr uint8_t PROTOCOL_VERSION = 1;
+constexpr uint32_t SERIAL_BAUD_RATE = 460800;
 constexpr uint16_t HEADER_SIZE = 32;
-constexpr uint32_t MAX_FRAME_PAYLOAD = 1024;
+constexpr uint32_t MAX_FRAME_PAYLOAD = 4096;
 constexpr uint32_t IMAGE_WIDTH = 800;
 constexpr uint32_t IMAGE_HEIGHT = 480;
 constexpr uint32_t IMAGE_BYTES = IMAGE_WIDTH * IMAGE_HEIGHT * 2;

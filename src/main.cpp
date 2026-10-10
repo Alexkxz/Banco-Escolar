@@ -23,6 +23,7 @@ LV_IMG_DECLARE(logo_y_nombre);
 #include "student_model.h"
 #include "activity_session.h"
 #include "network/wifi_manager.h"
+#include "network/panel_http_server.h"
 #include "time/time_manager.h"
 #include "storage/storage_manager.h"
 #include "storage/storage_metrics.h"
@@ -34,6 +35,8 @@ LV_IMG_DECLARE(logo_y_nombre);
 using namespace esp_panel::board;
 
 namespace {
+// Keep this aligned with platformio.ini monitor_speed and the DIAG.1 receiver.
+constexpr uint32_t SERIAL_BAUD_RATE = diag_capture::SERIAL_BAUD_RATE;
 constexpr int SCREEN_WIDTH = 800;
 constexpr int SCREEN_HEIGHT = 480;
 constexpr lv_coord_t GRID_MARGIN = 18;
@@ -4753,6 +4756,7 @@ const char *sd_state_label(SdState state)
         case SdState::SD_NOT_PRESENT: return "Estado: No detectada";
         case SdState::SD_MOUNTING: return "Estado: Preparando";
         case SdState::SD_READY: return "Estado: Disponible";
+        case SdState::SD_UNMOUNTED: return "Estado: Desmontada";
         case SdState::SD_ERROR: return "Estado: Error de montaje/lectura";
     }
     return "Estado: No disponible";
@@ -6754,11 +6758,13 @@ int32_t getStudentBalance()
 
 void setup()
 {
-    Serial.begin(115200);
+    Serial.begin(SERIAL_BAUD_RATE);
     Serial.println("================================");
     Serial.println("BANCO ESCOLAR");
     Serial.println("Sistema iniciado");
-    Serial.println("Serial: 115200 baudios");
+    Serial.print("Serial: ");
+    Serial.print(SERIAL_BAUD_RATE);
+    Serial.println(" baudios");
     Serial.println("================================");
     set_boot_progress(5, "Consola serial iniciada");
     time_manager.begin();
@@ -6801,6 +6807,7 @@ void setup()
         ? board->getIO_Expander()->getBase() : nullptr;
     set_boot_progress(56, "MicroSD: comprobando");
     sd_manager.begin(io_expander); // Reuses the CH422G initialized by Board::begin().
+    panel_http_server.begin();
     set_boot_progress(56, sd_boot_status_text());
     const bool storage_ready = storage_manager.begin(); // Storage errors are non-fatal; continue to the UI.
     activity_claim_startup_result = storage_ready
@@ -6824,6 +6831,7 @@ void loop()
 {
     terminal_capture_poll();
     wifi_manager.update();
+    panel_http_server.update();
     time_manager.update(wifi_manager.isConnected());
     const bool synchronized = time_manager.isSynchronized();
     if (synchronized && !ui_time_synchronized) {

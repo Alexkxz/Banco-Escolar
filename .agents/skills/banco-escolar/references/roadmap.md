@@ -43,14 +43,14 @@
 | 11 | Integración académica | FUTURO |
 | 12 | Gráficas y análisis | FUTURO |
 | 13 | Logros y recompensas | FUTURO |
-| 14 | microSD | FUTURO |
+| 14 | microSD (API local FAT) | IMPLEMENTADA; validación física pendiente |
 | 15 | Respaldos | FUTURO |
 | 16 | Exportaciones | FUTURO |
 | 17 | Administración avanzada | FUTURO |
 | 18 | BLE solo si existe caso de uso | FUTURO |
 | 19 | OTA | FUTURO |
 
-La fase 0S.3 quedó cerrada con el commit estable en GitHub. Las fases 5A.4–5A.7 quedaron validadas: LittleFS conserva los movimientos 1–3 y su conteo tras reinicio, y la UI resuelve el nombre del alumno desde el `student_id` persistido. La vista 5B.1 del historial real fue validada físicamente; es de solo lectura, no altera el esquema y no reconstruye saldo. El pulido 5B.1B se integró en 5B.1C. Las fases visuales 5B.1C–5B.1F fueron validadas físicamente; el bloque visual 5B.1 queda cerrado con Inicio, Mi cuenta e Historial coordinados, encabezado común, logos del splash y del encabezado, fecha/hora y Salir. `synced=false` permanece porque no existe servidor ni sincronización operativa. La fase 6 define sincronización; el Panel PWA 1.0 es 7, su integración con ESP32 es 7.1 y la operación offline completa es 7.2. Consulta [panel-master.md](panel-master.md) antes de esos trabajos.
+La fase 0S.3 quedó cerrada con el commit estable en GitHub. Las fases 5A.4–5A.7 quedaron validadas: LittleFS conserva los movimientos 1–3 y su conteo tras reinicio, y la UI resuelve el nombre del alumno desde el `student_id` persistido. La vista 5B.1 del historial real fue validada físicamente; es de solo lectura, no altera el esquema y no reconstruye saldo. El pulido 5B.1B se integró en 5B.1C. Las fases visuales 5B.1C–5B.1F fueron validadas físicamente; el bloque visual 5B.1 queda cerrado con Inicio, Mi cuenta e Historial coordinados, encabezado común, logos del splash y del encabezado, fecha/hora y Salir. `synced=false` permanece porque no existe API escolar ni sincronización operativa (el servidor HTTP de archivos de prueba no procesa movimientos). La fase 6 define sincronización; el Panel PWA 1.0 es 7, su integración con ESP32 es 7.1 y la operación offline completa es 7.2. Consulta [panel-master.md](panel-master.md) antes de esos trabajos.
 
 La Fase 5B.2 implementa filtros temporales y conteos de entradas, salidas y pendientes sobre los movimientos reales cargados para el alumno. Es de solo lectura, no reconstruye saldo ni modifica el modelo o el almacenamiento; fue validada físicamente.
 

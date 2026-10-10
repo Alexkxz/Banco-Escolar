@@ -2,6 +2,9 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <vector>
+
+#include <WString.h>
 
 namespace esp_expander {
 class Base;
@@ -11,6 +14,7 @@ enum class SdState : uint8_t {
     SD_NOT_PRESENT,
     SD_MOUNTING,
     SD_READY,
+    SD_UNMOUNTED,
     SD_ERROR
 };
 
@@ -25,6 +29,7 @@ constexpr SdBootStatus sd_boot_status(SdState state)
     switch (state) {
         case SdState::SD_MOUNTING: return SdBootStatus::CHECKING;
         case SdState::SD_READY: return SdBootStatus::AVAILABLE;
+        case SdState::SD_UNMOUNTED:
         case SdState::SD_NOT_PRESENT:
         case SdState::SD_ERROR: return SdBootStatus::UNAVAILABLE;
     }
@@ -36,6 +41,7 @@ static_assert(sd_boot_status(SdState::SD_MOUNTING) == SdBootStatus::CHECKING,
 static_assert(sd_boot_status(SdState::SD_READY) == SdBootStatus::AVAILABLE,
               "A successful SD probe must be shown as available");
 static_assert(sd_boot_status(SdState::SD_NOT_PRESENT) == SdBootStatus::UNAVAILABLE &&
+              sd_boot_status(SdState::SD_UNMOUNTED) == SdBootStatus::UNAVAILABLE &&
               sd_boot_status(SdState::SD_ERROR) == SdBootStatus::UNAVAILABLE,
               "Missing or failed SD probes must be shown as unavailable");
 
@@ -54,7 +60,44 @@ enum class SdError : uint8_t {
     SPI_DRIVER_FAILED,
     CARD_NOT_RESPONDING,
     FILESYSTEM_MOUNT_FAILED,
-    ROOT_READ_FAILED
+    ROOT_READ_FAILED,
+    UNMOUNT_FAILED
+};
+
+enum class SdFileError : uint8_t {
+    NONE,
+    NOT_MOUNTED,
+    INVALID_PATH,
+    NOT_FOUND,
+    ALREADY_EXISTS,
+    NOT_DIRECTORY,
+    IS_DIRECTORY,
+    RESOURCE_LIMIT,
+    NO_SPACE,
+    READ_FAILED,
+    WRITE_FAILED,
+    CLOSE_FAILED,
+    LIST_FAILED,
+    CREATE_DIRECTORY_FAILED,
+    REMOVE_FAILED,
+    RENAME_FAILED
+};
+
+struct SdFileResult {
+    SdFileError error = SdFileError::NONE;
+    int system_error = 0;
+    bool ok() const { return error == SdFileError::NONE; }
+};
+
+using SdStreamCallback = bool (*)(void *context, const uint8_t *data, size_t length);
+using SdStreamStartCallback = bool (*)(void *context, uint64_t file_size_bytes);
+
+const char *sd_file_error_name(SdFileError error);
+
+struct SdFileInfo {
+    String name;
+    bool is_directory = false;
+    uint64_t size_bytes = 0;
 };
 
 constexpr SdState sd_state_after_mount_failure(SdCardType card_type)
@@ -91,9 +134,29 @@ public:
     uint64_t usedBytes() const;
     uint64_t freeBytes() const;
 
+    // File paths are relative to /sdcard and may not contain traversal or
+    // transaction-reserved .tmp/.bak suffixes.
+    SdFileResult fileExists(const char *path, bool &exists);
+    SdFileResult fileSize(const char *path, uint64_t &size_bytes);
+    SdFileResult readFile(const char *path, std::vector<uint8_t> &contents);
+    // Reads a file with a fixed-size buffer and forwards chunks to the callback.
+    SdFileResult streamFile(const char *path, SdStreamStartCallback on_start,
+                            SdStreamCallback on_chunk, void *context, bool headers_only,
+                            uint64_t &file_size_bytes, uint64_t &bytes_streamed);
+    SdFileResult listDirectory(const char *path, std::vector<SdFileInfo> &entries);
+    SdFileResult createDirectory(const char *path);
+    SdFileResult writeFile(const char *path, const uint8_t *data, size_t length,
+                           bool replace = true);
+    SdFileResult writeFile(const char *path, const String &contents,
+                           bool replace = true);
+    SdFileResult removeFile(const char *path);
+
 private:
     bool listRoot();
     bool releaseBus();
+    bool initializeBus();
+    SdFileResult validateAndBuildPath(const char *path, String &full_path) const;
+    SdFileResult recoverWrite(const String &full_path);
 
     SdState state_ = SdState::SD_NOT_PRESENT;
     SdError error_ = SdError::NONE;

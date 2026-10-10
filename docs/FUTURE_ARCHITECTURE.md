@@ -19,6 +19,13 @@ física se indica por separado y no se deduce de compilar.
 - PM.9A conserva el diseño que precedió a la implementación; ver
   [PM.9A](PANEL_MAESTRO_PM9A.md), [PM.9B](PANEL_MAESTRO_PM9B.md) y
   [PM.9C](PANEL_MAESTRO_PM9C.md).
+- PM.10A propone que la ESP32-S3 aloje la API local y sirva los archivos del
+  Panel desde microSD a equipos conectados al mismo router Wi-Fi. La nube es
+  opcional para respaldo/acceso remoto. Primera versión para una terminal;
+  conserva sus IDs y mantiene cola durable al perder Wi-Fi. Los IDs ficticios
+  demo quedan aislados. La SD hoy solo se monta/lee y FAT bloquea escrituras;
+  API, servidor web y actualización de archivos siguen futuros. Ver
+  [PM.10A](PANEL_MAESTRO_PM10A.md).
 - DIAG.1 implementa captura de `flush_cb`, protocolo USB BED1 v1 y receptor
   Windows. Se validaron físicamente comando y botón, y ambos BMP cumplieron
   formato/dimensiones/checksum. Pruebas prolongadas de capturas repetidas no
@@ -127,7 +134,12 @@ de alcance**). No se implementan todavía múltiples maestros, roles ni permisos
   Linux y tablets; instalación PWA cuando la plataforma lo permita.
 - **FUTURO:** una interfaz responsive con menú lateral en escritorio y compacto
   en móvil; la lógica principal no dependerá de APIs exclusivas de Windows.
-- **FUTURO:** servidor/API local, con posible crecimiento posterior a nube/remoto.
+- **FUTURO:** la ESP32-S3 alojará API y servirá el Panel desde microSD en la
+  LAN escolar; nube opcional para respaldo/acceso remoto. Primera versión con
+  una terminal y cola durable offline. Hoy firmware sirve archivos de prueba HTTP
+  de solo lectura desde FAT, pero no aloja API escolar ni sirve el Panel real. La
+  escritura FAT existe en código, sin validación física; el servidor no expone rutas
+  de escritura.
 
 La UI no debe contener IPs, URLs ni detalles del servidor. La comunicación debe
 pertenecer a un servicio de datos independiente.
@@ -149,11 +161,15 @@ configuración y datos académicos necesarios. Ninguno está implementado.
 
 ### API, fuente de verdad y eventos — FUTURO
 
-Hoy LittleFS es almacenamiento persistente de la terminal. Cuando exista
-servidor, la base central será la fuente de verdad global y ESP32/PWA mantendrán
-caché, cola pendiente y estado de sincronización. Ambos clientes pasarán por
-la API para acceder a la base central. El servidor no debe ser un requisito
-obligatorio para operaciones locales válidas.
+Hoy LittleFS es almacenamiento persistente. PM.10A propone que ESP32-S3 aloje
+API y sirva archivos del Panel desde microSD por el router escolar, aunque no
+haya Internet. La terminal sigue siendo fuente primaria y guarda operaciones
+y cola durable antes de informar éxito. Al perder Wi-Fi, continúa localmente;
+al reconectar reenvía el mismo operation_id hasta ACK durable. El Panel ve
+operaciones confirmadas. Nube opcional recibe réplica para backup/remoto. La
+microSD actual cuenta con escritura FAT local en código (sin validar físicamente)
+y servidor HTTP de prueba de solo lectura para archivos estáticos y `/status`.
+Aún no existe API escolar ni instalador del Panel.
 
 La API asumirá autenticación, autorización, recepción de movimientos,
 consultas, sincronización, validaciones, deduplicación y conflictos. El acceso
@@ -166,12 +182,15 @@ Flujo previsto: operación local → guardar → marcar pendiente → detectar a
 a API → enviar → validar → confirmar → marcar sincronizado. Sin confirmación
 del servidor, el registro permanece pendiente.
 
-Los reintentos no deben duplicar movimientos (idempotencia): identificador
-único estable y reconocimiento de operaciones ya recibidas. El contador actual
-de la terminal es local; la identidad entre dispositivos y PWA queda pendiente.
-Origen, timestamps, IDs, `synced`, orden de eventos y conflictos por operación
-offline simultánea se resolverán en la fase de sincronización, sin definir
-todavía protocolo o estrategia final.
+Los reintentos no deben duplicar movimientos (idempotencia): servidor local
+con clave única por operation_id, mismo ID/payload devuelve ACK previo y mismo
+ID con payload distinto se rechaza. ACK solo tras commit durable. Se conserva
+el `student_id` oficial y los IDs locales; los IDs ficticios demo no se
+migran. Servidor referencia el ID local junto con el dispositivo. Saldo no se
+sincroniza como snapshot editable: terminal aplica movimiento y saldo juntos;
+el servidor deriva su réplica de eventos únicos. Primera versión una terminal;
+agregar otras requiere asignar escritor por cuenta o definir reservas y
+reconciliación explícita.
 
 ### Módulos y experiencia previstos — FUTURO
 

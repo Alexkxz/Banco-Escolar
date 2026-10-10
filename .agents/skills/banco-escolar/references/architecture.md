@@ -18,7 +18,7 @@ Terminal ESP32 ↔ API ↔ Servidor / Data Service ↔ Base de datos central
           Panel Maestro PWA
 ```
 
-LittleFS es el almacenamiento persistente local de la terminal. Cuando exista servidor, la base central será la fuente de verdad global; ESP32 y PWA mantendrán caché local, cola pendiente y estado de sincronización. Las operaciones válidas se guardan localmente primero y se sincronizan después; la sincronización y transferencia entre alumnos siguen pendientes.
+PM.10A propone que la ESP32-S3 sea centro local: alojar API y servir archivos del Panel desde microSD a equipos del mismo router Wi-Fi; nube opcional para backup/acceso remoto. Terminal es fuente primaria. La API local de archivos FAT existe, pero las escrituras físicas siguen pendientes. Ya se implementó un servidor HTTP temporal de solo lectura para archivos de prueba `panel-test/` y `/status`; no sirve el Panel real, no aloja la API ni sincroniza. Primera version: una terminal; cola durable e idempotente si pierde Wi-Fi.
 
 Consulta [panel-master.md](panel-master.md) antes de planificar Panel/API/sincronización. Allí se definen plataformas, IndexedDB y Service Worker previstos, módulos, idempotencia y conflictos. No hay framework, motor de base de datos ni protocolo final seleccionado. Una migración futura a nube/remoto conserva esta separación.
 
@@ -46,3 +46,8 @@ La arquitectura futura prevé entidades `ActivitySession` y `ActivityClaim` (pro
 El futuro Panel Maestro podrá crear y revisar actividades, revisar participaciones por alumno, agregar dinero manualmente y anular participaciones erróneas. Una anulación será lógica (`VOIDED`/anulada) y generará un movimiento inverso; nunca borrará físicamente la participación o el movimiento original. Tarjeta maestra, NFC, persistencia de actividades, cobro, Panel y sincronización siguen fuera de 5E.
 
 La Fase 5E.1 añade `ActivityDraft`, configuración funcional en RAM. 5E.1A ya está implementada en código para suspender el timeout normal en el contexto Maestro; su prueba física de más de 60 segundos está pendiente. 5E.1B está implementada y compilada, con validación visual física pendiente.
+
+
+### PM.10A - vinculacion Panel-terminal
+
+ESP32-S3 es centro local propuesto: API y archivos del Panel desde microSD, accesible por el router Wi-Fi; nube opcional de backup/remoto. Terminal conserva sus `student_id` y es fuente primaria. La lectura/escritura genérica local FAT está en código; escritura física no validada. Un servidor HTTP de prueba de archivos SD y estado ya está implementado, sin API escolar ni integración del Panel. IDs ficticios demo quedan aislados. Cambio PIN es comando cifrado pendiente hasta ACK terminal. Ver [PANEL_MAESTRO_PM10A.md](../../../../docs/PANEL_MAESTRO_PM10A.md).

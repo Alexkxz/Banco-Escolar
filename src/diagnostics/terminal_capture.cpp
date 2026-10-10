@@ -21,6 +21,22 @@ constexpr uint32_t CAPTURE_TIMEOUT_MS = 2500;
 constexpr uint32_t ACK_TIMEOUT_MS = 5000;
 constexpr uint32_t RECEIVER_VERIFY_TIMEOUT_MS = 30000;
 constexpr uint8_t MAX_CHUNK_RETRIES = terminal_capture_ui::MAX_RETRIES;
+constexpr uint8_t MAX_CHUNK_ATTEMPTS = MAX_CHUNK_RETRIES + 1U;
+
+struct SendAttemptMetrics {
+    uint16_t polls = 0;
+    uint16_t no_space_polls = 0;
+    uint16_t space_samples = 0;
+    uint16_t max_space = 0;
+    uint16_t write_calls = 0;
+    uint16_t bytes_accepted = 0;
+    uint32_t space_sum = 0;
+    uint32_t write_active_us = 0;
+    uint32_t poll_gap_sum_us = 0;
+    uint32_t poll_gap_max_us = 0;
+    uint32_t ack_latency_us = 0;
+};
+static_assert(sizeof(SendAttemptMetrics) == 32, "DIAG.1 attempt metrics RAM budget changed");
 
 enum class AckReply : uint8_t { NONE, ACK, NAK };
 enum class AckFailure : uint8_t { NONE, TIMEOUT, NAK };
@@ -70,6 +86,24 @@ bool s_receiver_verified = false;
 bool s_verify_timer_pending = false;
 uint32_t s_verify_started_ms = 0;
 uint8_t s_packet[diag_capture::HEADER_SIZE + diag_capture::MAX_FRAME_PAYLOAD] = {};
+uint32_t s_transfer_started_ms = 0;
+uint32_t s_transfer_finished_ms = 0;
+uint32_t s_block_send_started_ms = 0;
+uint16_t s_metrics_blocks_sent = 0;
+uint16_t s_metrics_acks = 0;
+uint16_t s_metrics_naks = 0;
+uint16_t s_metrics_timeouts = 0;
+uint16_t s_metrics_retries = 0;
+uint16_t s_metrics_errors = 0;
+uint32_t s_metrics_send_ms[terminal_capture_ui::TOTAL_BLOCKS] = {};
+uint32_t s_metrics_ack_wait_ms[terminal_capture_ui::TOTAL_BLOCKS] = {};
+bool s_metrics_started = false;
+bool s_metrics_emitted = false;
+bool s_metrics_verified = false;
+SendAttemptMetrics s_attempt_metrics[terminal_capture_ui::TOTAL_BLOCKS][MAX_CHUNK_ATTEMPTS] = {};
+uint32_t s_tx_last_poll_us = 0;
+uint32_t s_tx_enqueued_us = 0;
+bool s_tx_poll_started = false;
 size_t s_tx_length = 0;
 size_t s_tx_offset = 0;
 bool s_failure_report_queued = false;
@@ -138,11 +172,54 @@ void set_state(State state)
 void fail(uint8_t code)
 {
     portENTER_CRITICAL(&s_mux);
+    if (s_state != State::FAILED && s_metrics_started) ++s_metrics_errors;
     s_error_code = code;
     s_state = State::FAILED;
     portEXIT_CRITICAL(&s_mux);
+    if (s_metrics_started && s_transfer_finished_ms == 0)
+        s_transfer_finished_ms = millis();
     publish_ui_snapshot(terminal_capture_ui::State::ERROR, s_sequence, s_sequence,
                         s_retries, code, true);
+}
+
+void emit_transfer_metrics()
+{
+    if (!s_metrics_started || s_metrics_emitted) return;
+    s_metrics_emitted = true;
+    const uint32_t finished_ms = s_transfer_finished_ms == 0 ? millis() : s_transfer_finished_ms;
+    const uint32_t total_ms = finished_ms - s_transfer_started_ms;
+    Serial.printf("DIAG1_FW_METRICS result=%s baud_configured=%lu blocks_sent_attempts=%u "
+                  "valid_acks=%u naks=%u ack_timeouts=%u retries=%u errors=%u "
+                  "transfer_total_ms=%lu\n",
+                  s_metrics_verified ? "verified" : "failed",
+                  static_cast<unsigned long>(diag_capture::SERIAL_BAUD_RATE),
+                  static_cast<unsigned>(s_metrics_blocks_sent),
+                  static_cast<unsigned>(s_metrics_acks), static_cast<unsigned>(s_metrics_naks),
+                  static_cast<unsigned>(s_metrics_timeouts), static_cast<unsigned>(s_metrics_retries),
+                  static_cast<unsigned>(s_metrics_errors), static_cast<unsigned long>(total_ms));
+    for (uint16_t sequence = 0; sequence < terminal_capture_ui::TOTAL_BLOCKS; ++sequence) {
+        Serial.printf("DIAG1_FW_BLOCK seq=%u send_ms=%lu ack_wait_ms=%lu\n",
+                      static_cast<unsigned>(sequence),
+                      static_cast<unsigned long>(s_metrics_send_ms[sequence]),
+                      static_cast<unsigned long>(s_metrics_ack_wait_ms[sequence]));
+        for (uint8_t attempt = 0; attempt < MAX_CHUNK_ATTEMPTS; ++attempt) {
+            const SendAttemptMetrics &m = s_attempt_metrics[sequence][attempt];
+            if (m.polls == 0 && m.bytes_accepted == 0) continue;
+            Serial.printf("DIAG1_FW_ATTEMPT seq=%u retry=%u polls=%u no_space=%u space_samples=%u "
+                          "space_avg=%lu space_max=%u write_calls=%u bytes_accepted=%lu "
+                          "write_active_us=%lu poll_gap_avg_us=%lu poll_gap_max_us=%lu ack_latency_us=%lu\n",
+                          static_cast<unsigned>(sequence), static_cast<unsigned>(attempt),
+                          static_cast<unsigned>(m.polls), static_cast<unsigned>(m.no_space_polls),
+                          static_cast<unsigned>(m.space_samples),
+                          static_cast<unsigned long>(m.space_samples ? m.space_sum / m.space_samples : 0),
+                          static_cast<unsigned>(m.max_space), static_cast<unsigned>(m.write_calls),
+                          static_cast<unsigned long>(m.bytes_accepted),
+                          static_cast<unsigned long>(m.write_active_us),
+                          static_cast<unsigned long>(m.polls > 1 ? m.poll_gap_sum_us / (m.polls - 1U) : 0),
+                          static_cast<unsigned long>(m.poll_gap_max_us),
+                          static_cast<unsigned long>(m.ack_latency_us));
+        }
+    }
 }
 
 bool send_frame(diag_capture::FrameType type, uint32_t capture_id,
@@ -237,6 +314,10 @@ void parse_line(const char *line)
                 s_ack_sequence = static_cast<uint16_t>(sequence);
                 s_ack_valid = is_ack;
                 s_ack_received = true;
+                if (is_ack && s_last_reply_matches && s_sequence < terminal_capture_ui::TOTAL_BLOCKS &&
+                    s_retries < MAX_CHUNK_ATTEMPTS) {
+                    s_attempt_metrics[s_sequence][s_retries].ack_latency_us = micros() - s_tx_enqueued_us;
+                }
             }
         }
     }
@@ -337,6 +418,22 @@ void begin_transfer()
     s_ui_meta_pending = false;
     s_receiver_verified = false;
     s_verify_timer_pending = false;
+    s_transfer_started_ms = millis();
+    s_transfer_finished_ms = 0;
+    s_block_send_started_ms = 0;
+    s_metrics_blocks_sent = 0;
+    s_metrics_acks = 0;
+    s_metrics_naks = 0;
+    s_metrics_timeouts = 0;
+    s_metrics_retries = 0;
+    s_metrics_errors = 0;
+    memset(s_metrics_send_ms, 0, sizeof(s_metrics_send_ms));
+    memset(s_metrics_ack_wait_ms, 0, sizeof(s_metrics_ack_wait_ms));
+    memset(s_attempt_metrics, 0, sizeof(s_attempt_metrics));
+    s_tx_poll_started = false;
+    s_metrics_started = true;
+    s_metrics_emitted = false;
+    s_metrics_verified = false;
     publish_ui_snapshot(terminal_capture_ui::State::PREPARING, 0, 0, 0, 0, true);
     set_state(State::TRANSFERRING);
 }
@@ -375,6 +472,9 @@ void send_chunk()
         fail(5);
         return;
     }
+    ++s_metrics_blocks_sent;
+    s_tx_poll_started = false;
+    s_block_send_started_ms = millis();
     if (s_retries == 0) {
         s_block_started_ms = 0;
         s_last_reply_elapsed_ms = 0;
@@ -395,7 +495,14 @@ void send_chunk()
 
 void retry_or_fail(AckFailure failure)
 {
+    if (failure == AckFailure::NAK) ++s_metrics_naks;
+    else if (failure == AckFailure::TIMEOUT) {
+        ++s_metrics_timeouts;
+        if (s_sequence < terminal_capture_ui::TOTAL_BLOCKS && !s_ack_timer_pending)
+            s_metrics_ack_wait_ms[s_sequence] += millis() - s_ack_started_ms;
+    }
     if (s_retries < MAX_CHUNK_RETRIES) {
+        ++s_metrics_retries;
         ++s_retries;
         s_phase = TransferPhase::SEND_DATA;
         publish_ui_snapshot(terminal_capture_ui::State::RETRYING, s_sequence,
@@ -522,26 +629,62 @@ void terminal_capture_ui_dismiss()
 
 void terminal_capture_poll()
 {
+    const uint32_t poll_started_us = micros();
     read_serial_lines();
 
     // Drain USB in bounded, non-blocking slices from loop(). The LVGL flush
     // callback never performs protocol I/O, and one poll cannot wait for a
     // complete 1 KiB frame to leave the serial TX buffer.
     if (s_tx_offset < s_tx_length) {
+        if (s_phase == TransferPhase::WAIT_ACK && s_sequence < terminal_capture_ui::TOTAL_BLOCKS &&
+            s_retries < MAX_CHUNK_ATTEMPTS) {
+            SendAttemptMetrics &m = s_attempt_metrics[s_sequence][s_retries];
+            if (s_tx_poll_started) {
+                const uint32_t gap = poll_started_us - s_tx_last_poll_us;
+                m.poll_gap_sum_us += gap;
+                if (gap > m.poll_gap_max_us) m.poll_gap_max_us = gap;
+            }
+            s_tx_last_poll_us = poll_started_us;
+            s_tx_poll_started = true;
+            ++m.polls;
+        }
         const int available = Serial.availableForWrite();
-        if (available <= 0) return;
+        if (available <= 0) {
+            if (s_phase == TransferPhase::WAIT_ACK && s_sequence < terminal_capture_ui::TOTAL_BLOCKS &&
+                s_retries < MAX_CHUNK_ATTEMPTS)
+                ++s_attempt_metrics[s_sequence][s_retries].no_space_polls;
+            return;
+        }
+        SendAttemptMetrics *attempt_metrics = nullptr;
+        if (s_phase == TransferPhase::WAIT_ACK && s_sequence < terminal_capture_ui::TOTAL_BLOCKS &&
+            s_retries < MAX_CHUNK_ATTEMPTS) {
+            attempt_metrics = &s_attempt_metrics[s_sequence][s_retries];
+            ++attempt_metrics->space_samples;
+            attempt_metrics->space_sum += static_cast<uint32_t>(available);
+            if (available > attempt_metrics->max_space)
+                attempt_metrics->max_space = static_cast<uint16_t>(available > UINT16_MAX ? UINT16_MAX : available);
+            ++attempt_metrics->write_calls;
+        }
         const size_t remaining = s_tx_length - s_tx_offset;
         const size_t count = remaining < static_cast<size_t>(available)
             ? remaining : static_cast<size_t>(available);
+        const uint32_t write_started_us = micros();
         const size_t written = Serial.write(s_packet + s_tx_offset, count);
+        if (attempt_metrics != nullptr) {
+            attempt_metrics->write_active_us += micros() - write_started_us;
+            attempt_metrics->bytes_accepted = static_cast<uint16_t>(attempt_metrics->bytes_accepted + written);
+        }
         s_tx_offset += written;
         if (s_tx_offset < s_tx_length) return;
         s_tx_length = 0;
         s_tx_offset = 0;
         if (s_ack_timer_pending) {
             const uint32_t now = millis();
+            if (s_sequence < terminal_capture_ui::TOTAL_BLOCKS && s_block_send_started_ms != 0)
+                s_metrics_send_ms[s_sequence] += now - s_block_send_started_ms;
             if (s_retries == 0) s_block_started_ms = now;
             s_ack_started_ms = now;
+            s_tx_enqueued_us = micros();
             s_ack_timer_pending = false;
         }
         if (s_ui_meta_pending) {
@@ -553,6 +696,7 @@ void terminal_capture_poll()
             s_verify_timer_pending = false;
         }
         if (s_failure_report_queued) {
+            emit_transfer_metrics();
             cleanup_capture();
             return;
         }
@@ -561,6 +705,7 @@ void terminal_capture_poll()
     }
 
     if (s_failure_report_queued) {
+        emit_transfer_metrics();
         cleanup_capture();
         return;
     }
@@ -588,7 +733,10 @@ void terminal_capture_poll()
             s_failure_report_queued = send_error(
                 code < sizeof(errors) / sizeof(errors[0]) ? errors[code] : "CAPTURE_FAILED", s_capture_id);
         }
-        if (!s_failure_report_queued) cleanup_capture();
+        if (!s_failure_report_queued) {
+            emit_transfer_metrics();
+            cleanup_capture();
+        }
         return;
     }
     if (state == State::READY) {
@@ -608,6 +756,9 @@ void terminal_capture_poll()
             if (s_ack_received && s_ack_capture_id == s_capture_id && s_ack_sequence == s_sequence) {
                 s_ack_received = false;
                 if (s_ack_valid) {
+                    ++s_metrics_acks;
+                    if (s_sequence < terminal_capture_ui::TOTAL_BLOCKS)
+                        s_metrics_ack_wait_ms[s_sequence] += millis() - s_ack_started_ms;
                     ++s_sequence;
                     s_retries = 0;
                     const bool all_blocks_confirmed = s_sequence >= terminal_capture_ui::TOTAL_BLOCKS;
@@ -615,7 +766,11 @@ void terminal_capture_poll()
                     publish_ui_snapshot(all_blocks_confirmed ? terminal_capture_ui::State::VERIFYING :
                                                                terminal_capture_ui::State::SENDING,
                                         s_sequence, s_sequence, 0, 0, true);
-                } else retry_or_fail(AckFailure::NAK);
+                } else {
+                    if (s_sequence < terminal_capture_ui::TOTAL_BLOCKS)
+                        s_metrics_ack_wait_ms[s_sequence] += millis() - s_ack_started_ms;
+                    retry_or_fail(AckFailure::NAK);
+                }
             } else if (!s_ack_timer_pending &&
                        static_cast<uint32_t>(millis() - s_ack_started_ms) >= ACK_TIMEOUT_MS) {
                 retry_or_fail(AckFailure::TIMEOUT);
@@ -626,6 +781,8 @@ void terminal_capture_poll()
             break;
         case TransferPhase::WAIT_VERIFY:
             if (s_receiver_verified) {
+                s_metrics_verified = true;
+                s_transfer_finished_ms = millis();
                 s_phase = TransferPhase::SD_STATUS;
                 publish_ui_snapshot(terminal_capture_ui::State::RECEIVED,
                                     terminal_capture_ui::TOTAL_BLOCKS,
@@ -639,6 +796,7 @@ void terminal_capture_poll()
             send_sd_status();
             break;
         case TransferPhase::CLEANUP:
+            emit_transfer_metrics();
             cleanup_capture();
             break;
         case TransferPhase::NONE:
