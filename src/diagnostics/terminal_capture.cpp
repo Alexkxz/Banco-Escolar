@@ -12,6 +12,7 @@
 
 #include "../esp_lv_adapter_arduino.h"
 #include "../storage/sd_manager.h"
+#include "sd_file_test.h"
 #include "diag_capture_protocol.h"
 
 namespace {
@@ -275,6 +276,15 @@ void cleanup_capture()
 
 void parse_line(const char *line)
 {
+    if (strcmp(line, "SD DIAG TEST") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-DIAG] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        sd_file_test_run();
+        return;
+    }
+
     if (strcmp(line, diag_capture::REQUEST_LINE) == 0) {
         if (!terminal_capture_request()) s_busy_response_pending = true;
         return;

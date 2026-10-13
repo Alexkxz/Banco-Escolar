@@ -10,6 +10,8 @@ MANAGER = (ROOT / "src/storage/sd_manager.cpp").read_text(encoding="utf-8")
 SELECTOR = (ROOT / "src/storage/sd_external_cs.h").read_text(encoding="utf-8")
 PATHS = (ROOT / "src/storage/sd_path.h").read_text(encoding="utf-8")
 HEADER = (ROOT / "src/storage/sd_manager.h").read_text(encoding="utf-8")
+SERIAL = (ROOT / "src/diagnostics/terminal_capture.cpp").read_text(encoding="utf-8")
+SD_TEST = (ROOT / "src/diagnostics/sd_file_test.cpp").read_text(encoding="utf-8")
 
 
 def body(source: str, signature: str) -> str:
@@ -92,6 +94,20 @@ assert "SD_MAX_DIRECTORY_ENTRIES" in list_directory and "sd_path_reserved_suffix
 assert "mkdir(full_path.c_str()" in create_directory
 assert "unlink(full_path.c_str())" in remove_file
 assert "SdFileError::NO_SPACE" in MANAGER and "SdFileError::READ_FAILED" in MANAGER
+assert 'strcmp(line, "SD DIAG TEST") == 0' in SERIAL
+assert "get_state() != State::IDLE" in SERIAL
+assert "sd_file_test_run();" in SERIAL
+assert 'listDirectory("", root_entries)' in SD_TEST
+assert "entry.name == TEST_DIRECTORY" in SD_TEST
+assert 'listDirectory(TEST_DIRECTORY, test_entries)' in SD_TEST
+assert "test_entries.empty()" in SD_TEST
+assert "createDirectory(TEST_DIRECTORY)" in SD_TEST
+assert "write_content(INITIAL_CONTENT, false" in SD_TEST
+assert "check_content(INITIAL_CONTENT" in SD_TEST
+assert "write_content(REPLACEMENT_CONTENT, true" in SD_TEST
+assert "check_content(REPLACEMENT_CONTENT" in SD_TEST
+assert "removeFile(TEST_FILE)" in SD_TEST
+assert "sdcard_mount(" not in SD_TEST and "format(" not in SD_TEST
 assert 'validate_sd_path("../outside")' in PATHS
 assert 'validate_sd_path("data/../outside")' in PATHS
 assert 'validate_sd_path("data//file")' in PATHS
@@ -101,3 +117,4 @@ print("PASS: el driver no configura ni escribe un GPIO para CS (incluido GPIO 25
 print("PASS: CH422G reutilizado; montaje persistente sin formato automático.")
 print("PASS: API FAT con rutas relativas, lectura/listado y operaciones de archivo.")
 print("PASS: escritura temporal con sincronización, respaldo y recuperación por ruta.")
+print("PASS: diagnóstico serial manual de escritura, lectura, reemplazo y limpieza acotada.")
