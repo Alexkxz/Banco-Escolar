@@ -1,5 +1,13 @@
 # Banco Escolar — Handoff
 
+## Preparación de la prueba manual microSD (2026-10-13)
+
+- `SD DIAG TEST` existe en `src/diagnostics/sd_file_test.cpp` y se despacha solo al recibir esa línea completa en `src/diagnostics/terminal_capture.cpp`; no es una prueba de arranque. Enviar con LF/Enter a 460800 baudios (`diag_capture_protocol.h`, `platformio.ini`). El parser ignora CR. Si DIAG.1 está ocupada (`State != IDLE`), responde abortado y no inicia escritura.
+- La rutina se detiene sin escribir si SDManager no está montado, no puede listar la raíz o ya existe `sd_diag_manual`. Crea esa carpeta y usa solo `sd_diag_manual/payload.txt`: escritura inicial, lectura/comparación, reemplazo, lectura/comparación y borrado del archivo de esta ejecución. Al final vuelve a listar la carpeta; no elimina directorios ni elementos adicionales. La carpeta se conserva vacía si la comprobación final lo confirma.
+- El verificador `python tools/storage/check_sd_external_cs.py` comprueba integración, velocidad, línea/terminador, guards, rutas y alcance de borrado por inspección de fuente. Es una comprobación estática; no valida FAT ni hardware. No usar para justificar resultado físico.
+- Para una futura prueba física, primero confirmar mediante consulta de solo lectura que `/sd_diag_manual` no existe; detenerse si no se confirma. Mantener el registro serial completo, mandar una sola vez `SD DIAG TEST` con LF, esperar el resultado final y no retirar la tarjeta. Si hay timeout, error o limpieza incompleta, no repetir hasta revisar el contenido. No se debe formatear la tarjeta.
+- Evidencia de firmware: el registro de carga anterior declara SHA-256 `43824ae7eade48d940fc3842da7f712b6c018a869a6c70226d15bbc5feff12ba` y hashes verificados por esptool. Antes del BUILD de preparación, el `firmware.bin` local tenía SHA-256 `5bc7f52f0d4a9448fbbfd89ecbda24dad37fb3872882c6dce68ce84429c27709`; no coincide y no se encontró copia binaria con el hash del registro. El BUILD autorizado por la fase actual generó `.pio/build/esp32-s3-devkitc-1/firmware.bin` con SHA-256 `f59ef5108bb9e730aa262ea0e68275c8637b741f79010d77073d27621f1c31a0`. El mapa y los objetos actuales enlazan `sd_file_test.cpp.o` y `ota_manager.cpp.o`, pero solo describen ese build del árbol local. Esptool verifica bytes cargados, no su procedencia; el firmware que permanece en la placa no se demuestra con estos artefactos.
+
 ## Paquete local del Panel para microSD (2026-10-10)
 
 - El build `panel-maestro` tiene una variante `npm run build:sd` que usa base `/panel-test/maestro/` y `HashRouter`; el build habitual no cambia y conserva `BrowserRouter`. La navegación por fragmento evita depender de fallback de rutas en el servidor HTTP de archivos.
@@ -326,3 +334,19 @@ Limitaciones observadas antes de corregir el splash: durante el acceso SPI apare
 ### PM.10A - vinculacion Panel-terminal (decisiones actualizadas)
 
 PM.10A propone que la propia ESP32-S3 aloje API y sirva Panel desde microSD a equipos del mismo router Wi-Fi; nube opcional para backup/remoto. Primera version: una terminal. Si pierde Wi-Fi conserva cola durable y reenvia mismos IDs con ACK idempotente. A futuro, varias terminales usaran coordinador local y transacciones; valorar PC/mini PC si capacidad lo requiere. Estado: existe HTTP solo lectura para archivos de prueba `panel-test/` y `/status`; aún no hay API escolar ni se sirve el Panel real. Escritura FAT está en código, pendiente de validación física; el servidor no tiene rutas de escritura. La actualización del Panel por Wi-Fi será independiente de cargar firmware desde computadora. Pendientes: validar HTTP/SD en equipo, seguridad LAN, capacidad/desgaste SD, rollback ante corte de energía y restauración. Ver [PANEL_MAESTRO_PM10A.md](PANEL_MAESTRO_PM10A.md).
+
+### ALM.5A-FIS.1 — instalacion y arranque (2026-10-17)
+
+- BUILD `esp32-s3-devkitc-1` SUCCESS antes de instalar. El firmware actual incluye `SD DIAG LARGE` y `SD DIAG VERIFY`; imagen ESP32-S3 validada, 2,085,472 bytes, SHA-256 `9CA3BE23CC729563289987891F839682F3ACF954232D420D2860A2FB3282A15C`.
+- Tabla de particiones de 16 MB confirmada: `app0` comienza en `0x10000`, longitud `0x640000` (6,553,600 bytes). Imagen cabe en `app0`. Se uso escritura directa esptool solo a `0x10000`; rango de borrado reportado `0x10000–0x20dfff`, dentro de `app0`. Verificacion del hash de escritura SUCCESS y reset.
+- No se escribieron bootloader, tabla de particiones, NVS ni LittleFS; no se ejecuto `uploadfs`, borrado completo, formato ni operacion de escritura/borrado en microSD.
+- El arranque serial llego a `Sistema listo`. FAT32 se monto como SDHC con capacidad de tarjeta 62,568,529,920 bytes; se informaron FAT persistente y montaje disponible. `SD DIAG INFO` confirmo FAT32, 122,204,160 sectores de 512 bytes, volumen 62,551,719,936 bytes y espacio libre 62,551,556,096 bytes. LittleFS monto correctamente: total 3,538,944 bytes, usados 24,576 y libres 3,514,368; cinco movimientos existentes detectados.
+- La verificacion fue solo de arranque, montaje y consulta INFO de solo lectura. No se ejecutaron `SD DIAG LARGE` ni `SD DIAG VERIFY`; la pantalla tactil no se verifico visualmente. Detenerse aqui antes de la primera prueba de escritura grande.
+- Monitor serie propio cerrado con Ctrl+C; sesion termino con codigo 0. No se hizo Commit ni Push.
+
+### ALM.5A-FIS.2 — resultado de LARGE (2026-10-17)
+
+- Monitor PlatformIO en COM3 a 460800. Arranque reiniciado desde el monitor; serial confirmo `Sistema listo`, montaje SDHC/FAT32 de 62,568,529,920 bytes y `LittleFS listo` con cinco movimientos.
+- Se envio `SD DIAG LARGE` una sola vez. Respuesta literal: `[SD-DIAG] ABORTADO: no hay memoria suficiente para iniciar la tarea de diagnóstico.` La tarea no inicio; no se informaron resultado PASS/FAIL de integridad, tamaño escrito/leído, CRC32, duraciones, velocidades, memoria antes/después, ruta ni manifiesto.
+- Por el aborto no se repitio LARGE ni se ejecuto VERIFY. No se obtuvieron datos que confirmen creacion de un archivo de prueba; no se hizo inspeccion adicional ni se borraron/alteraron archivos. Pruebas de 5, 10 y 25 MiB no ejecutadas.
+- Monitor serie propio cerrado con Ctrl+C; la sesion termino con codigo 0. No se modifico codigo, firmware, LittleFS, NVS ni OTA; sin Commit ni Push.

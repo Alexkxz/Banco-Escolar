@@ -228,7 +228,10 @@ bool Board::init()
     _touch_bus = touch_bus;
     _touch_device = touch_device;
     _backlight = backlight;
-    _io_expander = io_expander;
+    if (io_expander != nullptr) {
+        _io_expander = io_expander;
+        _owns_io_expander = true;
+    }
 
     setState(State::INIT);
 
@@ -491,7 +494,14 @@ bool Board::del()
     _lcd_bus = nullptr;
     _touch_device = nullptr;
     _touch_bus = nullptr;
+
+    // Keep the adapter and Board state intact if controller or host teardown
+    // fails. A caller can then retry del() without publishing a dead handle.
+    if (_owns_io_expander && _io_expander != nullptr) {
+        ESP_UTILS_CHECK_FALSE_RETURN(_io_expander->del(), false, "Delete IO expander failed");
+    }
     _io_expander = nullptr;
+    _owns_io_expander = false;
 
     if (isOverState(State::BEGIN) && config.stage_callbacks[BoardConfig::STAGE_CALLBACK_POST_BOARD_DEL] != nullptr) {
         ESP_UTILS_LOGD("Board post-delete");

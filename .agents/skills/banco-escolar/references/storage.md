@@ -11,7 +11,13 @@ STORAGE_ALLOW_ONE_TIME_FORMAT = false
 STORAGE_SELF_TEST = false
 ```
 
-El montaje normal usa `LittleFS.begin(false, ..., 10, "spiffs")`. La rama que puede llamar `LittleFS.format()` existe como infraestructura, pero queda cerrada por el flag global; un fallo normal reporta error y no debe reparar ni borrar automáticamente. No actives el permiso, no ejecutes formato ni modifiques datos/NVS sin una fase autorizada.
+El montaje normal usa `bank_littlefs.mount(false, ..., "spiffs")`. La rama que puede llamar `bank_littlefs.format()` existe como infraestructura, pero queda cerrada por el flag global; un fallo normal reporta error y no debe reparar ni borrar automáticamente. No actives el permiso, no ejecutes formato ni modifiques datos/NVS sin una fase autorizada.
+
+Para el arranque de una imagen `PENDING_VERIFY`, el firmware reconstruye el bloqueo de mantenimiento desde el estado persistente del bootloader antes de iniciar almacenamiento o UI. Un error al consultar el estado se clasifica `STATE_UNKNOWN`: bloquea escrituras, no confirma y no reinicia automáticamente. El gestor usa `bank_littlefs` en lugar del singleton Arduino y monta en solo lectura, con `format_if_mount_failed=false` y `grow_on_mount=false`. Valida los registros existentes y rechaza un journal financiero pendiente; no recupera journals, crea archivos ni escribe marcadores NVS.
+
+Antes de confirmar, `StorageManager::prepareFilesystemForBootConfirmation()` verifica el remonte normal de lectura/escritura con crecimiento desactivado, vuelve a validar movimientos/cuentas y exige el tamaño esperado y ausencia del journal. La evidencia se basa en la versión exacta: esp_littlefs 1.16.1 incorpora LittleFS 2.10.1; `esp_littlefs_init()` llama `lfs_mount()`, cuya rutina de montaje lee superblock y metadatos y solo cambia estado RAM. No llama a `prog`, `erase`, `lfs_dir_commit` ni migración. El adaptador ejecuta `lfs_fs_grow()` por separado únicamente cuando `grow_on_mount=true`; esta transición lo fija en `false`. `read_only=true` restringe el acceso de escritura por VFS, pero no es un bloqueo eléctrico de la flash; la garantía de la fase depende también de mantener activa `ota_maintenance_active`, que deniega apertura de archivos para escritura, create, rename, remove, mkdir y rmdir. El build queda fijado a esp_littlefs 1.16.1 mediante `static_assert`; cualquier cambio de versión exige repetir la auditoría. Tras remonte y revalidación satisfactorios, una segunda comprobación de salud precede la confirmación. Un fallo de mount, validación o confirmación conserva el bloqueo y solicita rollback una vez; si la API de rollback falla, no hay reinicios repetidos.
+
+El arranque normal conserva `grow_on_mount=true`; OTA se niega si el filesystem no ocupa el tamaño esperado. Las pruebas automatizadas verifican contratos de fuente y rutas de decisión, no ejecutan el VFS de ESP-IDF ni prueban bytes de flash. La ausencia real de modificaciones byte a byte y el rollback requieren validación física supervisada antes de autorizar una instalación OTA.
 
 ## NVS y movimientos
 
@@ -60,6 +66,22 @@ La implementación compila pero aún necesita validación física de conexión W
 ### Paquete estático del Panel para el servidor HTTP de prueba
 
 La variante local se compila con `panel-maestro/npm run build:sd` y se prepara en `panel-maestro/package-sd/` con `tools/web/prepare_panel_sd_package.py`. El árbol `panel-test/maestro/` contiene el HTML y dependencias compiladas; `manifest.json` registra ruta, tamaño y SHA-256. La variante usa hash routing y no requiere fallback. Es un artefacto local pendiente de copia manual y validación física; no convierte al servidor en servicio del Panel ni añade escrituras HTTP.
+
+### Diagnóstico manual de archivos (SD DIAG TEST)
+
+`src/diagnostics/sd_file_test.cpp` implementa una prueba serial manual; no se ejecuta al arrancar. El parser de `terminal_capture.cpp` exige la línea completa `SD DIAG TEST` terminada en LF (Enter normalmente envía CR/LF; CR se ignora). La velocidad del firmware y de PlatformIO es 460800 baudios (`diag_capture_protocol.h` y `platformio.ini`). Si DIAG.1 no está en `IDLE`, el comando se rechaza sin iniciar la prueba.
+
+Antes de escribir, la rutina requiere SD montada, lista la raíz y aborta si ya existe `sd_diag_manual`. Solo crea `sd_diag_manual/` y opera sobre `sd_diag_manual/payload.txt`: escritura inicial sin reemplazo, lectura y comparación, reemplazo, nueva lectura y comparación, y eliminación de ese archivo. Al final vuelve a listar el directorio y solo informa carpeta vacía si la consulta termina correctamente y no encuentra entradas. No borra directorios ni otros archivos; conserva `sd_diag_manual` vacía. Ante fallo de limpieza informa resultado fallido y requiere inspección antes de repetir. El controlador no formatea automáticamente.
+
+La verificación `python tools/storage/check_sd_external_cs.py` inspecciona estáticamente parser, guards, rutas, secuencia y límites de borrado; no simula FAT ni sustituye una validación con microSD física. Para una futura ejecución: confirmar primero por un método de solo lectura que `sd_diag_manual` no existe en la raíz, usar monitor a 460800, enviar exactamente `SD DIAG TEST` una vez con LF/Enter, conservar el log completo y no retirar la tarjeta durante la operación. Detenerse si la ausencia no se puede confirmar. La ejecución puede crear o dejar `payload.txt` si hay interrupción o fallo; no repetir sin revisar el resultado.
+
+### Diagnostico avanzado ALM.5A-IMP.1 (pendiente de validacion fisica)
+
+`SDManager` ofrece escritura incremental exclusiva con `O_EXCL`, comprobacion de bytes por bloque, `fsync` y cierre; no elimina archivos parciales. El candado de operacion rechaza accesos FAT simultaneos y una reserva por tarea coordina `SD DIAG LARGE`/`SD DIAG VERIFY` con consumidores como el servidor HTTP. La tarea de diagnostico corre aparte del `loop()` y la reserva tiene timeout; el cierre de placa conserva su drenaje acotado.
+
+Los comandos manuales crean datos en `sd_diag_alm5a/`, en bloques de 4 KiB y con limite de 1 MiB por ejecucion. El archivo de datos se conserva. Un registro exclusivo `run_*.meta` contiene ruta, tamano, CRC32 y CRC del propio registro; `SD DIAG VERIFY` lo relee y compara CRC/tamano, y reporta datos sin manifiesto o manifiestos incompletos. No se guarda estado en NVS ni LittleFS. `SD DIAG LARGE` limita el directorio a 16 entradas en total (datos y manifiestos, aproximadamente ocho ejecuciones completas) y no limpia archivos automaticamente.
+
+Las pruebas host verifican contratos de fuente y rutas de fallo, no inyectan errores reales de FatFs ni reemplazan validacion fisica. BUILD tampoco valida sincronizacion FAT, memoria real, persistencia despues de apagado, concurrencia en placa o la experiencia con pantalla; ALM.5A-IMP.1 requiere autorizacion y validacion fisica antes de considerarse cerrada.
 
 ## Almacenamiento offline futuro
 

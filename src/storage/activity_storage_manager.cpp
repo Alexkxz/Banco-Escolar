@@ -2,8 +2,9 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <LittleFS.h>
+#include "bank_littlefs.h"
 #include <Preferences.h>
+#include "ota_maintenance_gate.h"
 
 #include <algorithm>
 #include <cstring>
@@ -147,8 +148,13 @@ bool readLatestSessions(std::vector<ActivitySession> &sessions,
     sessions.clear();
     maximum_id = 0;
     read_result = ActivityStorageResult::OK;
-    if (!LittleFS.exists(ACTIVITIES_FILE)) return true;
-    File file = LittleFS.open(ACTIVITIES_FILE, FILE_READ);
+    const BankLittleFsPathStatus file_status = bank_littlefs.pathStatus(ACTIVITIES_FILE);
+    if (file_status == BankLittleFsPathStatus::MISSING) return true;
+    if (file_status != BankLittleFsPathStatus::PRESENT) {
+        read_result = ActivityStorageResult::IO_ERROR;
+        return false;
+    }
+    File file = bank_littlefs.open(ACTIVITIES_FILE, FILE_READ);
     if (!file) {
         read_result = ActivityStorageResult::IO_ERROR;
         return false;
@@ -221,6 +227,7 @@ ActivityStorageResult ActivityStorageManager::createSession(
     int64_t started_at,
     ActivitySession &created)
 {
+    if (ota_maintenance_active.load()) return ActivityStorageResult::NOT_READY;
     if (!ready_ || !storage_manager.isReady()) return ActivityStorageResult::NOT_READY;
     if (started_at < MIN_VALID_ACTIVITY_EPOCH) return ActivityStorageResult::TIME_UNSYNCED;
     if (validateActivityConfiguration(configuration, registered_student_ids) !=
@@ -291,6 +298,7 @@ ActivityStorageResult ActivityStorageManager::closeSession(uint64_t id,
                                                             int64_t closed_at,
                                                             ActivitySession &updated)
 {
+    if (ota_maintenance_active.load()) return ActivityStorageResult::NOT_READY;
     if (!ready_ || !storage_manager.isReady()) return ActivityStorageResult::NOT_READY;
     if (status != ActivitySessionStatus::FINISHED && status != ActivitySessionStatus::CANCELLED) {
         return ActivityStorageResult::INVALID_STATE;
@@ -314,6 +322,7 @@ ActivityStorageResult ActivityStorageManager::updateActiveSession(
     uint64_t id, const ActivityConfiguration &configuration,
     const std::vector<uint16_t> &registered_student_ids, ActivitySession &updated)
 {
+    if (ota_maintenance_active.load()) return ActivityStorageResult::NOT_READY;
     if (!ready_ || !storage_manager.isReady()) return ActivityStorageResult::NOT_READY;
     if (id == 0 || validateActivityConfiguration(configuration, registered_student_ids) !=
                        ActivityValidationResult::VALID) return ActivityStorageResult::INVALID_ARGUMENT;
@@ -347,7 +356,7 @@ ActivityStorageResult ActivityStorageManager::appendSnapshot(const ActivitySessi
     if (!readLatestSessions(sessions, scan_result, maximum_id)) return scan_result;
     if (scan_result != ActivityStorageResult::OK) return scan_result;
 
-    if (!LittleFS.exists(ACTIVITIES_DIRECTORY) && !LittleFS.mkdir(ACTIVITIES_DIRECTORY)) {
+    if (!bank_littlefs.exists(ACTIVITIES_DIRECTORY) && !bank_littlefs.mkdir(ACTIVITIES_DIRECTORY)) {
         return ActivityStorageResult::IO_ERROR;
     }
 
@@ -369,7 +378,7 @@ ActivityStorageResult ActivityStorageManager::appendSnapshot(const ActivitySessi
     const size_t expected_size = measureJson(document);
     if (expected_size + 1U >= MAX_ACTIVITY_LINE_LENGTH) return ActivityStorageResult::IO_ERROR;
 
-    File file = LittleFS.open(ACTIVITIES_FILE, FILE_APPEND);
+    File file = bank_littlefs.open(ACTIVITIES_FILE, FILE_APPEND);
     if (!file) return ActivityStorageResult::IO_ERROR;
     const size_t written_size = serializeJson(document, file);
     const bool newline_written = file.write(static_cast<uint8_t>('\n')) == 1;

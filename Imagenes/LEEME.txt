@@ -1,0 +1,14 @@
+BANCO ESCOLAR — RECURSOS DE DISEÑO
+
+Carpetas:
+- imagenes/alumnos/: avatares originales de alumnos.
+- imagenes/sistema/: logotipos originales y maquetas de referencia.
+
+IMPORTANTE:
+- Logo.png y Logo y nombre.png son originales aportados por el usuario.
+- Santiago-4.png es un avatar original aportado por el usuario.
+- Banco_Escolar_Bienvenida_800x480.png es una referencia a 800x480.
+- Maqueta_Bienvenida_Original.png y Maqueta_Seleccion_Usuarios.png son maquetas conceptuales, no recursos listos para LVGL.
+- La maqueta de selección contiene nombres y saldos ilustrativos; NO deben utilizarse como datos reales ni mostrar saldos antes de autenticación.
+- No incorporar imágenes automáticamente al firmware sin evaluar Flash/RAM y formato.
+- Conservar splash y lógica OTA existentes. No cargar firmware sin autorización.

@@ -9,6 +9,7 @@
     "build:sd": "tsc -b && vite build --mode sd",
     "preview": "vite preview",
     "test": "vitest run",
+    "test:server": "node --test server/tests/static-server.test.mjs",
     "test:browser": "node scripts/pm9b-browser-test.mjs",
     "test:browser:pm9c": "node scripts/pm9c-browser-test.mjs"
   },

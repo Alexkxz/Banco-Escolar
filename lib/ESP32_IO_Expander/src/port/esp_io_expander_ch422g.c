@@ -13,7 +13,8 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
-#include "esp_io_expander.h"
+#include "../../internal/esp_io_expander_private.h"
+#include "../../internal/esp_io_expander_lock.h"
 #include "esp_io_expander_ch422g.h"
 
 #include "esp_expander_utils.h"
@@ -81,6 +82,20 @@ esp_err_t esp_io_expander_new_i2c_ch422g(i2c_port_t i2c_num, uint32_t i2c_addres
     ESP_RETURN_ON_FALSE(ch422g, ESP_ERR_NO_MEM, TAG, "Malloc failed");
 
     ch422g->base.config.io_count = IO_COUNT;
+    ch422g->base.operation_mutex = xSemaphoreCreateRecursiveMutex();
+    if (ch422g->base.operation_mutex == NULL) {
+        free(ch422g);
+        return ESP_ERR_NO_MEM;
+    }
+    ch422g->base.lifecycle_idle = xSemaphoreCreateBinary();
+    if (ch422g->base.lifecycle_idle == NULL) {
+        vSemaphoreDelete(ch422g->base.operation_mutex);
+        free(ch422g);
+        return ESP_ERR_NO_MEM;
+    }
+    portMUX_INITIALIZE(&ch422g->base.lifecycle_lock);
+    ch422g->base.lifecycle_managed = true;
+    ch422g->base.lifecycle_state = ESP_IO_EXPANDER_LIFECYCLE_ACTIVE;
     ch422g->i2c_num = i2c_num;
     ch422g->i2c_address = i2c_address;
     ch422g->regs.wr_set = REG_WR_SET_DEFAULT_VAL;
@@ -96,16 +111,18 @@ esp_err_t esp_io_expander_new_i2c_ch422g(i2c_port_t i2c_num, uint32_t i2c_addres
 
     esp_err_t ret = ESP_OK;
     /* Reset configuration and register status */
-    ESP_GOTO_ON_ERROR(reset(&ch422g->base), err, TAG, "Reset failed");
+    ESP_GOTO_ON_ERROR(esp_io_expander_reset(&ch422g->base), err, TAG, "Reset failed");
 
     *handle = &ch422g->base;
     return ESP_OK;
 err:
+    vSemaphoreDelete(ch422g->base.lifecycle_idle);
+    vSemaphoreDelete(ch422g->base.operation_mutex);
     free(ch422g);
     return ret;
 }
 
-esp_err_t esp_io_expander_ch422g_set_oc_open_drain(esp_io_expander_handle_t handle)
+static esp_err_t set_oc_open_drain_unlocked(esp_io_expander_handle_t handle)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t data = (uint8_t)(ch422g->regs.wr_set | REG_WR_SET_BIT_OD_EN);
@@ -121,7 +138,7 @@ esp_err_t esp_io_expander_ch422g_set_oc_open_drain(esp_io_expander_handle_t hand
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_ch422g_set_oc_push_pull(esp_io_expander_handle_t handle)
+static esp_err_t set_oc_push_pull_unlocked(esp_io_expander_handle_t handle)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t data = (uint8_t)(ch422g->regs.wr_set & ~REG_WR_SET_BIT_OD_EN);
@@ -137,7 +154,7 @@ esp_err_t esp_io_expander_ch422g_set_oc_push_pull(esp_io_expander_handle_t handl
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_ch422g_set_all_input(esp_io_expander_handle_t handle)
+static esp_err_t set_all_input_unlocked(esp_io_expander_handle_t handle)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t data = (uint8_t)(ch422g->regs.wr_set & ~REG_WR_SET_BIT_IO_OE);
@@ -155,7 +172,7 @@ esp_err_t esp_io_expander_ch422g_set_all_input(esp_io_expander_handle_t handle)
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_ch422g_set_all_output(esp_io_expander_handle_t handle)
+static esp_err_t set_all_output_unlocked(esp_io_expander_handle_t handle)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t data = (uint8_t)(ch422g->regs.wr_set | REG_WR_SET_BIT_IO_OE);
@@ -171,7 +188,43 @@ esp_err_t esp_io_expander_ch422g_set_all_output(esp_io_expander_handle_t handle)
     return ESP_OK;
 }
 
-static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value)
+esp_err_t esp_io_expander_ch422g_set_oc_open_drain(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_oc_open_drain_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_ch422g_set_oc_push_pull(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_oc_push_pull_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_ch422g_set_all_input(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_all_input_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_ch422g_set_all_output(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_all_output_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+static esp_err_t read_input_reg_unlocked(esp_io_expander_handle_t handle, uint32_t *value)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t temp = 0;
@@ -185,7 +238,7 @@ static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value
     return ESP_OK;
 }
 
-static esp_err_t write_output_reg(esp_io_expander_handle_t handle, uint32_t value)
+static esp_err_t write_output_reg_unlocked(esp_io_expander_handle_t handle, uint32_t value)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
 
@@ -213,7 +266,7 @@ static esp_err_t write_output_reg(esp_io_expander_handle_t handle, uint32_t valu
     return ESP_OK;
 }
 
-static esp_err_t read_output_reg(esp_io_expander_handle_t handle, uint32_t *value)
+static esp_err_t read_output_reg_unlocked(esp_io_expander_handle_t handle, uint32_t *value)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
 
@@ -222,7 +275,7 @@ static esp_err_t read_output_reg(esp_io_expander_handle_t handle, uint32_t *valu
     return ESP_OK;
 }
 
-static esp_err_t write_direction_reg(esp_io_expander_handle_t handle, uint32_t value)
+static esp_err_t write_direction_reg_unlocked(esp_io_expander_handle_t handle, uint32_t value)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
     uint8_t data = ch422g->regs.wr_set;
@@ -247,7 +300,7 @@ static esp_err_t write_direction_reg(esp_io_expander_handle_t handle, uint32_t v
 #define DIR_OUT_VALUE           (0xFFF)
 #define DIR_IN_VALUE            (0xF00)
 
-static esp_err_t read_direction_reg(esp_io_expander_handle_t handle, uint32_t *value)
+static esp_err_t read_direction_reg_unlocked(esp_io_expander_handle_t handle, uint32_t *value)
 {
     esp_io_expander_ch422g_t *ch422g = (esp_io_expander_ch422g_t *)__containerof(handle, esp_io_expander_ch422g_t, base);
 
@@ -256,12 +309,69 @@ static esp_err_t read_direction_reg(esp_io_expander_handle_t handle, uint32_t *v
     return ESP_OK;
 }
 
-static esp_err_t reset(esp_io_expander_t *handle)
+static esp_err_t reset_unlocked(esp_io_expander_t *handle)
 {
     ESP_RETURN_ON_ERROR(write_direction_reg(handle, REG_DIR_DEFAULT_VAL), TAG, "Write direction reg (WR_SET) failed");
     ESP_RETURN_ON_ERROR(write_output_reg(handle, REG_OUT_DEFAULT_VAL), TAG, "Write output reg (WR_OC & WR_IO) failed");
 
     return ESP_OK;
+}
+
+/* Lock callbacks as well as public composite APIs. The recursive mutex lets
+ * an outer operation retain atomicity while the private driver callbacks run.
+ */
+static esp_err_t read_input_reg(esp_io_expander_handle_t handle, uint32_t *value)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = read_input_reg_unlocked(handle, value);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
+}
+
+static esp_err_t write_output_reg(esp_io_expander_handle_t handle, uint32_t value)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = write_output_reg_unlocked(handle, value);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
+}
+
+static esp_err_t read_output_reg(esp_io_expander_handle_t handle, uint32_t *value)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = read_output_reg_unlocked(handle, value);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
+}
+
+static esp_err_t write_direction_reg(esp_io_expander_handle_t handle, uint32_t value)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = write_direction_reg_unlocked(handle, value);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
+}
+
+static esp_err_t read_direction_reg(esp_io_expander_handle_t handle, uint32_t *value)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = read_direction_reg_unlocked(handle, value);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
+}
+
+static esp_err_t reset(esp_io_expander_t *handle)
+{
+    esp_err_t ret = esp_io_expander_operation_lock(handle);
+    if (ret != ESP_OK) return ret;
+    ret = reset_unlocked(handle);
+    esp_io_expander_operation_unlock(handle);
+    return ret;
 }
 
 static esp_err_t del(esp_io_expander_t *handle)

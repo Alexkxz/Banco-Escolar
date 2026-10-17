@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "wifi_credentials.h"
+#include "storage/ota_maintenance_gate.h"
 
 namespace {
 constexpr uint32_t WIFI_RECONNECT_INTERVAL_MS = 5000;
@@ -118,6 +119,7 @@ bool WiFiManager::saveCredentials(const String &ssid, const String &password)
 
 bool WiFiManager::saveCredentialsUnlocked(const String &ssid, const String &password)
 {
+    if (ota_maintenance_active.load()) return false;
     if (ssid.length() == 0 || ssid.length() > 32 || password.length() > 63) return false;
     if (!preferences_ready_) {
         preferences_ready_ = preferences_.begin(WIFI_PREFERENCES_NAMESPACE, false);
@@ -153,6 +155,7 @@ bool WiFiManager::saveCredentialsUnlocked(const String &ssid, const String &pass
 
 void WiFiManager::clearCredentials()
 {
+    if (ota_maintenance_active.load()) return;
     SemaphoreGuard guard(mutex_);
     if (!preferences_ready_) {
         preferences_ready_ = preferences_.begin(WIFI_PREFERENCES_NAMESPACE, false);
@@ -181,6 +184,7 @@ void WiFiManager::clearCredentials()
 
 bool WiFiManager::startScan()
 {
+    if (ota_maintenance_active.load()) return false;
     SemaphoreGuard guard(mutex_);
     if (scan_in_progress_ || manual_attempt_pending_) return false;
     if (state_ == WiFiState::CONNECTING) {
@@ -252,6 +256,7 @@ uint32_t WiFiManager::scanRevision() const { SemaphoreGuard guard(mutex_); retur
 
 bool WiFiManager::connectToNetwork(const String &ssid, const String &password)
 {
+    if (ota_maintenance_active.load()) return false;
     SemaphoreGuard guard(mutex_);
     if (ssid.length() == 0 || ssid.length() > 32 || password.length() > 63) return false;
     if (scan_in_progress_) {

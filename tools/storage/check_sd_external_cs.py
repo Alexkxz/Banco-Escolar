@@ -11,7 +11,9 @@ SELECTOR = (ROOT / "src/storage/sd_external_cs.h").read_text(encoding="utf-8")
 PATHS = (ROOT / "src/storage/sd_path.h").read_text(encoding="utf-8")
 HEADER = (ROOT / "src/storage/sd_manager.h").read_text(encoding="utf-8")
 SERIAL = (ROOT / "src/diagnostics/terminal_capture.cpp").read_text(encoding="utf-8")
+MAIN = (ROOT / "src/main.cpp").read_text(encoding="utf-8")
 SD_TEST = (ROOT / "src/diagnostics/sd_file_test.cpp").read_text(encoding="utf-8")
+PROTOCOL = (ROOT / "src/diagnostics/diag_capture_protocol.h").read_text(encoding="utf-8")
 
 
 def body(source: str, signature: str) -> str:
@@ -43,8 +45,17 @@ size_file = body(MANAGER, "SdFileResult SDManager::fileSize(")
 list_directory = body(MANAGER, "SdFileResult SDManager::listDirectory(")
 create_directory = body(MANAGER, "SdFileResult SDManager::createDirectory(")
 remove_file = body(MANAGER, "SdFileResult SDManager::removeFile(")
+read_diagnostic = body(SD_TEST, "void sd_file_read_test_run()")
+info_diagnostic = body(SD_TEST, "void sd_file_info_test_run()")
+write_diagnostic = body(SD_TEST, "void sd_file_write_test_run()")
+exclusive_create = body(MANAGER, "SdFileResult SDManager::createFileExclusive(")
+directory_io_error = body(MANAGER, "SdFileResult SDManager::directoryIoError(")
+device_errno_classifier = body(MANAGER, "bool io_error_disables_device(")
 begin = body(MANAGER, "bool SDManager::begin(")
 unmount = body(MANAGER, "bool SDManager::unmount(")
+unmount_impl = body(MANAGER, "bool SDManager::unmountImpl(")
+parse_line = body(SERIAL, "void parse_line(const char *line)")
+read_serial_lines = body(SERIAL, "void read_serial_lines()")
 
 assert "digitalPinToGPIONumber" not in DRIVER
 assert "pinMode(" not in DRIVER and "digitalWrite(" not in DRIVER
@@ -66,7 +77,8 @@ assert "sdcard_mount(drive_, SD_MOUNT_PATH, SD_MAX_OPEN_FILES, SD_FORMAT_IF_EMPT
 assert "SD_FORMAT_IF_EMPTY = false" in MANAGER
 assert "listRoot()" in begin and "Montaje FAT persistente listo" in begin
 assert "unmount()" not in begin[begin.index("Montaje FAT persistente listo") :]
-assert "sdcard_unmount(drive_)" in unmount and "mounted_ = false" in unmount
+assert "closeAdmissionAndDrain(SD_CLOSE_DRAIN_TIMEOUT_MS)" in unmount and "unmountImpl()" in unmount
+assert "sdcard_unmount(drive_)" in unmount_impl and "mounted_ = false" in unmount_impl
 assert "SdFileResult fileExists(const char *path" in HEADER
 assert "SdFileResult fileSize(const char *path" in HEADER
 assert "readFile(const char *path" in HEADER
@@ -95,18 +107,77 @@ assert "mkdir(full_path.c_str()" in create_directory
 assert "unlink(full_path.c_str())" in remove_file
 assert "SdFileError::NO_SPACE" in MANAGER and "SdFileError::READ_FAILED" in MANAGER
 assert 'strcmp(line, "SD DIAG TEST") == 0' in SERIAL
+assert 'constexpr uint32_t SERIAL_BAUD_RATE = 460800' in PROTOCOL
+assert "Serial.begin(SERIAL_BAUD_RATE)" in MAIN
+assert "terminal_capture_poll();" in MAIN
+assert "sd_file_test_run();" not in MAIN
+assert 'if (strcmp(line, "SD DIAG TEST") == 0)' in parse_line
+assert 'if (strcmp(line, "SD DIAG READ") == 0)' in parse_line
+assert 'if (strcmp(line, "SD DIAG INFO") == 0)' in parse_line
+assert 'if (strcmp(line, "SD DIAG WRITE") == 0)' in parse_line
+assert "sd_file_info_test_run();" in parse_line and "sd_file_write_test_run();" in parse_line
+assert parse_line.index('if (strcmp(line, "SD DIAG READ") == 0)') < parse_line.index("sd_file_read_test_run();")
+assert parse_line.index('get_state() != State::IDLE') < parse_line.index("sd_file_read_test_run();")
+assert read_diagnostic.count('sd_manager.listDirectory("", entries)') == 1
+assert "attempt = 1" in read_diagnostic and "attempt <= 2" in read_diagnostic
+for forbidden in ("createDirectory", "writeFile", "removeFile", "rename(", "unlink(", "mkdir(", "format("):
+    assert forbidden not in read_diagnostic, f"read-only diagnostic invokes {forbidden}"
+for forbidden in ("createDirectory", "createFileExclusive", "writeFile", "removeFile", "rename(", "unlink(", "mkdir(", "format("):
+    assert forbidden not in info_diagnostic, f"SD DIAG INFO invokes {forbidden}"
+assert "cardSectorCount()" in info_diagnostic and "cardSectorSizeBytes()" in info_diagnostic
+assert "cardCapacityBytes()" in info_diagnostic and "filesystemTypeCode()" in info_diagnostic
+assert "filesystemStatsAvailable()" in info_diagnostic
+assert "NO DISPONIBLE" in info_diagnostic
+assert "createDirectory(WRITE_TEST_DIRECTORY)" in write_diagnostic
+assert "createFileExclusive(relative_path" in write_diagnostic
+assert "esp_random()" in write_diagnostic and "attempt < 8" in write_diagnostic
+assert "diag_capture::crc32" in write_diagnostic and "memcmp(contents.data()" in write_diagnostic
+assert "sd_manager.readFile(relative_path, contents)" in write_diagnostic
+for forbidden in ("writeFile(", "removeFile(", "rename(", "unlink(", "format("):
+    assert forbidden not in write_diagnostic, f"SD DIAG WRITE invokes unsafe path {forbidden}"
+assert "O_WRONLY | O_CREAT | O_EXCL" in exclusive_create
+assert "recoverWrite(" not in exclusive_create and "writeFile(" not in exclusive_create
+assert "fsync(descriptor)" in exclusive_create and "close(descriptor)" in exclusive_create
+assert "unlink(" not in exclusive_create and "rename(" not in exclusive_create
+assert "io_error_disables_device(system_error)" in directory_io_error
+assert "state_ = SdState::SD_ERROR" in directory_io_error
+assert "error_ = SdError::IO_FAILED" in directory_io_error
+assert "value == EBADF" in MANAGER and "value == EIO" in MANAGER
+assert all(code in device_errno_classifier for code in ("EBADF", "EIO", "ENODEV", "ENXIO"))
+assert all(code not in device_errno_classifier for code in ("ENOENT", "EINVAL", "ENOSPC", "EEXIST"))
+assert parse_line.index('get_state() != State::IDLE') < parse_line.index("sd_file_test_run();")
+assert "if (ch == '\\r') continue;" in read_serial_lines
+assert "if (ch == '\\n')" in read_serial_lines
+assert "parse_line(reinterpret_cast<const char *>(s_line))" in read_serial_lines
 assert "get_state() != State::IDLE" in SERIAL
 assert "sd_file_test_run();" in SERIAL
+assert 'constexpr char TEST_DIRECTORY[] = "sd_diag_manual";' in SD_TEST
+assert 'constexpr char TEST_FILE[] = "sd_diag_manual/payload.txt";' in SD_TEST
+assert "sd_manager.isReady()" in SD_TEST
+assert SD_TEST.index("sd_manager.isReady()") < SD_TEST.index('listDirectory("", root_entries)')
 assert 'listDirectory("", root_entries)' in SD_TEST
 assert "entry.name == TEST_DIRECTORY" in SD_TEST
+assert SD_TEST.index("entry.name == TEST_DIRECTORY") < SD_TEST.index("createDirectory(TEST_DIRECTORY)")
 assert 'listDirectory(TEST_DIRECTORY, test_entries)' in SD_TEST
 assert "test_entries.empty()" in SD_TEST
+assert "No se intento borrar nada; carpeta conservada para inspeccion" in SD_TEST
+assert "verificacion inicial de carpeta incompleta" in SD_TEST
 assert "createDirectory(TEST_DIRECTORY)" in SD_TEST
 assert "write_content(INITIAL_CONTENT, false" in SD_TEST
 assert "check_content(INITIAL_CONTENT" in SD_TEST
 assert "write_content(REPLACEMENT_CONTENT, true" in SD_TEST
 assert "check_content(REPLACEMENT_CONTENT" in SD_TEST
+assert SD_TEST.index('write_content(INITIAL_CONTENT, false') < SD_TEST.index('check_content(INITIAL_CONTENT')
+assert SD_TEST.index('check_content(INITIAL_CONTENT') < SD_TEST.index('write_content(REPLACEMENT_CONTENT, true')
+assert SD_TEST.index('write_content(REPLACEMENT_CONTENT, true') < SD_TEST.index('check_content(REPLACEMENT_CONTENT')
 assert "removeFile(TEST_FILE)" in SD_TEST
+assert "remove_test_file()" in SD_TEST and "if (file_created)" in SD_TEST
+assert "verify_test_directory_empty(payload_absence_confirmed)" in SD_TEST
+assert 'listDirectory(TEST_DIRECTORY, entries)' in SD_TEST
+assert "entries.empty()" in SD_TEST
+assert "payload_absence_confirmed" in SD_TEST
+assert "removeDirectory" not in SD_TEST and "rmdir(" not in SD_TEST
+assert "removeFile(TEST_DIRECTORY)" not in SD_TEST
 assert "sdcard_mount(" not in SD_TEST and "format(" not in SD_TEST
 assert 'validate_sd_path("../outside")' in PATHS
 assert 'validate_sd_path("data/../outside")' in PATHS
@@ -117,4 +188,9 @@ print("PASS: el driver no configura ni escribe un GPIO para CS (incluido GPIO 25
 print("PASS: CH422G reutilizado; montaje persistente sin formato automático.")
 print("PASS: API FAT con rutas relativas, lectura/listado y operaciones de archivo.")
 print("PASS: escritura temporal con sincronización, respaldo y recuperación por ruta.")
-print("PASS: diagnóstico serial manual de escritura, lectura, reemplazo y limpieza acotada.")
+print("PASS: comando SD DIAG TEST por línea LF exacta a 460800; ocupado DIAG.1 se rechaza.")
+print("PASS: comando SD DIAG READ exacto; dos listados consecutivos y solo lectura.")
+print("PASS: fallos de dispositivo EBADF/EIO/ENODEV/ENXIO invalidan READY; errores normales no.")
+print("PASS: diagnóstico requiere SD montada y carpeta ausente; solo opera sobre payload.txt.")
+print("PASS: lectura/comparación, reemplazo, borrado acotado y confirmación final de carpeta vacía.")
+print("PASS: sin formateo ni borrado de directorios; verificación estática, no prueba física.")

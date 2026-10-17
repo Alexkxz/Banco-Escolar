@@ -13,7 +13,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
-#include "esp_io_expander.h"
+#include "../../internal/esp_io_expander_private.h"
 #include "esp_io_expander_ht8574.h"
 
 #include "esp_expander_utils.h"

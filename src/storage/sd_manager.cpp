@@ -1,18 +1,24 @@
 #include "sd_manager.h"
+#include "ota_maintenance_gate.h"
 #include "storage_metrics.h"
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <string.h>
 #include <stdio.h>
+#include <utility>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include <esp_heap_caps.h>
 
 #include <esp_io_expander.hpp>
+#include "drivers/io_expander/esp_panel_io_expander.hpp"
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #include <ff.h>
 #include <sd_defines.h>
 #include "sd_diskio_external_cs.h"
@@ -28,7 +34,9 @@ constexpr char SD_MOUNT_PATH[] = "/sdcard";
 constexpr uint8_t SD_MAX_OPEN_FILES = 5;
 constexpr bool SD_FORMAT_IF_EMPTY = false;
 constexpr uint32_t SD_MAX_BUFFERED_READ_BYTES = 256U * 1024U;
+constexpr size_t SD_MAX_EXCLUSIVE_WRITE_CHUNK_BYTES = 4096;
 constexpr size_t SD_MAX_DIRECTORY_ENTRIES = 128;
+constexpr uint32_t SD_CLOSE_DRAIN_TIMEOUT_MS = 10000;
 
 static_assert(!SD_FORMAT_IF_EMPTY, "SD diagnosis must never format a card");
 
@@ -52,6 +60,11 @@ SdFileError map_io_error(int value, SdFileError fallback)
     if (value == ENOTDIR) return SdFileError::NOT_DIRECTORY;
     if (value == EEXIST) return SdFileError::ALREADY_EXISTS;
     return fallback;
+}
+
+bool io_error_disables_device(int value)
+{
+    return value == EBADF || value == EIO || value == ENODEV || value == ENXIO;
 }
 
 bool path_suffix(String &path, const char *suffix)
@@ -106,25 +119,117 @@ const char *sd_file_error_name(SdFileError error)
         case SdFileError::CREATE_DIRECTORY_FAILED: return "falló la creación del directorio";
         case SdFileError::REMOVE_FAILED: return "falló la eliminación";
         case SdFileError::RENAME_FAILED: return "falló el renombrado";
+        case SdFileError::MAINTENANCE_LOCKED: return "escritura bloqueada durante validación OTA";
+        case SdFileError::CLOSING: return "microSD en cierre; vuelva a intentar";
     }
     return "error de archivo microSD";
 }
 
-bool SDManager::begin(esp_expander::Base *expander)
+bool SDManager::enterOperation()
 {
+    const TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    const TaskHandle_t diagnostic_owner = diagnostic_owner_.load(std::memory_order_acquire);
+    if (diagnostic_owner != nullptr && diagnostic_owner != current_task) return false;
+    if (io_owner_.test_and_set(std::memory_order_acquire)) return false;
+    uint32_t observed = operation_gate_.load(std::memory_order_acquire);
+    for (;;) {
+        if ((observed & OPERATION_CLOSING_BIT) != 0 ||
+            (observed & OPERATION_COUNT_MASK) == OPERATION_COUNT_MASK) {
+            io_owner_.clear(std::memory_order_release);
+            return false;
+        }
+        if (operation_gate_.compare_exchange_weak(observed, observed + 1,
+                                                  std::memory_order_acq_rel,
+                                                  std::memory_order_acquire)) return true;
+    }
+}
+
+void SDManager::leaveOperation()
+{
+    io_owner_.clear(std::memory_order_release);
+    operation_gate_.fetch_sub(1, std::memory_order_release);
+}
+
+bool SDManager::beginDiagnosticExclusive(uint32_t timeout_ms)
+{
+    if (!closeAdmissionAndDrain(timeout_ms)) return false;
+    const TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    if (current_task == nullptr || exclusive_write_descriptor_ >= 0) {
+        reopenAdmission();
+        close_owner_.clear(std::memory_order_release);
+        return false;
+    }
+    diagnostic_owner_.store(current_task, std::memory_order_release);
+    // Keep one admission count as a lease. Board teardown cannot unmount FAT
+    // until endDiagnosticExclusive() releases it.
+    operation_gate_.store(1, std::memory_order_release);
+    reopenAdmission();
+    close_owner_.clear(std::memory_order_release);
+    return true;
+}
+
+bool SDManager::endDiagnosticExclusive()
+{
+    const TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    if (diagnostic_owner_.load(std::memory_order_acquire) != current_task) return false;
+    bool ok = true;
+    if (exclusive_write_descriptor_ >= 0) {
+        errno = 0;
+        if (close(exclusive_write_descriptor_) != 0) ok = false;
+        exclusive_write_descriptor_ = -1;
+    }
+    diagnostic_owner_.store(nullptr, std::memory_order_release);
+    operation_gate_.fetch_sub(1, std::memory_order_release);
+    return ok;
+}
+
+bool SDManager::closeAdmissionAndDrain(uint32_t timeout_ms)
+{
+    if (close_owner_.test_and_set(std::memory_order_acquire)) return false;
+    operation_gate_.fetch_or(OPERATION_CLOSING_BIT, std::memory_order_acq_rel);
+    const uint32_t start = millis();
+    for (;;) {
+        if ((operation_gate_.load(std::memory_order_acquire) & OPERATION_COUNT_MASK) == 0) {
+            return true;
+        }
+        if (static_cast<uint32_t>(millis() - start) >= timeout_ms) {
+            reopenAdmission();
+            close_owner_.clear(std::memory_order_release);
+            return false;
+        }
+        vTaskDelay(1);
+    }
+}
+
+void SDManager::reopenAdmission()
+{
+    operation_gate_.fetch_and(OPERATION_COUNT_MASK, std::memory_order_release);
+}
+
+bool SDManager::begin(std::shared_ptr<esp_panel::drivers::IO_Expander> expander)
+{
+    OperationGuard operation(*this);
+    if (!operation) return false;
     // Recover resources if the board manager is initialized again.
-    if (drive_ != 0xFF || spi_started_) unmount();
+    if (drive_ != 0xFF || spi_started_) {
+        if (!unmountImpl()) return false;
+    }
 
     state_ = SdState::SD_MOUNTING;
     error_ = SdError::NONE;
     card_type_ = SdCardType::NONE;
     card_capacity_bytes_ = 0;
+    card_sector_count_ = 0;
+    card_sector_size_bytes_ = 0;
+    filesystem_type_code_ = 0;
     total_bytes_ = 0;
     used_bytes_ = 0;
     free_bytes_ = 0;
     filesystem_stats_available_ = false;
     root_entry_count_ = 0;
-    expander_ = expander;
+    expander_owner_ = std::move(expander);
+    expander_ = expander_owner_ != nullptr ? expander_owner_->getBase() : nullptr;
+    board_shutdown_complete_ = false;
 
     if (expander_ == nullptr) {
         state_ = SdState::SD_ERROR;
@@ -135,18 +240,18 @@ bool SDManager::begin(esp_expander::Base *expander)
 
     if (!initializeBus()) return false;
 
-    if (!mount()) {
+    if (!mountImpl()) {
         Serial.printf("[MicroSD] %s; tipo=%s; capacidad=%llu bytes\n",
                       errorName(), cardTypeName(),
                       static_cast<unsigned long long>(card_capacity_bytes_));
-        unmount();
+        unmountImpl();
         return false;
     }
 
     Serial.printf("[MicroSD] Montada: tipo=%s; capacidad=%llu bytes\n",
                   cardTypeName(), static_cast<unsigned long long>(card_capacity_bytes_));
     if (!listRoot()) {
-        unmount();
+        unmountImpl();
         return false;
     }
 
@@ -159,6 +264,13 @@ bool SDManager::begin(esp_expander::Base *expander)
 bool SDManager::initializeBus()
 {
     if (drive_ != 0xFF) return true;
+    // A prior close may have unregistered the SD device but failed to
+    // deselect CS. Finish that release before attempting another SPI setup.
+    if (spi_started_ && !releaseBus()) {
+        state_ = SdState::SD_ERROR;
+        error_ = SdError::UNMOUNT_FAILED;
+        return false;
+    }
     if (expander_ == nullptr) {
         state_ = SdState::SD_ERROR;
         error_ = SdError::EXPANDER_UNAVAILABLE;
@@ -184,7 +296,7 @@ bool SDManager::initializeBus()
         state_ = SdState::SD_ERROR;
         error_ = SdError::SPI_DRIVER_FAILED;
         Serial.println("[MicroSD] Error: no se pudo preparar el controlador SPI de la tarjeta");
-        unmount();
+        unmountImpl();
         return false;
     }
     return true;
@@ -192,11 +304,26 @@ bool SDManager::initializeBus()
 
 bool SDManager::mount()
 {
+    OperationGuard operation(*this);
+    return operation && mountImpl();
+}
+
+bool SDManager::mountImpl()
+{
     if (mounted_) {
         state_ = SdState::SD_READY;
         error_ = SdError::NONE;
         return true;
     }
+    card_type_ = SdCardType::NONE;
+    card_capacity_bytes_ = 0;
+    card_sector_count_ = 0;
+    card_sector_size_bytes_ = 0;
+    filesystem_type_code_ = 0;
+    total_bytes_ = 0;
+    used_bytes_ = 0;
+    free_bytes_ = 0;
+    filesystem_stats_available_ = false;
     if (!initializeBus()) return false;
     if (drive_ == 0xFF) {
         state_ = SdState::SD_ERROR;
@@ -209,8 +336,9 @@ bool SDManager::mount()
     // fail untouched, never trigger f_mkfs.
     if (!sdcard_mount(drive_, SD_MOUNT_PATH, SD_MAX_OPEN_FILES, SD_FORMAT_IF_EMPTY)) {
         card_type_ = map_card_type(sdcard_type(drive_));
-        card_capacity_bytes_ = measured_capacity_bytes(sdcard_num_sectors(drive_),
-                                                       sdcard_sector_size(drive_));
+        card_sector_count_ = sdcard_num_sectors(drive_);
+        card_sector_size_bytes_ = sdcard_sector_size(drive_);
+        card_capacity_bytes_ = measured_capacity_bytes(card_sector_count_, card_sector_size_bytes_);
         state_ = sd_state_after_mount_failure(card_type_);
         error_ = state_ == SdState::SD_NOT_PRESENT ? SdError::CARD_NOT_RESPONDING :
                                                      SdError::FILESYSTEM_MOUNT_FAILED;
@@ -219,8 +347,9 @@ bool SDManager::mount()
 
     mounted_ = true;
     card_type_ = map_card_type(sdcard_type(drive_));
-    card_capacity_bytes_ = measured_capacity_bytes(sdcard_num_sectors(drive_),
-                                                   sdcard_sector_size(drive_));
+    card_sector_count_ = sdcard_num_sectors(drive_);
+    card_sector_size_bytes_ = sdcard_sector_size(drive_);
+    card_capacity_bytes_ = measured_capacity_bytes(card_sector_count_, card_sector_size_bytes_);
     if (card_type_ == SdCardType::NONE || card_type_ == SdCardType::UNKNOWN ||
         card_capacity_bytes_ == 0) {
         state_ = SdState::SD_ERROR;
@@ -232,6 +361,7 @@ bool SDManager::mount()
     FATFS *filesystem = nullptr;
     DWORD free_clusters = 0;
     if (f_getfree(volume, &free_clusters, &filesystem) == FR_OK && filesystem != nullptr) {
+        filesystem_type_code_ = filesystem->fs_type;
         const uint64_t cluster_count = filesystem->n_fatent > 2U
             ? static_cast<uint64_t>(filesystem->n_fatent - 2U) : 0;
 #if _MAX_SS != 512
@@ -290,44 +420,88 @@ bool SDManager::listRoot()
 
 bool SDManager::unmount()
 {
+    if (!closeAdmissionAndDrain(SD_CLOSE_DRAIN_TIMEOUT_MS)) return false;
+    const bool result = unmountImpl();
+    reopenAdmission();
+    close_owner_.clear(std::memory_order_release);
+    return result;
+}
+
+bool SDManager::unmountImpl()
+{
     const bool was_mounted = mounted_;
-    bool closed = true;
-    if (drive_ != 0xFF) {
-        if (mounted_ && sdcard_unmount(drive_) != 0) {
-            closed = false;
+    if (drive_ != 0xFF && mounted_) {
+        if (sdcard_unmount(drive_) != 0) {
             Serial.println("[MicroSD] Error al desmontar FAT");
+            state_ = SdState::SD_ERROR;
+            error_ = SdError::UNMOUNT_FAILED;
+            return false;
         }
         mounted_ = false;
-        if (sdcard_uninit(drive_) != 0) {
-            closed = false;
-            Serial.println("[MicroSD] Error al liberar el controlador de la tarjeta");
-        }
+    }
+    if (drive_ != 0xFF) {
+        const uint8_t old_drive = drive_;
+        const uint8_t uninit_result = sdcard_uninit(old_drive);
+        // sdcard_uninit unregisters the disk and frees its card object even
+        // when VFS path unregistration reports an error. Never call it twice.
         drive_ = 0xFF;
+        if (uninit_result != 0) {
+            Serial.println("[MicroSD] Error al liberar el controlador de la tarjeta");
+            state_ = SdState::SD_ERROR;
+            error_ = SdError::UNMOUNT_FAILED;
+            return false;
+        }
     }
 
-    if (!releaseBus()) closed = false;
-    if (!closed) {
+    if (!releaseBus()) {
         state_ = SdState::SD_ERROR;
         error_ = SdError::UNMOUNT_FAILED;
-    } else if (was_mounted && state_ != SdState::SD_ERROR) {
+        return false;
+    }
+    if (was_mounted && state_ != SdState::SD_ERROR) {
         state_ = SdState::SD_UNMOUNTED;
         error_ = SdError::NONE;
     }
-    return closed;
+    return true;
 }
 
 bool SDManager::releaseBus()
 {
-    bool released = true;
     if (expander_ != nullptr && !expander_->digitalWrite(SD_CS_EXIO, HIGH)) {
-        released = false;
         Serial.println("[MicroSD] Error al desactivar EXIO4 (SD_CS)");
+        return false;
     }
     if (spi_started_) {
         SPI.end();
         spi_started_ = false;
     }
-    return released;
+    return true;
+}
+
+bool SDManager::shutdownForBoardDelete()
+{
+    if (board_shutdown_complete_) return true;
+    if (!closeAdmissionAndDrain(SD_CLOSE_DRAIN_TIMEOUT_MS)) return false;
+    if (!unmountImpl()) {
+        // Keep admission closed and retain the owner/callback context. A
+        // later Board::del() retry can safely resume teardown.
+        close_owner_.clear(std::memory_order_release);
+        return false;
+    }
+    expander_ = nullptr;
+    board_shutdown_complete_ = true;
+    close_owner_.clear(std::memory_order_release);
+    return true;
+}
+
+bool SDManager::completeBoardDelete()
+{
+    if (!board_shutdown_complete_ || drive_ != 0xFF || spi_started_) return false;
+    expander_ = nullptr;
+    expander_owner_.reset();
+    board_shutdown_complete_ = false;
+    reopenAdmission();
+    return true;
 }
 
 SdState SDManager::state() const
@@ -373,14 +547,28 @@ const char *SDManager::errorName() const
         case SdError::FILESYSTEM_MOUNT_FAILED: return "tarjeta detectada, montaje FAT fallido (sin formatear)";
         case SdError::ROOT_READ_FAILED: return "no se pudo leer la raíz";
         case SdError::UNMOUNT_FAILED: return "falló el desmontaje de FAT o SPI";
+        case SdError::IO_FAILED: return "fallo de E/S; microSD/controlador requiere reinicialización";
     }
     return "fallo de microSD";
+}
+
+SdFileResult SDManager::directoryIoError(SdFileError fallback, int system_error)
+{
+    if (io_error_disables_device(system_error)) {
+        state_ = SdState::SD_ERROR;
+        error_ = SdError::IO_FAILED;
+    }
+    return file_error(map_io_error(system_error, fallback), system_error);
 }
 
 uint64_t SDManager::cardCapacityBytes() const
 {
     return card_capacity_bytes_;
 }
+
+uint32_t SDManager::cardSectorCount() const { return card_sector_count_; }
+uint32_t SDManager::cardSectorSizeBytes() const { return card_sector_size_bytes_; }
+uint8_t SDManager::filesystemTypeCode() const { return filesystem_type_code_; }
 
 size_t SDManager::rootEntryCount() const
 {
@@ -418,6 +606,7 @@ SdFileResult SDManager::validateAndBuildPath(const char *path, String &full_path
 
 SdFileResult SDManager::recoverWrite(const String &full_path)
 {
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
     String temporary = full_path;
     String backup = full_path;
     if (!path_suffix(temporary, ".tmp") || !path_suffix(backup, ".bak"))
@@ -459,6 +648,8 @@ SdFileResult SDManager::recoverWrite(const String &full_path)
 SdFileResult SDManager::fileExists(const char *path, bool &exists)
 {
     exists = false;
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     SdFileResult result = validateAndBuildPath(path, full_path);
@@ -478,6 +669,8 @@ SdFileResult SDManager::fileExists(const char *path, bool &exists)
 SdFileResult SDManager::fileSize(const char *path, uint64_t &size_bytes)
 {
     size_bytes = 0;
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     SdFileResult result = validateAndBuildPath(path, full_path);
@@ -497,6 +690,8 @@ SdFileResult SDManager::fileSize(const char *path, uint64_t &size_bytes)
 SdFileResult SDManager::readFile(const char *path, std::vector<uint8_t> &contents)
 {
     contents.clear();
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     SdFileResult result = validateAndBuildPath(path, full_path);
@@ -540,6 +735,8 @@ SdFileResult SDManager::streamFile(const char *path, SdStreamStartCallback on_st
 {
     file_size_bytes = 0;
     bytes_streamed = 0;
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     if (on_start == nullptr || (!headers_only && on_chunk == nullptr))
         return file_error(SdFileError::READ_FAILED, EINVAL);
@@ -594,6 +791,8 @@ SdFileResult SDManager::streamFile(const char *path, SdStreamStartCallback on_st
 SdFileResult SDManager::listDirectory(const char *path, std::vector<SdFileInfo> &entries)
 {
     entries.clear();
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     if (path == nullptr || path[0] == '\0') full_path = SD_MOUNT_PATH;
@@ -604,13 +803,13 @@ SdFileResult SDManager::listDirectory(const char *path, std::vector<SdFileInfo> 
 
     errno = 0;
     DIR *directory = opendir(full_path.c_str());
-    if (directory == nullptr) return file_error(map_io_error(errno, SdFileError::LIST_FAILED), errno);
+    if (directory == nullptr) return directoryIoError(SdFileError::LIST_FAILED, errno);
     SdFileResult result;
     for (;;) {
         errno = 0;
         struct dirent *entry = readdir(directory);
         if (entry == nullptr) {
-            if (errno != 0) result = file_error(map_io_error(errno, SdFileError::LIST_FAILED), errno);
+            if (errno != 0) result = directoryIoError(SdFileError::LIST_FAILED, errno);
             break;
         }
         if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
@@ -635,7 +834,7 @@ SdFileResult SDManager::listDirectory(const char *path, std::vector<SdFileInfo> 
         struct stat child_info {};
         errno = 0;
         if (stat(child.c_str(), &child_info) != 0) {
-            result = file_error(map_io_error(errno, SdFileError::LIST_FAILED), errno);
+            result = directoryIoError(SdFileError::LIST_FAILED, errno);
             break;
         }
         info.is_directory = S_ISDIR(child_info.st_mode);
@@ -645,13 +844,16 @@ SdFileResult SDManager::listDirectory(const char *path, std::vector<SdFileInfo> 
     }
     errno = 0;
     if (closedir(directory) != 0 && result.ok())
-        result = file_error(map_io_error(errno, SdFileError::LIST_FAILED), errno);
+        result = directoryIoError(SdFileError::LIST_FAILED, errno);
     if (!result.ok()) entries.clear();
     return result;
 }
 
 SdFileResult SDManager::createDirectory(const char *path)
 {
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     SdFileResult result = validateAndBuildPath(path, full_path);
@@ -669,6 +871,9 @@ SdFileResult SDManager::createDirectory(const char *path)
 SdFileResult SDManager::writeFile(const char *path, const uint8_t *data, size_t length,
                                  bool replace)
 {
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     if (data == nullptr && length != 0) return file_error(SdFileError::WRITE_FAILED, EINVAL);
     String full_path;
@@ -737,8 +942,118 @@ SdFileResult SDManager::writeFile(const char *path, const String &contents, bool
                      contents.length(), replace);
 }
 
+SdFileResult SDManager::createFileExclusive(const char *path, const uint8_t *data, size_t length)
+{
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
+    if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
+    if (data == nullptr && length != 0) return file_error(SdFileError::WRITE_FAILED, EINVAL);
+
+    String full_path;
+    SdFileResult result = validateAndBuildPath(path, full_path);
+    if (!result.ok()) return result;
+
+    errno = 0;
+    const int descriptor = open(full_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (descriptor < 0) return file_error(map_io_error(errno, SdFileError::WRITE_FAILED), errno);
+
+    size_t written = 0;
+    while (written < length) {
+        errno = 0;
+        const ssize_t count = write(descriptor, data + written, length - written);
+        if (count > 0) {
+            written += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        result = file_error(map_io_error(errno, SdFileError::WRITE_FAILED), errno);
+        break;
+    }
+    if (result.ok()) {
+        errno = 0;
+        if (fsync(descriptor) != 0)
+            result = file_error(map_io_error(errno, SdFileError::WRITE_FAILED), errno);
+    }
+    errno = 0;
+    if (close(descriptor) != 0 && result.ok())
+        result = file_error(map_io_error(errno, SdFileError::CLOSE_FAILED), errno);
+    return result;
+}
+
+SdFileResult SDManager::beginExclusiveStreamWrite(const char *path)
+{
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (diagnostic_owner_.load(std::memory_order_acquire) != xTaskGetCurrentTaskHandle())
+        return file_error(SdFileError::CLOSING);
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
+    if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
+    if (exclusive_write_descriptor_ >= 0) return file_error(SdFileError::CLOSING);
+
+    String full_path;
+    SdFileResult result = validateAndBuildPath(path, full_path);
+    if (!result.ok()) return result;
+    errno = 0;
+    const int descriptor = open(full_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (descriptor < 0) return file_error(map_io_error(errno, SdFileError::WRITE_FAILED), errno);
+    exclusive_write_descriptor_ = descriptor;
+    return {};
+}
+
+SdFileResult SDManager::writeExclusiveStreamChunk(const uint8_t *data, size_t length,
+                                                  size_t &bytes_written)
+{
+    bytes_written = 0;
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (diagnostic_owner_.load(std::memory_order_acquire) != xTaskGetCurrentTaskHandle() ||
+        exclusive_write_descriptor_ < 0)
+        return file_error(SdFileError::CLOSING);
+    if (data == nullptr && length != 0) return file_error(SdFileError::WRITE_FAILED, EINVAL);
+    if (length > SD_MAX_EXCLUSIVE_WRITE_CHUNK_BYTES)
+        return file_error(SdFileError::RESOURCE_LIMIT, EINVAL);
+
+    while (bytes_written < length) {
+        errno = 0;
+        const ssize_t count = write(exclusive_write_descriptor_, data + bytes_written,
+                                    length - bytes_written);
+        if (count > 0) {
+            bytes_written += static_cast<size_t>(count);
+            continue;
+        }
+        if (count < 0 && errno == EINTR) continue;
+        const int saved_errno = errno;
+        return file_error(map_io_error(saved_errno, SdFileError::WRITE_FAILED), saved_errno);
+    }
+    if (bytes_written != length) return file_error(SdFileError::WRITE_FAILED);
+    return {};
+}
+
+SdFileResult SDManager::finishExclusiveStreamWrite()
+{
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (diagnostic_owner_.load(std::memory_order_acquire) != xTaskGetCurrentTaskHandle() ||
+        exclusive_write_descriptor_ < 0)
+        return file_error(SdFileError::CLOSING);
+
+    SdFileResult result;
+    errno = 0;
+    if (fsync(exclusive_write_descriptor_) != 0)
+        result = file_error(map_io_error(errno, SdFileError::WRITE_FAILED), errno);
+    errno = 0;
+    if (close(exclusive_write_descriptor_) != 0 && result.ok())
+        result = file_error(map_io_error(errno, SdFileError::CLOSE_FAILED), errno);
+    exclusive_write_descriptor_ = -1;
+    return result;
+}
+
 SdFileResult SDManager::removeFile(const char *path)
 {
+    OperationGuard operation(*this);
+    if (!operation) return file_error(SdFileError::CLOSING);
+    if (ota_maintenance_active.load()) return file_error(SdFileError::MAINTENANCE_LOCKED);
     if (!isReady()) return file_error(SdFileError::NOT_MOUNTED);
     String full_path;
     SdFileResult result = validateAndBuildPath(path, full_path);

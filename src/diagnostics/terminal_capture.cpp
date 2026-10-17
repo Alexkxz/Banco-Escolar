@@ -1,10 +1,12 @@
 #include "terminal_capture.h"
 
 #include <Arduino.h>
+#include <atomic>
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/portmacro.h>
+#include <freertos/task.h>
 #include <lvgl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +46,9 @@ enum class AckFailure : uint8_t { NONE, TIMEOUT, NAK };
 
 enum class State : uint8_t { IDLE, REQUESTED, CAPTURING, READY, TRANSFERRING, FAILED };
 enum class TransferPhase : uint8_t { NONE, META, SEND_DATA, WAIT_ACK, END, WAIT_VERIFY, SD_STATUS, CLEANUP };
+enum class SdDiagnosticTask : uintptr_t { VERIFY = 1, LARGE = 2 };
+std::atomic<bool> s_sd_diagnostic_task_active{false};
+void start_sd_diagnostic_task(SdDiagnosticTask task);
 
 portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE s_ui_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -276,6 +281,51 @@ void cleanup_capture()
 
 void parse_line(const char *line)
 {
+    if (strcmp(line, "SD DIAG INFO") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-INFO] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        sd_file_info_test_run();
+        return;
+    }
+
+    if (strcmp(line, "SD DIAG WRITE") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-WRITE] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        sd_file_write_test_run();
+        return;
+    }
+
+    if (strcmp(line, "SD DIAG VERIFY") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-VERIFY] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        start_sd_diagnostic_task(SdDiagnosticTask::VERIFY);
+        return;
+    }
+
+    if (strcmp(line, "SD DIAG LARGE") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-LARGE] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        start_sd_diagnostic_task(SdDiagnosticTask::LARGE);
+        return;
+    }
+
+    if (strcmp(line, "SD DIAG READ") == 0) {
+        if (get_state() != State::IDLE) {
+            Serial.println("[SD-READ] ABORTADO: termina primero la captura DIAG.1 en curso.");
+            return;
+        }
+        sd_file_read_test_run();
+        return;
+    }
+
     if (strcmp(line, "SD DIAG TEST") == 0) {
         if (get_state() != State::IDLE) {
             Serial.println("[SD-DIAG] ABORTADO: termina primero la captura DIAG.1 en curso.");
@@ -286,6 +336,10 @@ void parse_line(const char *line)
     }
 
     if (strcmp(line, diag_capture::REQUEST_LINE) == 0) {
+        if (s_sd_diagnostic_task_active.load(std::memory_order_acquire)) {
+            Serial.println("DIAG.1 ABORTADO: termina primero el diagnóstico avanzado de microSD.");
+            return;
+        }
         if (!terminal_capture_request()) s_busy_response_pending = true;
         return;
     }
@@ -352,6 +406,32 @@ void read_serial_lines()
             else s_line_overflow = true;
         }
     }
+}
+
+void sd_diagnostic_task(void *argument)
+{
+    const SdDiagnosticTask task = static_cast<SdDiagnosticTask>(reinterpret_cast<uintptr_t>(argument));
+    if (task == SdDiagnosticTask::VERIFY) sd_file_verify_test_run();
+    else sd_file_large_test_run();
+    s_sd_diagnostic_task_active.store(false, std::memory_order_release);
+    vTaskDelete(nullptr);
+}
+
+void start_sd_diagnostic_task(SdDiagnosticTask task)
+{
+    bool expected = false;
+    if (!s_sd_diagnostic_task_active.compare_exchange_strong(expected, true,
+                                                             std::memory_order_acq_rel)) {
+        Serial.println("[SD-DIAG] ABORTADO: ya hay una prueba avanzada en curso.");
+        return;
+    }
+    if (xTaskCreate(sd_diagnostic_task, "sd_diag", 8192,
+                    reinterpret_cast<void *>(static_cast<uintptr_t>(task)), 1, nullptr) != pdPASS) {
+        s_sd_diagnostic_task_active.store(false, std::memory_order_release);
+        Serial.println("[SD-DIAG] ABORTADO: no hay memoria suficiente para iniciar la tarea de diagnóstico.");
+        return;
+    }
+    Serial.println("[SD-DIAG] Tarea manual iniciada en segundo plano.");
 }
 
 void capture_timer_cb(lv_timer_t *timer)

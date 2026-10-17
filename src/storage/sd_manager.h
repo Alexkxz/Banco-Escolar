@@ -2,12 +2,19 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <atomic>
+#include <memory>
 #include <vector>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <WString.h>
 
 namespace esp_expander {
 class Base;
+}
+namespace esp_panel::drivers {
+class IO_Expander;
 }
 
 enum class SdState : uint8_t {
@@ -61,7 +68,8 @@ enum class SdError : uint8_t {
     CARD_NOT_RESPONDING,
     FILESYSTEM_MOUNT_FAILED,
     ROOT_READ_FAILED,
-    UNMOUNT_FAILED
+    UNMOUNT_FAILED,
+    IO_FAILED
 };
 
 enum class SdFileError : uint8_t {
@@ -80,7 +88,9 @@ enum class SdFileError : uint8_t {
     LIST_FAILED,
     CREATE_DIRECTORY_FAILED,
     REMOVE_FAILED,
-    RENAME_FAILED
+    RENAME_FAILED,
+    MAINTENANCE_LOCKED,
+    CLOSING
 };
 
 struct SdFileResult {
@@ -117,9 +127,14 @@ static_assert(sd_state_after_mount_failure(SdCardType::SDHC) == SdState::SD_ERRO
 class SDManager {
 public:
     // Reuses the CH422G instance already initialized by Board::begin().
-    bool begin(esp_expander::Base *expander);
+    bool begin(std::shared_ptr<esp_panel::drivers::IO_Expander> expander);
     bool mount();
     bool unmount();
+
+    // Board PRE/POST_BOARD_DEL hooks. The owner remains retained until Board
+    // confirms that its controller del() succeeded.
+    bool shutdownForBoardDelete();
+    bool completeBoardDelete();
 
     SdState state() const;
     SdError error() const;
@@ -128,6 +143,9 @@ public:
     const char *cardTypeName() const;
     const char *errorName() const;
     uint64_t cardCapacityBytes() const;
+    uint32_t cardSectorCount() const;
+    uint32_t cardSectorSizeBytes() const;
+    uint8_t filesystemTypeCode() const;
     size_t rootEntryCount() const;
     bool filesystemStatsAvailable() const;
     uint64_t totalBytes() const;
@@ -149,23 +167,62 @@ public:
                            bool replace = true);
     SdFileResult writeFile(const char *path, const String &contents,
                            bool replace = true);
+    // O_EXCL creation only; never recovers/replaces/removes. Partial files remain on error.
+    SdFileResult createFileExclusive(const char *path, const uint8_t *data, size_t length);
+    // Exclusive diagnostic lease: other tasks receive CLOSING until released.
+    bool beginDiagnosticExclusive(uint32_t timeout_ms = 10000);
+    bool endDiagnosticExclusive();
+    SdFileResult beginExclusiveStreamWrite(const char *path);
+    SdFileResult writeExclusiveStreamChunk(const uint8_t *data, size_t length,
+                                            size_t &bytes_written);
+    SdFileResult finishExclusiveStreamWrite();
     SdFileResult removeFile(const char *path);
 
 private:
+    class OperationGuard {
+    public:
+        explicit OperationGuard(SDManager &manager): manager_(manager), admitted_(manager_.enterOperation()) {}
+        ~OperationGuard() { if (admitted_) manager_.leaveOperation(); }
+        explicit operator bool() const { return admitted_; }
+    private:
+        SDManager &manager_;
+        bool admitted_;
+    };
+
+    bool enterOperation();
+    void leaveOperation();
+    bool closeAdmissionAndDrain(uint32_t timeout_ms = 10000);
+    void reopenAdmission();
+    bool mountImpl();
+    bool unmountImpl();
     bool listRoot();
     bool releaseBus();
     bool initializeBus();
     SdFileResult validateAndBuildPath(const char *path, String &full_path) const;
     SdFileResult recoverWrite(const String &full_path);
+    SdFileResult directoryIoError(SdFileError fallback, int system_error);
 
     SdState state_ = SdState::SD_NOT_PRESENT;
     SdError error_ = SdError::NONE;
     SdCardType card_type_ = SdCardType::NONE;
+    std::shared_ptr<esp_panel::drivers::IO_Expander> expander_owner_;
     esp_expander::Base *expander_ = nullptr;
+    // High bit closes admission; remaining bits count all admitted operations.
+    static constexpr uint32_t OPERATION_CLOSING_BIT = UINT32_C(1) << 31;
+    static constexpr uint32_t OPERATION_COUNT_MASK = ~OPERATION_CLOSING_BIT;
+    std::atomic<uint32_t> operation_gate_{0};
+    std::atomic_flag close_owner_ = ATOMIC_FLAG_INIT;
+    std::atomic_flag io_owner_ = ATOMIC_FLAG_INIT;
+    std::atomic<TaskHandle_t> diagnostic_owner_{nullptr};
+    int exclusive_write_descriptor_ = -1;
+    bool board_shutdown_complete_ = false;
     uint8_t drive_ = 0xFF;
     bool spi_started_ = false;
     bool mounted_ = false;
     uint64_t card_capacity_bytes_ = 0;
+    uint32_t card_sector_count_ = 0;
+    uint32_t card_sector_size_bytes_ = 0;
+    uint8_t filesystem_type_code_ = 0;
     uint64_t total_bytes_ = 0;
     uint64_t used_bytes_ = 0;
     uint64_t free_bytes_ = 0;

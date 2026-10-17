@@ -57,6 +57,10 @@ Los perfiles usan iniciales y color determinista. El control excepcional de imag
 
 La marca usa el logo original de `Imagenes/Logo y nombre.png`; el recurso se importa sin alterar el original. Los iconos SVG proceden de una biblioteca pequeña única.
 
+## Servidor local para Windows
+
+Después de generar `dist/`, abre `Abrir-Banco-Escolar.bat`. El servidor Node local solo escucha en `127.0.0.1:4173`; presiona `Ctrl+C` en esa ventana para detenerlo. Consulta [SERVER_LOCAL.md](SERVER_LOCAL.md) para errores, logs y el futuro empaquetado portable. `npm run test:server` ejecuta pruebas con el runner nativo de Node, sin instalar paquetes.
+
 ## Límites y fases futuras
 
 El proveedor `DemoPanelDataService` sirve colecciones ficticias y no lee ni escribe datos del firmware. PM.9B persiste en IndexedDB solo los datos demo. No existe API, base central, autenticación ni sincronización. No hay Service Worker ni funcionamiento offline garantizado. Los tipos de `models/` tampoco definen contratos de servidor. El estado ACTIVE/INACTIVE de estudiantes es solo de la demo; no existe en el modelo actual del firmware.

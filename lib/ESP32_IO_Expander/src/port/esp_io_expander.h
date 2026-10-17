@@ -87,107 +87,12 @@ typedef struct {
     /* Don't support with interrupt mode yet, will be added soon */
 } esp_io_expander_config_t;
 
-struct esp_io_expander_s {
-
-    /**
-     * @brief Read value from input register (mandatory)
-     *
-     * @note The value represents the input level from IO
-     * @note If there are multiple input registers in the device, their values should be spliced together in order to form the `value`.
-     *
-     * @param handle: IO Expander handle
-     * @param value: Register's value
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*read_input_reg)(esp_io_expander_handle_t handle, uint32_t *value);
-
-    /**
-     * @brief Write value to output register (mandatory)
-     *
-     * @note The value represents the output level to IO
-     * @note If there are multiple input registers in the device, their values should be spliced together in order to form the `value`.
-     *
-     * @param handle: IO Expander handle
-     * @param value: Register's value
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*write_output_reg)(esp_io_expander_handle_t handle, uint32_t value);
-
-    /**
-     * @brief Read value from output register (mandatory)
-     *
-     * @note The value represents the expected output level to IO
-     * @note This function can be implemented by reading the physical output register, or simply by reading a variable that record the output value (more faster)
-     * @note If there are multiple input registers in the device, their values should be spliced together in order to form the `value`.
-     *
-     * @param handle: IO Expander handle
-     * @param value: Register's value
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*read_output_reg)(esp_io_expander_handle_t handle, uint32_t *value);
-
-    /**
-     * @brief Write value to direction register (mandatory)
-     *
-     * @note The value represents the direction of IO
-     * @note If there are multiple input registers in the device, their values should be spliced together in order to form the `value`.
-     *
-     * @param handle: IO Expander handle
-     * @param value: Register's value
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*write_direction_reg)(esp_io_expander_handle_t handle, uint32_t value);
-
-    /**
-     * @brief Read value from directioin register (mandatory)
-     *
-     * @note The value represents the expected direction of IO
-     * @note This function can be implemented by reading the physical direction register, or simply by reading a variable that record the direction value (more faster)
-     * @note If there are multiple input registers in the device, their values should be spliced together in order to form the `value`.
-     *
-     * @param handle: IO Expander handle
-     * @param value: Register's value
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*read_direction_reg)(esp_io_expander_handle_t handle, uint32_t *value);
-
-    /**
-     * @brief Reset the device to its initial state (mandatory)
-     *
-     * @note This function will reset all device's registers
-     *
-     * @param handle: IO Expander handle
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*reset)(esp_io_expander_handle_t handle);
-
-    /**
-     * @brief Delete device (mandatory)
-     *
-     * @param handle: IO Expander handle
-     *
-     * @return
-     *      - ESP_OK: Success, otherwise returns ESP_ERR_xxx
-     */
-    esp_err_t (*del)(esp_io_expander_handle_t handle);
-
-    /**
-     * @brief Configuration structure
-     */
-    esp_io_expander_config_t config;
-};
+/* Concrete handle fields and driver callbacks are private to this component.
+ * Applications use esp_io_expander_* APIs; destruction is supported only
+ * through esp_io_expander_del(). The owner must stop publishing the handle
+ * and quiesce all callers before deletion. A managed device returns
+ * ESP_ERR_TIMEOUT on a close timeout and remains alive and ACTIVE.
+ */
 
 /**
  * @brief Set the direction of a set of target IOs

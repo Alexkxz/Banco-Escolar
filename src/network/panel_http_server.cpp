@@ -175,6 +175,7 @@ void handle_file()
         if (stream_result.error == SdFileError::NOT_FOUND) send_error(404, "File not found");
         else if (stream_result.error == SdFileError::INVALID_PATH) send_error(400, "Invalid file path");
         else if (stream_result.error == SdFileError::NOT_MOUNTED) send_error(503, "microSD is not mounted");
+        else if (stream_result.error == SdFileError::CLOSING) send_error(503, "microSD is busy");
         else if (stream_result.error != SdFileError::RESOURCE_LIMIT)
             send_error(500, "Unable to read file metadata");
     } else if (!stream_result.ok() || (!headers_only && bytes_streamed != file_size)) {

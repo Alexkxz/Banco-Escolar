@@ -11,7 +11,8 @@
 #include "esp_check.h"
 #include "esp_log.h"
 
-#include "esp_io_expander.h"
+#include "../../internal/esp_io_expander_private.h"
+#include "../../internal/esp_io_expander_lock.h"
 
 #include "esp_expander_utils.h"
 
@@ -31,7 +32,7 @@ static char *TAG = "io_expander";
 static esp_err_t write_reg(esp_io_expander_handle_t handle, reg_type_t reg, uint32_t value);
 static esp_err_t read_reg(esp_io_expander_handle_t handle, reg_type_t reg, uint32_t *value);
 
-esp_err_t esp_io_expander_set_dir(esp_io_expander_handle_t handle, uint32_t pin_num_mask, esp_io_expander_dir_t direction)
+static esp_err_t set_dir_unlocked(esp_io_expander_handle_t handle, uint32_t pin_num_mask, esp_io_expander_dir_t direction)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     if (pin_num_mask >= BIT64(VALID_IO_COUNT(handle))) {
@@ -59,7 +60,7 @@ esp_err_t esp_io_expander_set_dir(esp_io_expander_handle_t handle, uint32_t pin_
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_set_level(esp_io_expander_handle_t handle, uint32_t pin_num_mask, uint8_t level)
+static esp_err_t set_level_unlocked(esp_io_expander_handle_t handle, uint32_t pin_num_mask, uint8_t level)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     if (pin_num_mask >= BIT64(VALID_IO_COUNT(handle))) {
@@ -106,7 +107,7 @@ esp_err_t esp_io_expander_set_level(esp_io_expander_handle_t handle, uint32_t pi
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_get_level(esp_io_expander_handle_t handle, uint32_t pin_num_mask, uint32_t *level_mask)
+static esp_err_t get_level_unlocked(esp_io_expander_handle_t handle, uint32_t pin_num_mask, uint32_t *level_mask)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     ESP_RETURN_ON_FALSE(level_mask, ESP_ERR_INVALID_ARG, TAG, "Invalid level");
@@ -127,7 +128,7 @@ esp_err_t esp_io_expander_get_level(esp_io_expander_handle_t handle, uint32_t pi
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_print_state(esp_io_expander_handle_t handle)
+static esp_err_t print_state_unlocked(esp_io_expander_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
 
@@ -157,7 +158,7 @@ esp_err_t esp_io_expander_print_state(esp_io_expander_handle_t handle)
     return ESP_OK;
 }
 
-esp_err_t esp_io_expander_reset(esp_io_expander_handle_t handle)
+static esp_err_t reset_unlocked(esp_io_expander_handle_t handle)
 {
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     ESP_RETURN_ON_FALSE(handle->reset, ESP_ERR_NOT_SUPPORTED, TAG, "reset isn't implemented");
@@ -170,7 +171,106 @@ esp_err_t esp_io_expander_del(esp_io_expander_handle_t handle)
     ESP_RETURN_ON_FALSE(handle, ESP_ERR_INVALID_ARG, TAG, "Invalid handle");
     ESP_RETURN_ON_FALSE(handle->del, ESP_ERR_NOT_SUPPORTED, TAG, "del isn't implemented");
 
-    return handle->del(handle);
+    if (!handle->lifecycle_managed) {
+        return handle->del(handle);
+    }
+
+    /* The owner must stop publishing this raw handle before calling delete.
+     * The lifecycle gate rejects calls already racing inside the API, and the
+     * counter includes all operations admitted before CLOSING, even if they
+     * have not yet acquired operation_mutex.
+     */
+    portENTER_CRITICAL(&handle->lifecycle_lock);
+    if (handle->lifecycle_state != ESP_IO_EXPANDER_LIFECYCLE_ACTIVE) {
+        portEXIT_CRITICAL(&handle->lifecycle_lock);
+        return ESP_ERR_INVALID_STATE;
+    }
+    handle->lifecycle_state = ESP_IO_EXPANDER_LIFECYCLE_CLOSING;
+    uint32_t active = handle->admitted_operations;
+    portEXIT_CRITICAL(&handle->lifecycle_lock);
+
+    SemaphoreHandle_t operation_mutex = handle->operation_mutex;
+    SemaphoreHandle_t lifecycle_idle = handle->lifecycle_idle;
+    if (active != 0) {
+        TickType_t timeout = pdMS_TO_TICKS(ESP_IO_EXPANDER_CLOSE_TIMEOUT_MS);
+        if (timeout == 0) timeout = 1;
+        TickType_t start = xTaskGetTickCount();
+        for (;;) {
+            portENTER_CRITICAL(&handle->lifecycle_lock);
+            active = handle->admitted_operations;
+            portEXIT_CRITICAL(&handle->lifecycle_lock);
+            if (active == 0) break;
+
+            TickType_t elapsed = xTaskGetTickCount() - start;
+            if (elapsed >= timeout || xSemaphoreTake(lifecycle_idle, timeout - elapsed) != pdTRUE) {
+                portENTER_CRITICAL(&handle->lifecycle_lock);
+                handle->lifecycle_state = ESP_IO_EXPANDER_LIFECYCLE_ACTIVE;
+                portEXIT_CRITICAL(&handle->lifecycle_lock);
+                return ESP_ERR_TIMEOUT;
+            }
+        }
+    }
+
+    /* Only the private callback can free the driver object. No mutex is held
+     * here: the state is CLOSING and the admitted-operation count is zero.
+     */
+    esp_err_t ret = handle->del(handle);
+    if (ret == ESP_OK) {
+        if (operation_mutex != NULL) vSemaphoreDelete(operation_mutex);
+        if (lifecycle_idle != NULL) vSemaphoreDelete(lifecycle_idle);
+    } else {
+        portENTER_CRITICAL(&handle->lifecycle_lock);
+        handle->lifecycle_state = ESP_IO_EXPANDER_LIFECYCLE_ACTIVE;
+        portEXIT_CRITICAL(&handle->lifecycle_lock);
+    }
+    return ret;
+}
+
+esp_err_t esp_io_expander_set_dir(esp_io_expander_handle_t handle, uint32_t pin_num_mask,
+                                  esp_io_expander_dir_t direction)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_dir_unlocked(handle, pin_num_mask, direction);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_set_level(esp_io_expander_handle_t handle, uint32_t pin_num_mask, uint8_t level)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = set_level_unlocked(handle, pin_num_mask, level);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_get_level(esp_io_expander_handle_t handle, uint32_t pin_num_mask,
+                                    uint32_t *level_mask)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = get_level_unlocked(handle, pin_num_mask, level_mask);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_print_state(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = print_state_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
+}
+
+esp_err_t esp_io_expander_reset(esp_io_expander_handle_t handle)
+{
+    esp_err_t ret = esp_io_expander_operation_begin(handle);
+    if (ret != ESP_OK) return ret;
+    ret = reset_unlocked(handle);
+    esp_io_expander_operation_end(handle);
+    return ret;
 }
 
 /**

@@ -1,5 +1,6 @@
 ﻿#include <Arduino.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -24,13 +25,19 @@ LV_IMG_DECLARE(logo_y_nombre);
 #include "activity_session.h"
 #include "network/wifi_manager.h"
 #include "network/panel_http_server.h"
+#include "network/ota_manager.h"
+#include "network/ota_boot_validation.h"
 #include "time/time_manager.h"
 #include "storage/storage_manager.h"
+#include "storage/ota_maintenance_gate.h"
 #include "storage/storage_metrics.h"
 #include "storage/activity_storage_manager.h"
 #include "storage/activity_claim_storage_manager.h"
 #include "storage/sd_manager.h"
 #include "diagnostics/terminal_capture.h"
+#include <freertos/semphr.h>
+#include <esp_heap_caps.h>
+#include <esp_random.h>
 
 using namespace esp_panel::board;
 
@@ -144,6 +151,16 @@ lv_color_t theme_color_hex(uint32_t color)
 #define lv_color_hex theme_color_hex
 
 std::shared_ptr<Board> board;
+bool sd_manager_pre_board_delete(void *)
+{
+    return sd_manager.shutdownForBoardDelete();
+}
+
+bool sd_manager_post_board_delete(void *)
+{
+    return sd_manager.completeBoardDelete();
+}
+
 lv_obj_t *nfc_message_label = nullptr, *nfc_hint_label = nullptr;
 lv_obj_t *clock_label = nullptr, *date_label = nullptr, *motivation_label = nullptr;
 lv_obj_t *nfc_card_visual = nullptr, *nfc_ring_outer = nullptr, *nfc_ring_middle = nullptr, *nfc_ring_inner = nullptr;
@@ -193,6 +210,31 @@ uint32_t boot_last_detail_update_ms = 0;
 char boot_detail_text[112] = "";
 bool boot_adapter_started = false;
 bool boot_setup_complete = false;
+SemaphoreHandle_t ota_background_io_mutex = nullptr;
+lv_display_t *ota_health_display = nullptr;
+lv_indev_t *ota_health_touch = nullptr;
+uint32_t ota_health_frame_baseline = 0;
+uint32_t ota_health_loop_baseline = 0;
+std::atomic<uint32_t> ota_main_loop_iterations{0};
+bool ota_startup_critical_error = false;
+bool ota_boot_validation_hold = false;
+bool ota_boot_validation_manager_ready = false;
+bool ota_boot_validation_release_reported = false;
+std::atomic<bool> ota_boot_validation_screen_active{false};
+OtaBootValidationProof ota_boot_validation_proof;
+lv_obj_t *ota_boot_validation_screen = nullptr;
+lv_obj_t *ota_boot_validation_screen_status = nullptr;
+lv_obj_t *ota_boot_validation_touch_status = nullptr;
+lv_obj_t *ota_boot_validation_overall_status = nullptr;
+uint32_t ota_boot_validation_ui_boot_id = 0;
+struct OtaBootValidationButtonContext {
+    uint32_t boot_id = 0;
+    bool acknowledge_screen = false;
+};
+OtaBootValidationButtonContext ota_boot_screen_ack_context;
+OtaBootValidationButtonContext ota_boot_touch_test_context;
+bool ota_ready_notice_reported = false;
+bool ota_ready_notice_visible = false;
 bool boot_wifi_resolved = false;
 bool boot_wifi_connection_seen = false;
 bool boot_ui_prepared = false;
@@ -715,7 +757,82 @@ void obtener_texto_fecha_hora(char *date_buffer, size_t date_size,
     }
     formatear_fecha_hora(local_time, date_buffer, date_size, time_buffer, time_size);
 }
-void halt_on_error() { while (true) vTaskDelay(pdMS_TO_TICKS(1000)); }
+void halt_on_error()
+{
+    ota_startup_critical_error = true;
+    // If this is a pending OTA image, do not leave a fatal startup failure
+    // parked forever before loop() can run its health monitor.
+    ota_manager.rejectRunningImageAndRollback();
+    while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+}
+
+bool ota_enter_maintenance()
+{
+    bool expected = false;
+    if (!ota_maintenance_active.compare_exchange_strong(expected, true)) return false;
+
+    // Drain in-flight UI callbacks first. Mutation call sites also check the
+    // flag, so new financial writes are rejected once this gate is raised.
+    if (esp_lv_adapter_lock(pdMS_TO_TICKS(2000)) != ESP_OK) {
+        ota_maintenance_active.store(false);
+        return false;
+    }
+    const bool storage_safe = storage_manager.isReady() &&
+        !storage_manager.hasIncompleteTransactions() &&
+        activity_storage_startup_result == ActivityStorageResult::OK &&
+        activity_claim_startup_result == ActivityClaimStorageResult::OK;
+    esp_lv_adapter_unlock();
+    if (!storage_safe || ota_background_io_mutex == nullptr ||
+        xSemaphoreTake(ota_background_io_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) {
+        ota_maintenance_active.store(false);
+        return false;
+    }
+    // The main-loop service section (Wi-Fi credential persistence and serial
+    // diagnostics, including any SD test) has drained. It rechecks the gate
+    // after taking the same mutex before starting another pass.
+    xSemaphoreGive(ota_background_io_mutex);
+    return true;
+}
+
+void ota_leave_maintenance()
+{
+    ota_maintenance_active.store(false);
+}
+
+bool ota_can_reboot()
+{
+    return ota_maintenance_active.load() && storage_manager.isReady() &&
+        !storage_manager.hasIncompleteTransactions() &&
+        activity_storage_startup_result == ActivityStorageResult::OK &&
+        activity_claim_startup_result == ActivityClaimStorageResult::OK;
+}
+
+bool ota_boot_health_ok()
+{
+    if (ota_startup_critical_error || !boot_setup_complete || !boot_adapter_started ||
+        board == nullptr || ota_health_display == nullptr || ota_health_touch == nullptr ||
+        ota_main_loop_iterations.load() <= ota_health_loop_baseline ||
+        !heap_caps_check_integrity_all(false) ||
+        esp_lv_adapter_lock(0) != ESP_OK) return false;
+    const bool operator_checks_complete = ota_boot_validation_screen_active.load() &&
+        ota_boot_validation_proof.complete(ota_boot_validation_ui_boot_id);
+    const bool healthy = operator_checks_complete && lv_scr_act() != nullptr &&
+        esp_lv_adapter_get_frame_count() > ota_health_frame_baseline &&
+        storage_manager.isReady() && !storage_manager.hasIncompleteTransactions() &&
+        activity_storage_startup_result == ActivityStorageResult::OK &&
+        activity_claim_startup_result == ActivityClaimStorageResult::OK;
+    esp_lv_adapter_unlock();
+    return healthy;
+}
+
+bool ota_prepare_boot_storage()
+{
+    if (!ota_maintenance_active.load() || ota_background_io_mutex == nullptr ||
+        xSemaphoreTake(ota_background_io_mutex, pdMS_TO_TICKS(2000)) != pdTRUE) return false;
+    const bool ready = storage_manager.prepareFilesystemForBootConfirmation();
+    xSemaphoreGive(ota_background_io_mutex);
+    return ready;
+}
 
 void boot_progress_animation_exec(void *object, int32_t value)
 {
@@ -820,6 +937,125 @@ void create_boot_splash()
     boot_splash_active = true;
     lv_scr_load(boot_splash_screen);
     boot_splash_started_ms = millis();
+}
+
+void refresh_ota_boot_validation_status()
+{
+    if (ota_boot_validation_screen_status != nullptr) {
+        lv_label_set_text(ota_boot_validation_screen_status,
+            ota_boot_validation_proof.screenAcknowledged()
+                ? "Pantalla: operador confirmó que la interfaz se ve correctamente"
+                : "Pantalla: pendiente de confirmación visual del operador");
+    }
+    if (ota_boot_validation_touch_status != nullptr) {
+        lv_label_set_text(ota_boot_validation_touch_status,
+            ota_boot_validation_proof.touchVerified()
+                ? "Touch GT911: interacción registrada en este arranque"
+                : "Touch GT911: pendiente de tocar el control de prueba");
+    }
+    if (ota_boot_validation_overall_status != nullptr) {
+        const bool complete = ota_boot_validation_proof.complete(ota_boot_validation_ui_boot_id);
+        lv_label_set_text(ota_boot_validation_overall_status,
+            complete ? "Comprobaciones visual y táctil completas; almacenamiento aún en validación"
+                     : "No habrá operaciones financieras durante esta comprobación");
+        lv_obj_set_style_text_color(ota_boot_validation_overall_status,
+            lv_color_hex(complete ? GREEN : DANGER), 0);
+    }
+}
+
+void ota_boot_validation_button_event(lv_event_t *event)
+{
+    if (event == nullptr || lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    auto *context = static_cast<OtaBootValidationButtonContext *>(lv_event_get_user_data(event));
+    if (context == nullptr) return;
+
+    const bool recorded = context->acknowledge_screen
+        ? ota_boot_validation_proof.acknowledgeScreen(context->boot_id)
+        : ota_boot_validation_proof.verifyTouch(context->boot_id);
+    if (!recorded) return;
+
+    Serial.printf("[OTA-BOOT-CHECK] boot=%08lx screen=%u touch=%u\n",
+        static_cast<unsigned long>(context->boot_id),
+        ota_boot_validation_proof.screenAcknowledged() ? 1U : 0U,
+        ota_boot_validation_proof.touchVerified() ? 1U : 0U);
+    refresh_ota_boot_validation_status();
+}
+
+void create_ota_boot_validation_screen(uint32_t boot_id)
+{
+    ota_boot_validation_ui_boot_id = boot_id;
+    ota_boot_screen_ack_context = {boot_id, true};
+    ota_boot_touch_test_context = {boot_id, false};
+
+    ota_boot_validation_screen = lv_obj_create(nullptr);
+    lv_obj_remove_style_all(ota_boot_validation_screen);
+    lv_obj_set_size(ota_boot_validation_screen, SCREEN_WIDTH, SCREEN_HEIGHT);
+    lv_obj_set_style_bg_color(ota_boot_validation_screen, lv_color_hex(theme_palette().background), 0);
+    lv_obj_set_style_bg_opa(ota_boot_validation_screen, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(ota_boot_validation_screen, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(ota_boot_validation_screen);
+    lv_label_set_text(title, "Comprobación del firmware");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_26, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(NAVY), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 36);
+
+    lv_obj_t *instruction = lv_label_create(ota_boot_validation_screen);
+    lv_label_set_text(instruction,
+        "La imagen aún no está confirmada. Las funciones financieras permanecen bloqueadas.\n"
+        "Si puedes leer esta interfaz, confirma la pantalla y después prueba el touch.");
+    lv_obj_set_style_text_font(instruction, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(instruction, lv_color_hex(theme_palette().primary_text), 0);
+    lv_obj_set_width(instruction, 740);
+    lv_obj_set_style_text_align(instruction, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(instruction, LV_ALIGN_TOP_MID, 0, 92);
+
+    lv_obj_t *screen_ack = lv_btn_create(ota_boot_validation_screen);
+    lv_obj_set_size(screen_ack, 520, 64);
+    lv_obj_align(screen_ack, LV_ALIGN_TOP_MID, 0, 170);
+    lv_obj_set_style_bg_color(screen_ack, lv_color_hex(BLUE), LV_PART_MAIN);
+    lv_obj_set_style_radius(screen_ack, 12, LV_PART_MAIN);
+    lv_obj_add_event_cb(screen_ack, ota_boot_validation_button_event, LV_EVENT_CLICKED,
+                        &ota_boot_screen_ack_context);
+    lv_obj_t *screen_ack_label = lv_label_create(screen_ack);
+    lv_label_set_text(screen_ack_label, "Confirmo que la pantalla se ve correctamente");
+    lv_obj_set_style_text_font(screen_ack_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(screen_ack_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(screen_ack_label);
+
+    lv_obj_t *touch_test = lv_btn_create(ota_boot_validation_screen);
+    lv_obj_set_size(touch_test, 520, 72);
+    lv_obj_align(touch_test, LV_ALIGN_TOP_MID, 0, 254);
+    lv_obj_set_style_bg_color(touch_test, lv_color_hex(GREEN), LV_PART_MAIN);
+    lv_obj_set_style_radius(touch_test, 12, LV_PART_MAIN);
+    lv_obj_add_event_cb(touch_test, ota_boot_validation_button_event, LV_EVENT_CLICKED,
+                        &ota_boot_touch_test_context);
+    lv_obj_t *touch_label = lv_label_create(touch_test);
+    lv_label_set_text(touch_label, "Tocar aquí para probar el touch");
+    lv_obj_set_style_text_font(touch_label, &banco_escolar_font_16, 0);
+    lv_obj_set_style_text_color(touch_label, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_center(touch_label);
+
+    ota_boot_validation_screen_status = lv_label_create(ota_boot_validation_screen);
+    lv_obj_set_style_text_font(ota_boot_validation_screen_status, &banco_escolar_font_16, 0);
+    lv_obj_set_width(ota_boot_validation_screen_status, 760);
+    lv_obj_set_style_text_align(ota_boot_validation_screen_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ota_boot_validation_screen_status, LV_ALIGN_TOP_MID, 0, 350);
+
+    ota_boot_validation_touch_status = lv_label_create(ota_boot_validation_screen);
+    lv_obj_set_style_text_font(ota_boot_validation_touch_status, &banco_escolar_font_16, 0);
+    lv_obj_set_width(ota_boot_validation_touch_status, 760);
+    lv_obj_set_style_text_align(ota_boot_validation_touch_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ota_boot_validation_touch_status, LV_ALIGN_TOP_MID, 0, 380);
+
+    ota_boot_validation_overall_status = lv_label_create(ota_boot_validation_screen);
+    lv_obj_set_style_text_font(ota_boot_validation_overall_status, &banco_escolar_font_16, 0);
+    lv_obj_set_width(ota_boot_validation_overall_status, 760);
+    lv_obj_set_style_text_align(ota_boot_validation_overall_status, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(ota_boot_validation_overall_status, LV_ALIGN_TOP_MID, 0, 425);
+
+    refresh_ota_boot_validation_status();
+    lv_scr_load(ota_boot_validation_screen);
 }
 
 const char *sd_boot_status_text()
@@ -1233,6 +1469,7 @@ void demo_entry_event(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
     selected_student = getDemoStudent();
     if (selected_student == nullptr) return;
+    if (ota_maintenance_active.load()) return;
     StudentAccount account = {};
     if (storage_manager.createAccountIfMissing(selected_student->student_id, 125, account) != StorageResult::STORAGE_OK) {
         Serial.println("[Account] No se pudo cargar o inicializar la cuenta demo");
@@ -2407,6 +2644,7 @@ void wifi_forget_event(lv_event_t *event)
 void wifi_forget_confirm_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    if (ota_maintenance_active.load()) return;
     wifi_manager.clearCredentials();
     mostrar_pantalla(PANTALLA_CONFIGURACION);
 }
@@ -3414,6 +3652,7 @@ void activity_start_event(lv_event_t *event)
         return;
     }
 
+    if (ota_maintenance_active.load()) return;
     activity_start_in_progress = true;
     lv_obj_t *button = lv_event_get_target(event);
     if (button != nullptr) lv_obj_add_state(button, LV_STATE_DISABLED);
@@ -3928,6 +4167,7 @@ void activity_close_action_event(lv_event_t *event)
         mostrar_pantalla(PANTALLA_ACTIVITY_DETAIL);
         return;
     }
+    if (ota_maintenance_active.load()) return;
     ActivitySession updated;
     const ActivityStorageResult result = activity_storage_manager.closeSession(
         selected_activity_session.id, pending_activity_close_status, static_cast<int64_t>(epoch), updated);
@@ -4273,6 +4513,7 @@ const char *activity_claim_status_text(ActivityClaimStatus status)
 void activity_claim_commit_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED || activity_claim_in_progress) return;
+    if (ota_maintenance_active.load()) return;
     activity_claim_in_progress = true;
     ActivitySession session;
     StudentAccount account;
@@ -4656,6 +4897,7 @@ void storage_confirm_cancel_event(lv_event_t *event)
 void storage_delete_final_event(lv_event_t *event)
 {
     if (lv_event_get_code(event) != LV_EVENT_CLICKED) return;
+    if (ota_maintenance_active.load()) return;
     register_student_activity();
     const StorageResult result = storage_manager.clearLocalData();
     storage_status_success = result == StorageResult::STORAGE_OK;
@@ -5925,6 +6167,7 @@ void account_entry_confirm_event(lv_event_t *event)
     if (lv_event_get_code(event) != LV_EVENT_CLICKED ||
         pantalla_actual != PANTALLA_ACCOUNT_ENTRY_CONFIRM ||
         account_entry_confirmation_in_progress) return;
+    if (ota_maintenance_active.load()) return;
     account_entry_confirmation_in_progress = true;
     account_entry_confirm_button = lv_event_get_target(event);
     if (account_entry_confirm_button) lv_obj_add_state(account_entry_confirm_button, LV_STATE_DISABLED);
@@ -6084,6 +6327,7 @@ void transfer_confirm_event(lv_event_t *event)
         return;
     }
 
+    if (ota_maintenance_active.load()) return;
     const size_t movement_count_before = storage_manager.getMovementCount();
     const int32_t signed_amount = -static_cast<int32_t>(transfer_amount);
     uint64_t created_id = 0;
@@ -6627,6 +6871,9 @@ void create_ui()
 void startup_progress_timer_cb(lv_timer_t *timer)
 {
     if (!boot_setup_complete) return;
+    // Keep the pending-image diagnostic screen visible until both operator
+    // checks pass and the OTA manager confirms the image.
+    if (ota_boot_validation_screen_active.load()) return;
 
     const uint32_t now = millis();
     if (now - boot_last_detail_update_ms >= 250) {
@@ -6758,7 +7005,38 @@ int32_t getStudentBalance()
 
 void setup()
 {
+    // Arduino initArduino() has already run. Re-read persistent OTA state now,
+    // before display, storage, or application services can accept writes.
+    const bool ota_manager_ready_at_boot = ota_manager.begin();
+    ota_boot_validation_manager_ready = ota_manager_ready_at_boot;
+    ota_boot_validation_hold = !ota_manager_ready_at_boot || ota_manager.bootValidationHoldRequired();
+    const bool pending_boot = ota_manager_ready_at_boot && ota_manager.bootValidationPending();
+    if (pending_boot) {
+        ota_boot_validation_ui_boot_id = esp_random();
+        if (ota_boot_validation_ui_boot_id == 0) ota_boot_validation_ui_boot_id = 1;
+        ota_boot_validation_proof.begin(ota_boot_validation_ui_boot_id);
+        ota_boot_validation_screen_active.store(true);
+        Serial.printf("[OTA-BOOT-CHECK] pending boot session=%08lx; visual and touch checks required\n",
+                      static_cast<unsigned long>(ota_boot_validation_ui_boot_id));
+    } else {
+        ota_boot_validation_ui_boot_id = 0;
+        ota_boot_validation_proof.clear();
+        ota_boot_validation_screen_active.store(false);
+    }
+    ota_maintenance_active.store(ota_boot_validation_hold);
     Serial.begin(SERIAL_BAUD_RATE);
+    if (!ota_manager_ready_at_boot) Serial.println("[OTA] Gestor no disponible; OTA permanece cerrada");
+    if (ota_manager.bootValidationPending()) {
+        Serial.println("[OTA] Imagen pendiente; escrituras escolares bloqueadas hasta validar salud");
+    } else if (ota_manager.bootValidationState() == OtaBootValidationState::STATE_UNKNOWN ||
+               !ota_manager_ready_at_boot) {
+        Serial.printf("[OTA] Estado OTA desconocido (0x%x); escrituras bloqueadas, sin confirmar ni reiniciar automáticamente\n",
+                      static_cast<unsigned>(ota_manager.bootValidationError()));
+    } else if (ota_manager.bootValidationState() == OtaBootValidationState::STATE_UNSAFE) {
+        Serial.printf("[OTA] Estado/particiones OTA incompatibles (0x%x); escrituras bloqueadas\n",
+                      static_cast<unsigned>(ota_manager.bootValidationError()));
+    }
+    ota_background_io_mutex = xSemaphoreCreateMutex();
     Serial.println("================================");
     Serial.println("BANCO ESCOLAR");
     Serial.println("Sistema iniciado");
@@ -6770,16 +7048,23 @@ void setup()
     time_manager.begin();
     set_boot_progress(12, "Servicio de hora iniciado");
 
-    board = std::make_shared<Board>(); if ((board == nullptr) || !board->init()) halt_on_error(); if (!board->begin()) halt_on_error();
+    board = std::make_shared<Board>(); if (board == nullptr) halt_on_error();
+    if (!board->configCallback(BoardConfig::STAGE_CALLBACK_PRE_BOARD_DEL, sd_manager_pre_board_delete) ||
+        !board->configCallback(BoardConfig::STAGE_CALLBACK_POST_BOARD_DEL, sd_manager_post_board_delete) ||
+        !board->init()) halt_on_error();
+    if (!board->begin()) halt_on_error();
     set_boot_progress(28, "Placa y periféricos inicializados");
     const esp_lv_adapter_config_t lvgl_config = ESP_LV_ADAPTER_DEFAULT_CONFIG(); if (esp_lv_adapter_init(&lvgl_config) != ESP_OK) halt_on_error();
     set_boot_progress(36, "Motor gráfico iniciado");
     const esp_lv_adapter_display_config_t display_config = ESP_LV_ADAPTER_DISPLAY_RGB_DEFAULT_CONFIG(board->getLCD(), SCREEN_WIDTH, SCREEN_HEIGHT, ESP_LV_ADAPTER_ROTATE_0);
     lv_display_t *display = esp_lv_adapter_register_display(&display_config); if (display == nullptr) halt_on_error();
+    ota_health_display = display;
     set_boot_progress(40, "Pantalla registrada");
-    const esp_lv_adapter_touch_config_t touch_config = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(display, board->getTouch()); if (esp_lv_adapter_register_touch(&touch_config) == nullptr) halt_on_error();
+    const esp_lv_adapter_touch_config_t touch_config = ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(display, board->getTouch());
+    ota_health_touch = esp_lv_adapter_register_touch(&touch_config); if (ota_health_touch == nullptr) halt_on_error();
     if (esp_lv_adapter_lock(-1) != ESP_OK) halt_on_error();
     create_boot_splash();
+    if (pending_boot) create_ota_boot_validation_screen(ota_boot_validation_ui_boot_id);
     esp_lv_adapter_unlock();
     set_boot_progress(44, "Pantalla táctil lista");
     if (esp_lv_adapter_start() != ESP_OK) halt_on_error();
@@ -6803,10 +7088,9 @@ void setup()
     wifi_manager.begin();
     boot_wifi_started_ms = millis();
     set_boot_progress(50, "Servicio Wi-Fi iniciado");
-    auto *io_expander = board != nullptr && board->getIO_Expander() != nullptr
-        ? board->getIO_Expander()->getBase() : nullptr;
+    auto io_expander = board != nullptr ? board->getIO_ExpanderShared() : nullptr;
     set_boot_progress(56, "MicroSD: comprobando");
-    sd_manager.begin(io_expander); // Reuses the CH422G initialized by Board::begin().
+    sd_manager.begin(std::move(io_expander)); // Retains the same CH422G until coordinated Board teardown.
     panel_http_server.begin();
     set_boot_progress(56, sd_boot_status_text());
     const bool storage_ready = storage_manager.begin(); // Storage errors are non-fatal; continue to the UI.
@@ -6824,14 +7108,79 @@ void setup()
     set_boot_progress(storage_ready ? 68 : 64,
                       storage_ready ? "Almacenamiento local listo" : "Almacenamiento local no disponible");
     boot_setup_complete = true;
+    ota_health_frame_baseline = esp_lv_adapter_get_frame_count();
+    ota_health_loop_baseline = ota_main_loop_iterations.load();
+    ota_manager.setBootHealthHook(ota_boot_health_ok);
+    if (!ota_manager.setBootStoragePreparationHook(ota_prepare_boot_storage))
+        Serial.println("[OTA] Preparación previa de LittleFS no disponible; imagen pendiente no se confirmará");
+    const OtaMaintenanceHooks maintenance_hooks = {
+        ota_enter_maintenance, ota_leave_maintenance, ota_can_reboot
+    };
+    if (!ota_manager.setMaintenanceHooks(maintenance_hooks))
+        Serial.println("[OTA] Modo mantenimiento no disponible; las actualizaciones se rechazarían");
     if (PN532_ENABLED) xTaskCreatePinnedToCore(nfc_task, "pn532_i2c1", 4096, nullptr, 1, &nfc_task_handle, 1);
 }
 
 void loop()
 {
-    terminal_capture_poll();
-    wifi_manager.update();
-    panel_http_server.update();
+    if (ota_background_io_mutex == nullptr) {
+        terminal_capture_poll();
+        wifi_manager.update();
+        panel_http_server.update();
+    } else if (xSemaphoreTake(ota_background_io_mutex, 0) == pdTRUE) {
+        if (!ota_maintenance_active.load()) {
+            terminal_capture_poll();
+            wifi_manager.update();
+            panel_http_server.update();
+        }
+        xSemaphoreGive(ota_background_io_mutex);
+    }
+    ota_manager.update();
+    if (ota_boot_validation_hold && ota_boot_validation_manager_ready &&
+        !ota_manager.bootValidationHoldRequired()) {
+        // Resume the existing startup flow only after the OTA manager confirms
+        // the image. Keep the maintenance gate closed if LVGL cannot switch.
+        if (esp_lv_adapter_lock(pdMS_TO_TICKS(100)) == ESP_OK) {
+            ota_boot_validation_screen_active.store(false);
+            if (boot_splash_screen != nullptr) lv_scr_load(boot_splash_screen);
+            esp_lv_adapter_unlock();
+            // Storage was mounted read/write without growth and revalidated
+            // before confirmation. Only now may school-data writers resume.
+            ota_maintenance_active.store(false);
+            ota_boot_validation_hold = false;
+            if (!ota_boot_validation_release_reported) {
+                Serial.println("[OTA] Imagen confirmada, pruebas visual/táctil completadas y LittleFS preparado; mantenimiento liberado");
+                ota_boot_validation_release_reported = true;
+            }
+        }
+    }
+    ota_main_loop_iterations.fetch_add(1);
+    const OtaSnapshot ota_snapshot = ota_manager.snapshot();
+    if (ota_snapshot.state == OtaState::READY_TO_REBOOT && !ota_ready_notice_reported) {
+        Serial.printf("[OTA] Imagen %s preparada; esperando aprobación administrativa reciente para reiniciar\n",
+                      ota_snapshot.target_version);
+        ota_ready_notice_reported = true;
+    }
+    if (ota_snapshot.state == OtaState::READY_TO_REBOOT && !ota_ready_notice_visible &&
+        esp_lv_adapter_lock(100) == ESP_OK) {
+        lv_obj_t *notice = lv_obj_create(lv_layer_top());
+        lv_obj_remove_style_all(notice);
+        lv_obj_set_size(notice, 760, 58);
+        lv_obj_set_style_bg_color(notice, lv_color_hex(NAVY), 0);
+        lv_obj_set_style_bg_opa(notice, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(notice, 12, 0);
+        lv_obj_set_style_border_width(notice, 1, 0);
+        lv_obj_set_style_border_color(notice, lv_color_hex(CYAN), 0);
+        lv_obj_align(notice, LV_ALIGN_TOP_MID, 0, 10);
+        lv_obj_clear_flag(notice, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *label = lv_label_create(notice);
+        lv_label_set_text(label, "Actualización preparada · esperando aprobación del maestro para reiniciar");
+        lv_obj_set_style_text_font(label, &banco_escolar_font_16, 0);
+        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        ota_ready_notice_visible = true;
+        esp_lv_adapter_unlock();
+    }
     time_manager.update(wifi_manager.isConnected());
     const bool synchronized = time_manager.isSynchronized();
     if (synchronized && !ui_time_synchronized) {

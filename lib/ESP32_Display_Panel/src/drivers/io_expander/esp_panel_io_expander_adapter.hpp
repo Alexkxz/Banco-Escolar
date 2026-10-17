@@ -157,15 +157,17 @@ bool IO_ExpanderAdapter<T>::del()
 {
     ESP_UTILS_LOG_TRACE_ENTER_WITH_THIS();
 
+    // The controller owns callbacks and synchronization state. Close it
+    // before releasing its I2C host; on failure, retain the host for retry.
+    ESP_UTILS_CHECK_FALSE_RETURN(T::del(), false, "Delete base failed");
+
     if (_host != nullptr) {
-        _host = nullptr;
         int host_id = this->getConfig().host_id;
         ESP_UTILS_CHECK_FALSE_RETURN(
             HostI2C::tryReleaseInstance(host_id), false, "Release I2C host(%d) failed", host_id
         );
+        _host = nullptr;
     }
-
-    ESP_UTILS_CHECK_FALSE_RETURN(T::del(), false, "Delete base failed");
 
     ESP_UTILS_LOG_TRACE_EXIT_WITH_THIS();
 

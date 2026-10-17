@@ -153,6 +153,19 @@ public:
     }
 
     /**
+     * @brief Get an owning reference to the IO expander created by Board.
+     *
+     * Consumers retaining this reference must coordinate explicit device
+     * shutdown with Board::del(); shared ownership alone does not keep the
+     * underlying controller operational after del(). Returns nullptr for an
+     * externally injected, caller-owned expander.
+     */
+    std::shared_ptr<drivers::IO_Expander> getIO_ExpanderShared() const
+    {
+        return _owns_io_expander ? _io_expander : nullptr;
+    }
+
+    /**
      * @brief Get the current board configuration
      *
      * @return Reference to the current board configuration
@@ -272,6 +285,7 @@ private:
     std::shared_ptr<drivers::Bus> _touch_bus = nullptr;
     std::shared_ptr<drivers::Touch> _touch_device = nullptr;
     std::shared_ptr<drivers::IO_Expander> _io_expander = nullptr;
+    bool _owns_io_expander = false;
 };
 
 } // namespace esp_panel

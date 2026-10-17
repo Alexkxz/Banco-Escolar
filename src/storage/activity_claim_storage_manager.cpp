@@ -2,8 +2,9 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <LittleFS.h>
+#include "bank_littlefs.h"
 #include <Preferences.h>
+#include "ota_maintenance_gate.h"
 
 #include <algorithm>
 #include <cstring>
@@ -81,8 +82,10 @@ bool readAllRecords(std::vector<ActivityClaim> &claims,
 {
     claims.clear();
     issues.clear();
-    if (!LittleFS.exists(CLAIMS_FILE)) return true;
-    File file = LittleFS.open(CLAIMS_FILE, FILE_READ);
+    const BankLittleFsPathStatus file_status = bank_littlefs.pathStatus(CLAIMS_FILE);
+    if (file_status == BankLittleFsPathStatus::MISSING) return true;
+    if (file_status != BankLittleFsPathStatus::PRESENT) return false;
+    File file = bank_littlefs.open(CLAIMS_FILE, FILE_READ);
     if (!file) return false;
     char line[MAX_CLAIM_LINE_LENGTH];
     while (file.available()) {
@@ -142,10 +145,10 @@ bool readAllRecords(std::vector<ActivityClaim> &claims,
 
 bool appendDocument(JsonDocument &document)
 {
-    if (!LittleFS.exists(DATA_DIRECTORY) && !LittleFS.mkdir(DATA_DIRECTORY)) return false;
+    if (!bank_littlefs.exists(DATA_DIRECTORY) && !bank_littlefs.mkdir(DATA_DIRECTORY)) return false;
     const size_t expected = measureJson(document);
     if (expected + 1U >= MAX_CLAIM_LINE_LENGTH) return false;
-    File file = LittleFS.open(CLAIMS_FILE, FILE_APPEND);
+    File file = bank_littlefs.open(CLAIMS_FILE, FILE_APPEND);
     if (!file) return false;
     const size_t written = serializeJson(document, file);
     const bool newline_written = file.write(static_cast<uint8_t>('\n')) == 1;
@@ -249,6 +252,7 @@ ActivityClaimStorageResult ActivityClaimStorageManager::hasClaimForActivity(
 
 ActivityClaimStorageResult ActivityClaimStorageManager::reserveClaimId(uint64_t &id)
 {
+    if (ota_maintenance_active.load()) return ActivityClaimStorageResult::NOT_READY;
     if (!ready_ || !storage_manager.isReady()) return ActivityClaimStorageResult::NOT_READY;
     if (next_id_ == 0 || next_id_ == std::numeric_limits<uint64_t>::max()) return ActivityClaimStorageResult::ID_ERROR;
     id = next_id_;
@@ -260,6 +264,7 @@ ActivityClaimStorageResult ActivityClaimStorageManager::reserveClaimId(uint64_t 
 ActivityClaimStorageResult ActivityClaimStorageManager::recordMissingAccountIssue(
     const ActivityAccountIssue &issue)
 {
+    if (ota_maintenance_active.load()) return ActivityClaimStorageResult::NOT_READY;
     if (!ready_ || !storage_manager.isReady()) return ActivityClaimStorageResult::NOT_READY;
     if (!issue.activity_id || !issue.student_id || issue.occurred_at < MIN_VALID_ACTIVITY_EPOCH ||
         strcmp(issue.reason, "account_missing") != 0) return ActivityClaimStorageResult::INVALID_ARGUMENT;
@@ -282,6 +287,7 @@ ActivityClaimStorageResult ActivityClaimStorageManager::recordMissingAccountIssu
 
 ActivityClaimStorageResult ActivityClaimStorageManager::ensureClaimPersisted(const ActivityClaim &claim)
 {
+    if (ota_maintenance_active.load()) return ActivityClaimStorageResult::NOT_READY;
     if (!claim.id || !claim.activity_id || !claim.student_id || !claim.reward_amount ||
         claim.claimed_at < MIN_VALID_ACTIVITY_EPOCH || !claim.movement_id ||
         claim.status != ActivityClaimStatus::PAID || claim.void_movement_id) return ActivityClaimStorageResult::INVALID_ARGUMENT;

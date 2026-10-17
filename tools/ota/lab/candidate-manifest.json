@@ -1,0 +1,31 @@
+﻿{
+    "build_id":  "OTA-LAB.1",
+    "firmware_path":  "C:/Users/alexk/Documents/Banco-Escolar-Tools/ota-lab-build/esp32-s3-devkitc-1/firmware.bin",
+    "firmware_size_bytes":  2073104,
+    "firmware_sha256":  "1f9bdd7323dd49b8c5c252b1540909e954d19ae097567ad355ac208edda75897",
+    "ota_wifi_enabled":  false,
+    "rollback_enabled":  true,
+    "environment":  {
+                        "platformio_core":  "6.2.0",
+                        "platform":  "Espressif 32 53.3.11 (pioarduino 53.03.11)",
+                        "arduino_esp32":  "3.1.1",
+                        "esp_idf_package":  "5.3.0+sha.cfea4f7c98",
+                        "esptool":  "4.8.5",
+                        "flash_size":  "16MB",
+                        "flash_mode":  "qio",
+                        "psram_mode":  "qio_opi",
+                        "partition_table_csv":  "default_16MB.csv"
+                    },
+    "target":  {
+                   "name":  "ota_1",
+                   "offset":  "0x650000",
+                   "size":  "0x640000"
+               },
+    "ota0_reference":  {
+                           "size_bytes":  2058080,
+                           "sha256":  "5bc7f52f0d4a9448fbbfd89ecbda24dad37fb3872882c6dce68ce84429c27709"
+                       },
+    "partition_table":  "default_16MB.csv",
+    "partition_table_bin_sha256":  "bd0f7954aca2ef7d925ee21aaa1f3dc8822d1d6ce5cbbd26a135e5886bfff6ce",
+    "production_upload_authorized":  false
+}

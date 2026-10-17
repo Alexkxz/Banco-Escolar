@@ -2,7 +2,7 @@
 
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <LittleFS.h>
+#include "bank_littlefs.h"
 #include <Preferences.h>
 #include <esp_partition.h>
 #include <nvs.h>
@@ -14,6 +14,7 @@
 #include "time/time_manager.h"
 #include "activity_claim_storage_manager.h"
 #include "activity_session.h"
+#include "ota_maintenance_gate.h"
 
 namespace {
 constexpr char STORAGE_MOUNT_PATH[] = "/littlefs";
@@ -113,8 +114,10 @@ bool readBoundedLine(File &file, char *line, size_t capacity, bool &overflow);
 bool readLatestAccount(uint16_t student_id, StudentAccount &out, bool &found)
 {
     found = false;
-    if (!LittleFS.exists(ACCOUNTS_FILE)) return true;
-    File file = LittleFS.open(ACCOUNTS_FILE, FILE_READ);
+    const BankLittleFsPathStatus account_file = bank_littlefs.pathStatus(ACCOUNTS_FILE);
+    if (account_file == BankLittleFsPathStatus::MISSING) return true;
+    if (account_file != BankLittleFsPathStatus::PRESENT) return false;
+    File file = bank_littlefs.open(ACCOUNTS_FILE, FILE_READ);
     if (!file) return false;
     char line[256];
     size_t length = 0;
@@ -134,6 +137,65 @@ bool readLatestAccount(uint16_t student_id, StudentAccount &out, bool &found)
     // last complete snapshot and let the next append separate it safely.
     file.close();
     return true;
+}
+
+bool validateAccountSnapshots()
+{
+    const BankLittleFsPathStatus account_file = bank_littlefs.pathStatus(ACCOUNTS_FILE);
+    if (account_file == BankLittleFsPathStatus::MISSING) return true;
+    if (account_file != BankLittleFsPathStatus::PRESENT) return false;
+    File file = bank_littlefs.open(ACCOUNTS_FILE, FILE_READ);
+    if (!file) return false;
+    char line[256];
+    size_t length = 0;
+    while (file.available()) {
+        const int value = file.read();
+        if (value < 0) break;
+        if (value == '\n') {
+            line[length] = '\0';
+            StudentAccount account = {};
+            if (length == 0 || !parseAccountLine(line, account)) { file.close(); return false; }
+            length = 0;
+        } else if (length + 1 < sizeof(line)) {
+            line[length++] = static_cast<char>(value);
+        } else {
+            file.close();
+            return false;
+        }
+    }
+    const bool reached_file_end = file.position() == file.size();
+    file.close();
+    // A pending candidate must not accept an incomplete account snapshot.
+    // Leave the bytes untouched so the reference firmware can inspect them.
+    return reached_file_end && length == 0;
+}
+
+bool validateCompleteMovementRecords()
+{
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
+    if (!file) return false;
+    char line[MAX_MOVEMENT_LINE_LENGTH];
+    size_t length = 0;
+    while (file.available()) {
+        const int value = file.read();
+        if (value < 0) break;
+        if (value == '\n') {
+            line[length] = '\0';
+            MovementRecord movement = {};
+            if (length == 0 || !parseMovementLine(line, movement)) { file.close(); return false; }
+            length = 0;
+        } else if (length + 1 < sizeof(line)) {
+            line[length++] = static_cast<char>(value);
+        } else {
+            file.close();
+            return false;
+        }
+    }
+    const bool reached_file_end = file.position() == file.size();
+    file.close();
+    // An interrupted append is not repaired here; it rejects the candidate
+    // and remains byte-for-byte available to the reference firmware.
+    return reached_file_end && length == 0;
 }
 
 bool writePendingTransaction(uint16_t student_id, uint64_t movement_id,
@@ -165,7 +227,7 @@ bool writePendingTransaction(uint16_t student_id, uint64_t movement_id,
         claim_document["void_movement_id"] = 0;
     }
     if (document.overflowed()) return false;
-    File file = LittleFS.open(ACCOUNT_TXN_FILE, FILE_WRITE);
+    File file = bank_littlefs.open(ACCOUNT_TXN_FILE, FILE_WRITE);
     if (!file) return false;
     const size_t expected = measureJson(document);
     const size_t written = serializeJson(document, file);
@@ -176,7 +238,7 @@ bool writePendingTransaction(uint16_t student_id, uint64_t movement_id,
 
 bool findMovementById(uint64_t id, MovementRecord &found, size_t &matches)
 {
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!file) return false;
     matches = 0;
     char line[MAX_MOVEMENT_LINE_LENGTH];
@@ -229,7 +291,7 @@ uint64_t storedNextMovementId()
 
 uint64_t findMaximumMovementId()
 {
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!file) return 0;
 
     uint64_t maximum_id = 0;
@@ -247,7 +309,7 @@ uint64_t findMaximumMovementId()
 
 size_t countMovements(bool pending_only)
 {
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!file) return 0;
 
     size_t count = 0;
@@ -266,7 +328,7 @@ StorageResult readMovementRecords(size_t offset, MovementRecord *records, size_t
 {
     read_count = 0;
     if (records == nullptr && capacity != 0) return StorageResult::STORAGE_INVALID_ARGUMENT;
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!file) return StorageResult::STORAGE_IO_ERROR;
 
     size_t matching_index = 0;
@@ -363,18 +425,24 @@ bool isExpectedFilesystemPartition()
 
 bool mountOrInitializeFilesystem()
 {
-    if (LittleFS.begin(false, STORAGE_MOUNT_PATH, 10, "spiffs")) return true;
+    const bool validating_ota_image = ota_maintenance_active.load();
+    if (bank_littlefs.mount(validating_ota_image, STORAGE_MOUNT_PATH, "spiffs",
+                            !validating_ota_image)) return true;
 
-    Serial.println("[Storage] Mount falló");
+    Serial.println("[Storage] Mount fallÃ³");
+    if (validating_ota_image) {
+        Serial.println("[Storage] Montaje de validaciÃ³n de solo lectura fallÃ³; formato bloqueado");
+        return false;
+    }
     if (!STORAGE_ALLOW_ONE_TIME_FORMAT) {
-        Serial.println("[Storage] Formateo no autorizado; se continúa sin almacenamiento");
+        Serial.println("[Storage] Formateo no autorizado; se continÃºa sin almacenamiento");
         return false;
     }
 
     bool initialized = false;
     bool format_attempted = false;
     if (!readFilesystemGuard(initialized, format_attempted)) {
-        Serial.println("[Storage] No se pudo leer la protección NVS; formato bloqueado");
+        Serial.println("[Storage] No se pudo leer la protecciÃ³n NVS; formato bloqueado");
         return false;
     }
     if (initialized) {
@@ -386,34 +454,34 @@ bool mountOrInitializeFilesystem()
         return false;
     }
     if (!isExpectedFilesystemPartition()) {
-        Serial.println("[Storage] Partición inesperada; formato bloqueado");
+        Serial.println("[Storage] ParticiÃ³n inesperada; formato bloqueado");
         return false;
     }
 
-    Serial.println("[Storage] Inicialización de filesystem autorizada");
-    Serial.printf("[Storage] Partición validada: spiffs, offset 0x%06lX, tamaño 0x%06lX\n",
+    Serial.println("[Storage] InicializaciÃ³n de filesystem autorizada");
+    Serial.printf("[Storage] ParticiÃ³n validada: spiffs, offset 0x%06lX, tamaÃ±o 0x%06lX\n",
                   static_cast<unsigned long>(EXPECTED_FS_OFFSET),
                   static_cast<unsigned long>(EXPECTED_FS_SIZE));
 
     // Persist the attempt before erasing anything. A failed format/remount will
     // not be repeated on a later boot, even if the development flag stays on.
     if (!writeFilesystemGuard(FS_FORMAT_ATTEMPTED_KEY, true)) {
-        Serial.println("[Storage] No se pudo guardar protección NVS; formato bloqueado");
+        Serial.println("[Storage] No se pudo guardar protecciÃ³n NVS; formato bloqueado");
         return false;
     }
 
-    Serial.println("[Storage] Formateando únicamente partición LittleFS");
-    // LittleFS.format() delegates to esp_littlefs_format(partitionLabel_),
+    Serial.println("[Storage] Formateando Ãºnicamente particiÃ³n LittleFS");
+    // bank_littlefs.format() delegates to esp_littlefs_format(partitionLabel_),
     // where partitionLabel_ was set to "spiffs" by the failed begin() above.
-    if (!LittleFS.format()) {
-        Serial.println("[Storage] Formato falló");
+    if (!bank_littlefs.format()) {
+        Serial.println("[Storage] Formato fallÃ³");
         return false;
     }
 
     Serial.println("[Storage] Formato OK");
     Serial.println("[Storage] Remontando LittleFS");
-    if (!LittleFS.begin(false, STORAGE_MOUNT_PATH, 10, "spiffs")) {
-        Serial.println("[Storage] Remontaje falló; filesystem deshabilitado");
+    if (!bank_littlefs.mount(false, STORAGE_MOUNT_PATH, "spiffs", true)) {
+        Serial.println("[Storage] Remontaje fallÃ³; filesystem deshabilitado");
         return false;
     }
     return true;
@@ -421,7 +489,7 @@ bool mountOrInitializeFilesystem()
 
 bool findStorageTestRecord(uint64_t requested_id, MovementRecord &found, size_t &matches)
 {
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!file) return false;
     matches = 0;
     char line[MAX_MOVEMENT_LINE_LENGTH];
@@ -460,13 +528,31 @@ bool StorageManager::begin()
         return false;
     }
 
-    if (!LittleFS.exists(MOVEMENTS_DIRECTORY) && !LittleFS.mkdir(MOVEMENTS_DIRECTORY)) {
+    // A rollback candidate must not create files, repair journals, or write
+    // the NVS initialization marker before its health decision. If a journal
+    // is present, reject this boot and let the known-good image recover it.
+    const bool validating_ota_image = ota_maintenance_active.load();
+    const BankLittleFsPathStatus pending_transaction_status =
+        bank_littlefs.pathStatus(ACCOUNT_TXN_FILE);
+    if (validating_ota_image &&
+        (bank_littlefs.pathStatus(MOVEMENTS_DIRECTORY) != BankLittleFsPathStatus::PRESENT ||
+         bank_littlefs.pathStatus(MOVEMENTS_FILE) != BankLittleFsPathStatus::PRESENT ||
+         pending_transaction_status != BankLittleFsPathStatus::MISSING ||
+         !validateCompleteMovementRecords() ||
+         !validateAccountSnapshots())) {
+        state_ = StorageState::STORAGE_ERROR;
+        recovery_required_ = pending_transaction_status != BankLittleFsPathStatus::MISSING;
+        Serial.println("[Storage] Validacion OTA bloqueada: datos base ausentes o transaccion pendiente");
+        return false;
+    }
+
+    if (!validating_ota_image && !bank_littlefs.exists(MOVEMENTS_DIRECTORY) && !bank_littlefs.mkdir(MOVEMENTS_DIRECTORY)) {
         state_ = StorageState::STORAGE_ERROR;
         Serial.println("[Storage] Error al crear directorio de datos");
         return false;
     }
-    if (!LittleFS.exists(MOVEMENTS_FILE)) {
-        File empty_file = LittleFS.open(MOVEMENTS_FILE, FILE_WRITE);
+    if (!validating_ota_image && !bank_littlefs.exists(MOVEMENTS_FILE)) {
+        File empty_file = bank_littlefs.open(MOVEMENTS_FILE, FILE_WRITE);
         if (!empty_file) {
             state_ = StorageState::STORAGE_ERROR;
             Serial.println("[Storage] Error al crear archivo de movimientos");
@@ -483,16 +569,16 @@ bool StorageManager::begin()
     next_movement_id_ = persisted_next_id > minimum_next_id ? persisted_next_id : minimum_next_id;
     if (next_movement_id_ == 0) next_movement_id_ = 1;
 
-    total_bytes_ = LittleFS.totalBytes();
-    used_bytes_ = LittleFS.usedBytes();
-    if (!writeFilesystemGuard(FS_INITIALIZED_KEY, true)) {
+    total_bytes_ = bank_littlefs.totalBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
+    if (!validating_ota_image && !writeFilesystemGuard(FS_INITIALIZED_KEY, true)) {
         state_ = StorageState::STORAGE_ERROR;
         Serial.println("[Storage] No se pudo guardar fs_initialized; almacenamiento deshabilitado");
         return false;
     }
     state_ = StorageState::STORAGE_READY;
 
-    if (!recoverPendingAccountMovement()) {
+    if (!validating_ota_image && !recoverPendingAccountMovement()) {
         recovery_required_ = true;
         state_ = StorageState::STORAGE_ERROR;
         Serial.println("[Account] Recuperacion pendiente; almacenamiento bloqueado");
@@ -512,9 +598,54 @@ StorageState StorageManager::state() const
     return state_;
 }
 
+bool StorageManager::prepareFilesystemForBootConfirmation()
+{
+    if (!ota_maintenance_active.load() || !bank_littlefs.isReadOnly() ||
+        state_ != StorageState::STORAGE_READY || recovery_required_ || transaction_in_progress_ ||
+        bank_littlefs.pathStatus(ACCOUNT_TXN_FILE) != BankLittleFsPathStatus::MISSING) return false;
+
+    // In esp_littlefs 1.16.1 / LittleFS 2.10.1, lfs_mount scans metadata and
+    // does not program or erase blocks. Growth is a separate lfs_fs_grow call;
+    // the boot-validation remount pins it off. School VFS writes remain gated.
+    // This verifies the normal mount before rollback is cancelled.
+    if (!bank_littlefs.remountReadWriteForBootValidation()) {
+        state_ = StorageState::STORAGE_ERROR;
+        recovery_required_ = true;
+        Serial.println("[Storage] No se pudo preparar LittleFS RW sin crecimiento; rollback antes de confirmar");
+        return false;
+    }
+
+    const bool records_valid = bank_littlefs.totalBytes() == EXPECTED_FS_SIZE &&
+        bank_littlefs.pathStatus(MOVEMENTS_DIRECTORY) == BankLittleFsPathStatus::PRESENT &&
+        bank_littlefs.pathStatus(MOVEMENTS_FILE) == BankLittleFsPathStatus::PRESENT &&
+        bank_littlefs.pathStatus(ACCOUNT_TXN_FILE) == BankLittleFsPathStatus::MISSING &&
+        validateCompleteMovementRecords() && validateAccountSnapshots();
+    if (!records_valid) {
+        (void)bank_littlefs.remountReadOnly();
+        state_ = StorageState::STORAGE_ERROR;
+        recovery_required_ = true;
+        Serial.println("[Storage] Revalidación falló; LittleFS vuelve a solo lectura y se rechaza la imagen");
+        return false;
+    }
+
+    // No school-file, journal-recovery, NVS-marker, format, or growth writes
+    // occur before confirmation. The filesystem has a normal RW mount, but
+    // the VFS and financial-operation gates remain closed until confirmation.
+    total_bytes_ = bank_littlefs.totalBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
+    return true;
+}
+
 bool StorageManager::isReady() const
 {
     return state_ == StorageState::STORAGE_READY && !recovery_required_ && !transaction_in_progress_;
+}
+
+bool StorageManager::hasIncompleteTransactions() const
+{
+    const BankLittleFsPathStatus journal_status = bank_littlefs.pathStatus(ACCOUNT_TXN_FILE);
+    return state_ != StorageState::STORAGE_READY || recovery_required_ || transaction_in_progress_ ||
+           journal_status != BankLittleFsPathStatus::MISSING;
 }
 
 size_t StorageManager::totalBytes() const
@@ -554,7 +685,8 @@ uint64_t StorageManager::nextMovementId() const
 
 void StorageManager::updateSelfTest()
 {
-    if (!STORAGE_SELF_TEST || self_test_finished_ || state_ != StorageState::STORAGE_READY) return;
+    if (ota_maintenance_active.load() || !STORAGE_SELF_TEST || self_test_finished_ ||
+        state_ != StorageState::STORAGE_READY) return;
 
     if (!self_test_initialized_) {
         bool marker_done = false;
@@ -653,7 +785,7 @@ void StorageManager::updateSelfTest()
         self_test_finished_ = true;
         return;
     }
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     Serial.printf("[StorageTest] usedBytes antes: %u, despues: %u, libre: %u bytes\n",
                   static_cast<unsigned>(used_before), static_cast<unsigned>(used_bytes_),
                   static_cast<unsigned>(freeBytes()));
@@ -667,6 +799,7 @@ StorageResult StorageManager::appendMovement(uint16_t student_id, int32_t amount
                                               StoredMovementType type, const char *reason,
                                               StoredRecordOrigin origin, uint64_t *created_id)
 {
+    if (ota_maintenance_active.load()) return StorageResult::STORAGE_NOT_READY;
     if (!isReady()) return StorageResult::STORAGE_NOT_READY;
     StorageOperationGuard operation(transaction_in_progress_);
     if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
@@ -725,7 +858,7 @@ StorageResult StorageManager::appendReservedMovement(const MovementRecord &recor
 
     // Separate an interrupted tail before appending the reserved record.
     bool needs_separator = false;
-    File tail = LittleFS.open(MOVEMENTS_FILE, FILE_READ);
+    File tail = bank_littlefs.open(MOVEMENTS_FILE, FILE_READ);
     if (!tail) return StorageResult::STORAGE_IO_ERROR;
     if (tail.size() > 0) {
         const bool positioned = tail.seek(tail.size() - 1, SeekSet);
@@ -738,7 +871,7 @@ StorageResult StorageManager::appendReservedMovement(const MovementRecord &recor
     }
     tail.close();
 
-    File file = LittleFS.open(MOVEMENTS_FILE, FILE_APPEND);
+    File file = bank_littlefs.open(MOVEMENTS_FILE, FILE_APPEND);
     if (!file) return StorageResult::STORAGE_IO_ERROR;
     if (needs_separator) {
         if (file.write(static_cast<uint8_t>('\n')) != 1) {
@@ -754,7 +887,7 @@ StorageResult StorageManager::appendReservedMovement(const MovementRecord &recor
     file.close();
     if (written_size != expected_size || !newline_written) return StorageResult::STORAGE_IO_ERROR;
 
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     return StorageResult::STORAGE_OK;
 }
 
@@ -779,6 +912,7 @@ StorageResult StorageManager::getMovementById(uint64_t id, MovementRecord &out) 
 
 StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &account)
 {
+    if (ota_maintenance_active.load()) return StorageResult::STORAGE_NOT_READY;
     bool found = false;
     StudentAccount current = {};
     if (!readLatestAccount(account.student_id, current, found)) return StorageResult::STORAGE_IO_ERROR;
@@ -788,8 +922,8 @@ StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &accoun
     document["student_id"] = account.student_id;
     document["balance"] = account.balance;
     bool needs_separator = false;
-    if (LittleFS.exists(ACCOUNTS_FILE)) {
-        File tail = LittleFS.open(ACCOUNTS_FILE, FILE_READ);
+    if (bank_littlefs.exists(ACCOUNTS_FILE)) {
+        File tail = bank_littlefs.open(ACCOUNTS_FILE, FILE_READ);
         if (!tail) return StorageResult::STORAGE_IO_ERROR;
         if (tail.size() > 0) {
             if (!tail.seek(tail.size() - 1, SeekSet)) { tail.close(); return StorageResult::STORAGE_IO_ERROR; }
@@ -799,7 +933,7 @@ StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &accoun
         }
         tail.close();
     }
-    File file = LittleFS.open(ACCOUNTS_FILE, FILE_APPEND);
+    File file = bank_littlefs.open(ACCOUNTS_FILE, FILE_APPEND);
     if (!file) return StorageResult::STORAGE_IO_ERROR;
     if (needs_separator && file.write(static_cast<uint8_t>('\n')) != 1) { file.close(); return StorageResult::STORAGE_IO_ERROR; }
     const size_t expected = measureJson(document);
@@ -808,7 +942,7 @@ StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &accoun
     file.flush();
     file.close();
     if (written != expected || !newline_written) return StorageResult::STORAGE_IO_ERROR;
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     Serial.printf("[Account] Cuenta persistida student_id=%u balance=%lld\n",
                   static_cast<unsigned>(account.student_id), static_cast<long long>(account.balance));
     return StorageResult::STORAGE_OK;
@@ -817,6 +951,7 @@ StorageResult StorageManager::appendAccountSnapshot(const StudentAccount &accoun
 StorageResult StorageManager::createAccountIfMissing(uint16_t student_id, int64_t initial_balance,
                                                       StudentAccount &out)
 {
+    if (ota_maintenance_active.load()) return StorageResult::STORAGE_NOT_READY;
     if (!isReady()) return StorageResult::STORAGE_NOT_READY;
     StorageOperationGuard operation(transaction_in_progress_);
     if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
@@ -835,6 +970,7 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
                                                             StoredRecordOrigin origin,
                                                             StudentAccount &updated, uint64_t *created_id)
 {
+    if (ota_maintenance_active.load()) return AccountMovementResult::RECOVERY_REQUIRED;
     if (!isReady()) return AccountMovementResult::RECOVERY_REQUIRED;
     StorageOperationGuard operation(transaction_in_progress_);
     if (!operation.acquired) return AccountMovementResult::RECOVERY_REQUIRED;
@@ -856,7 +992,7 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
     time_t epoch = 0;
     time(&epoch);
     if (!time_manager.isSynchronized() || !time_manager.getLocalTime(local_time) || epoch < MIN_VALID_EPOCH) return AccountMovementResult::INVALID_TIME;
-    if (LittleFS.exists(ACCOUNT_TXN_FILE) || next_movement_id_ == 0 || next_movement_id_ == std::numeric_limits<uint64_t>::max()) return AccountMovementResult::RECOVERY_REQUIRED;
+    if (bank_littlefs.exists(ACCOUNT_TXN_FILE) || next_movement_id_ == 0 || next_movement_id_ == std::numeric_limits<uint64_t>::max()) return AccountMovementResult::RECOVERY_REQUIRED;
 
     const uint64_t movement_id = next_movement_id_;
     if (!persistNextMovementId(movement_id + 1)) return AccountMovementResult::MOVEMENT_WRITE_FAILED;
@@ -868,14 +1004,14 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
     movement.schema_version = STORAGE_SCHEMA_VERSION;
     if (!writePendingTransaction(student_id, movement_id, current.balance, next_balance,
                                  movement.amount, movement.timestamp, type, safe_reason, origin)) {
-        recovery_required_ = LittleFS.exists(ACCOUNT_TXN_FILE);
+        recovery_required_ = bank_littlefs.exists(ACCOUNT_TXN_FILE);
         return AccountMovementResult::RECOVERY_REQUIRED;
     }
     const StorageResult movement_write = appendReservedMovement(movement);
     if (movement_write != StorageResult::STORAGE_OK) { recovery_required_ = true; return AccountMovementResult::MOVEMENT_WRITE_FAILED; }
     const StudentAccount next = {student_id, next_balance, 1};
     if (appendAccountSnapshot(next) != StorageResult::STORAGE_OK) { recovery_required_ = true; return AccountMovementResult::ACCOUNT_WRITE_FAILED; }
-    if (!LittleFS.remove(ACCOUNT_TXN_FILE)) { recovery_required_ = true; return AccountMovementResult::RECOVERY_REQUIRED; }
+    if (!bank_littlefs.remove(ACCOUNT_TXN_FILE)) { recovery_required_ = true; return AccountMovementResult::RECOVERY_REQUIRED; }
     updated = next;
     if (created_id) *created_id = movement_id;
     Serial.printf("[Account] Saldo actualizado student_id=%u %lld -> %lld\n", static_cast<unsigned>(student_id), static_cast<long long>(current.balance), static_cast<long long>(next_balance));
@@ -885,6 +1021,7 @@ AccountMovementResult StorageManager::applyAccountMovement(uint16_t student_id, 
 AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
                                                           StudentAccount &updated)
 {
+    if (ota_maintenance_active.load()) return AccountMovementResult::RECOVERY_REQUIRED;
     if (!isReady()) return AccountMovementResult::RECOVERY_REQUIRED;
     if (!claim.id || !claim.activity_id || !claim.student_id || claim.reward_amount == 0 ||
         claim.reward_amount > MAX_ACTIVITY_REWARD || claim.claimed_at < MIN_VALID_EPOCH ||
@@ -911,7 +1048,7 @@ AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
     time(&now);
     if (now < MIN_VALID_EPOCH || claim.claimed_at > static_cast<int64_t>(now))
         return AccountMovementResult::INVALID_TIME;
-    if (LittleFS.exists(ACCOUNT_TXN_FILE) || next_movement_id_ == 0 ||
+    if (bank_littlefs.exists(ACCOUNT_TXN_FILE) || next_movement_id_ == 0 ||
         next_movement_id_ == std::numeric_limits<uint64_t>::max())
         return AccountMovementResult::RECOVERY_REQUIRED;
 
@@ -933,7 +1070,7 @@ AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
     if (!writePendingTransaction(claim.student_id, movement_id, current.balance, next_balance,
                                  movement.amount, claim.claimed_at, StoredMovementType::ENTRY,
                                  reason, StoredRecordOrigin::TERMINAL, &claim)) {
-        recovery_required_ = LittleFS.exists(ACCOUNT_TXN_FILE);
+        recovery_required_ = bank_littlefs.exists(ACCOUNT_TXN_FILE);
         return AccountMovementResult::RECOVERY_REQUIRED;
     }
     const StorageResult movement_result = appendReservedMovement(movement);
@@ -952,12 +1089,12 @@ AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
         recovery_required_ = true;
         return AccountMovementResult::RECOVERY_REQUIRED;
     }
-    if (!LittleFS.remove(ACCOUNT_TXN_FILE)) {
+    if (!bank_littlefs.remove(ACCOUNT_TXN_FILE)) {
         recovery_required_ = true;
         return AccountMovementResult::RECOVERY_REQUIRED;
     }
     updated = next;
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     Serial.printf("[ActivityClaim] claim_id=%llu activity_id=%llu student_id=%u movement_id=%llu\n",
                   static_cast<unsigned long long>(claim.id),
                   static_cast<unsigned long long>(claim.activity_id),
@@ -968,8 +1105,11 @@ AccountMovementResult StorageManager::applyActivityReward(ActivityClaim &claim,
 
 bool StorageManager::recoverPendingAccountMovement()
 {
-    if (!LittleFS.exists(ACCOUNT_TXN_FILE)) return true;
-    File file = LittleFS.open(ACCOUNT_TXN_FILE, FILE_READ);
+    if (ota_maintenance_active.load()) return false;
+    const BankLittleFsPathStatus journal_status = bank_littlefs.pathStatus(ACCOUNT_TXN_FILE);
+    if (journal_status == BankLittleFsPathStatus::MISSING) return true;
+    if (journal_status != BankLittleFsPathStatus::PRESENT) return false;
+    File file = bank_littlefs.open(ACCOUNT_TXN_FILE, FILE_READ);
     if (!file || file.size() > 512) { if (file) file.close(); return false; }
     char json[513]; const size_t size = file.readBytes(json, sizeof(json) - 1); file.close(); json[size] = '\0';
     StaticJsonDocument<512> document;
@@ -1038,9 +1178,9 @@ bool StorageManager::recoverPendingAccountMovement()
     }
     if (has_activity_claim &&
         activity_claim_storage_manager.ensureClaimPersisted(pending_claim) != ActivityClaimStorageResult::OK) return false;
-    if (!LittleFS.remove(ACCOUNT_TXN_FILE)) return false;
+    if (!bank_littlefs.remove(ACCOUNT_TXN_FILE)) return false;
     Serial.printf("[Account] Transaccion recuperada student_id=%u movement_id=%llu\n", static_cast<unsigned>(student_id), static_cast<unsigned long long>(movement_id));
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     return true;
 }
 
@@ -1071,12 +1211,14 @@ StorageResult StorageManager::getPendingMovements(size_t offset, MovementRecord 
 StorageResult StorageManager::markMovementSynced(uint64_t id)
 {
     (void)id;
+    if (ota_maintenance_active.load()) return StorageResult::STORAGE_NOT_READY;
     return state_ == StorageState::STORAGE_READY ? StorageResult::STORAGE_UNSUPPORTED
                                                  : StorageResult::STORAGE_NOT_READY;
 }
 
 StorageResult StorageManager::clearLocalData()
 {
+    if (ota_maintenance_active.load()) return StorageResult::STORAGE_NOT_READY;
     if (!isReady()) {
         Serial.println("[Storage] Borrado cancelado: almacenamiento no disponible");
         return StorageResult::STORAGE_NOT_READY;
@@ -1085,19 +1227,19 @@ StorageResult StorageManager::clearLocalData()
     if (!operation.acquired) return StorageResult::STORAGE_NOT_READY;
 
     // This list is intentionally explicit. Never format or recursively delete.
-    if (LittleFS.exists(MOVEMENTS_FILE) && !LittleFS.remove(MOVEMENTS_FILE)) {
+    if (bank_littlefs.exists(MOVEMENTS_FILE) && !bank_littlefs.remove(MOVEMENTS_FILE)) {
         Serial.println("[Storage] Error al eliminar /data/movements.ndjson");
         return StorageResult::STORAGE_IO_ERROR;
     }
 
-    File empty_file = LittleFS.open(MOVEMENTS_FILE, FILE_WRITE);
+    File empty_file = bank_littlefs.open(MOVEMENTS_FILE, FILE_WRITE);
     if (!empty_file) {
         Serial.println("[Storage] Error al recrear /data/movements.ndjson");
         return StorageResult::STORAGE_IO_ERROR;
     }
     empty_file.close();
 
-    used_bytes_ = LittleFS.usedBytes();
+    used_bytes_ = bank_littlefs.usedBytes();
     Serial.println("[Storage] Datos locales eliminados: /data/movements.ndjson");
     Serial.printf("[Storage] Total: %u, usado: %u, libre: %u bytes\n",
                   static_cast<unsigned>(totalBytes()), static_cast<unsigned>(usedBytes()),

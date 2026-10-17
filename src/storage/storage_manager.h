@@ -81,10 +81,14 @@ struct StoredAttendanceRecord {
 class StorageManager {
 public:
     bool begin();
+    // Probe the normal no-grow writable mount while school writes remain
+    // gated, then validate persistent records before OTA confirmation.
+    bool prepareFilesystemForBootConfirmation();
     void updateSelfTest();
 
     StorageState state() const;
     bool isReady() const;
+    bool hasIncompleteTransactions() const;
     size_t totalBytes() const;
     size_t usedBytes() const;
     size_t freeBytes() const;
